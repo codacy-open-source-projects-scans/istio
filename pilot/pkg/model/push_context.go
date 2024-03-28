@@ -1757,7 +1757,7 @@ func (ps *PushContext) initVirtualServices(env *Environment) {
 		}
 
 		// For mesh virtual services, build a map of host -> referenced destinations
-		if features.EnableAmbientControllers && (len(rule.Gateways) == 0 || slices.Contains(rule.Gateways, constants.IstioMeshGateway)) {
+		if features.EnableAmbientWaypoints && (len(rule.Gateways) == 0 || slices.Contains(rule.Gateways, constants.IstioMeshGateway)) {
 			for host := range virtualServiceDestinations(rule) {
 				for _, rhost := range rule.Hosts {
 					if _, f := ps.virtualServiceIndex.referencedDestinations[rhost]; !f {
@@ -2452,11 +2452,11 @@ func (ps *PushContext) SupportsTunnel(n network.ID, ip string) bool {
 	return false
 }
 
-func (ps *PushContext) WaypointsFor(scope WaypointScope) []netip.Addr {
-	return ps.ambientIndex.Waypoint(scope)
+func (ps *PushContext) WaypointsFor(network, address string) []netip.Addr {
+	return ps.ambientIndex.Waypoint(network, address)
 }
 
-// WorkloadsForWaypoint returns all workloads associated with a given WaypointScope
-func (ps *PushContext) WorkloadsForWaypoint(scope WaypointScope) []WorkloadInfo {
-	return ps.ambientIndex.WorkloadsForWaypoint(scope)
+// WorkloadsForWaypoint returns all workloads associated with a given waypoint identified by it's network address
+func (ps *PushContext) WorkloadsForWaypoint(key WaypointKey) []WorkloadInfo {
+	return ps.ambientIndex.WorkloadsForWaypoint(key)
 }
