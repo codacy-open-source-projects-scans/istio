@@ -74,7 +74,107 @@ func init() {
 	features.EnableAmbientControllers = true
 }
 
+var validTrafficTypes = sets.New(constants.ServiceTraffic, constants.WorkloadTraffic, constants.AllTraffic, constants.NoTraffic)
+
+func TestAmbientIndex_WaypointForWorkloadTraffic(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientControllers, true)
+
+	cases := []struct {
+		name         string
+		trafficType  string
+		podAssertion func(s *ambientTestServer)
+		svcAssertion func(s *ambientTestServer)
+	}{
+		{
+			name:        "service traffic",
+			trafficType: constants.ServiceTraffic,
+			podAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertNoEvent(s.t)
+			},
+			svcAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertEvent(s.t, s.svcXdsName("svc1"))
+			},
+		},
+		{
+			name:        "all traffic",
+			trafficType: constants.AllTraffic,
+			podAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertEvent(s.t, s.podXdsName("pod1"))
+			},
+			svcAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertEvent(s.t, s.svcXdsName("svc1"))
+			},
+		},
+		{
+			name:        "workload traffic",
+			trafficType: constants.WorkloadTraffic,
+			podAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertEvent(s.t, s.podXdsName("pod1"))
+			},
+			svcAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertNoEvent(s.t)
+			},
+		},
+		{
+			name:        "no traffic",
+			trafficType: constants.NoTraffic,
+			podAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertNoEvent(s.t)
+			},
+			svcAssertion: func(s *ambientTestServer) {
+				s.t.Helper()
+				s.assertNoEvent(s.t)
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newAmbientTestServer(t, testC, testNW)
+			// These steps happen for every test regardless of traffic type.
+			// It involves creating a waypoint for the specified traffic type
+			// then creating a workload and a service with no annotations set
+			// on these objects yet.
+			s.addWaypoint(t, "10.0.0.10", "test-wp", c.trafficType, true)
+			s.addPods(t, "127.0.0.1", "pod1", "sa1",
+				map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
+			s.assertEvent(t, s.podXdsName("pod1"))
+			s.addService(t, "svc1",
+				map[string]string{},
+				map[string]string{},
+				[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1")
+			s.assertEvent(t, s.svcXdsName("svc1"), s.podXdsName("pod1"))
+
+			// Annotate the pod and check that the correct event is produced.
+			s.annotatePod(t, "pod1", testNS,
+				map[string]string{constants.AmbientUseWaypoint: "test-wp"})
+			c.podAssertion(s)
+
+			// Annotate the service and check that the correct event is produced.
+			s.annotateService(t, "svc1", testNS,
+				map[string]string{constants.AmbientUseWaypoint: "test-wp"})
+			c.svcAssertion(s)
+
+			// clean up resources
+			s.deleteService(t, "svc1")
+			s.assertEvent(t, s.podXdsName("pod1"), s.svcXdsName("svc1"))
+			s.deletePod(t, "pod1")
+			s.assertEvent(t, s.podXdsName("pod1"))
+			s.deleteWaypoint(t, "test-wp")
+			s.clearEvents()
+		})
+	}
+}
+
 func TestAmbientIndex_NetworkAndClusterIDs(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientControllers, true)
 	cases := []struct {
 		name    string
 		cluster cluster.ID
@@ -279,12 +379,12 @@ func TestAmbientIndex_WaypointConfiguredOnlyWhenReady(t *testing.T) {
 		corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("pod2"))
 
-	s.addWaypoint(t, "10.0.0.1", "waypoint-sa1", "sa1", false)
-	s.addWaypoint(t, "10.0.0.2", "waypoint-sa2", "sa2", true)
+	s.addWaypoint(t, "10.0.0.1", "waypoint-sa1", "", false)
+	s.addWaypoint(t, "10.0.0.2", "waypoint-sa2", constants.WorkloadTraffic, true)
 	s.assertEvent(t, s.podXdsName("pod2"))
 
 	// make waypoint-sa1 ready
-	s.addWaypoint(t, "10.0.0.1", "waypoint-sa1", "sa1", true)
+	s.addWaypoint(t, "10.0.0.1", "waypoint-sa1", constants.WorkloadTraffic, true)
 	// if waypoint-sa1 was configured when not ready "pod2" assertions should skip the "pod1" xds event and this should fail
 	s.assertEvent(t, s.podXdsName("pod1"))
 }
@@ -319,7 +419,7 @@ func TestAmbientIndex_WaypointAddressAddedToWorkloads(t *testing.T) {
 		corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("pod4"))
 
-	s.addWaypoint(t, "10.0.0.2", "waypoint-ns", "", true)
+	s.addWaypoint(t, "10.0.0.2", "waypoint-ns", constants.AllTraffic, true)
 	// All these workloads updated, so push them
 	s.assertEvent(t, s.podXdsName("pod1"),
 		s.podXdsName("pod2"),
@@ -330,34 +430,34 @@ func TestAmbientIndex_WaypointAddressAddedToWorkloads(t *testing.T) {
 	s.addPods(t, "127.0.0.200", "waypoint-ns-pod", "namespace-wide",
 		map[string]string{
 			constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel,
-			constants.GatewayNameLabel:    "namespace-wide",
+			constants.GatewayNameLabel:    "waypoint-ns",
 		}, nil, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("waypoint-ns-pod"))
 	// create the waypoint service
 	s.addService(t, "waypoint-ns",
 		map[string]string{constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel},
 		map[string]string{},
-		[]int32{80}, map[string]string{constants.GatewayNameLabel: "namespace-wide"}, "10.0.0.2")
+		[]int32{80}, map[string]string{constants.GatewayNameLabel: "waypoint-ns"}, "10.0.0.2")
 	s.assertEvent(t,
 		s.podXdsName("waypoint-ns-pod"),
 		s.svcXdsName("waypoint-ns"),
 	)
 	s.assertAddresses(t, "", "pod1", "pod2", "pod3", "pod4", "waypoint-ns", "waypoint-ns-pod")
 
-	s.addWaypoint(t, "10.0.0.3", "waypoint-sa2", "sa2", true)
+	s.addWaypoint(t, "10.0.0.3", "waypoint-sa2", constants.AllTraffic, true)
 	s.assertEvent(t, s.podXdsName("pod4"))
 	// Add a waypoint proxy pod for sa2
 	s.addPods(t, "127.0.0.250", "waypoint-sa2-pod", "service-account",
 		map[string]string{
 			constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel,
-			constants.GatewayNameLabel:    "service-account",
+			constants.GatewayNameLabel:    "waypoint-sa2",
 		}, nil, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("waypoint-sa2-pod"))
 	// create the waypoint service
 	s.addService(t, "waypoint-sa2",
 		map[string]string{constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel},
 		map[string]string{},
-		[]int32{80}, map[string]string{constants.GatewayNameLabel: "service-account"}, "10.0.0.3")
+		[]int32{80}, map[string]string{constants.GatewayNameLabel: "waypoint-sa2"}, "10.0.0.3")
 	s.assertEvent(t,
 		s.podXdsName("waypoint-sa2-pod"),
 		s.svcXdsName("waypoint-sa2"),
@@ -453,7 +553,7 @@ func TestAmbientIndex_WaypointAddressAddedToWorkloads(t *testing.T) {
 
 	s.addPods(t, "127.0.0.201", "waypoint2-sa", "waypoint-sa",
 		map[string]string{constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel},
-		map[string]string{constants.WaypointServiceAccount: "sa2"}, true, corev1.PodRunning)
+		map[string]string{}, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("waypoint2-sa"))
 	// Unrelated SA should not change anything
 	assert.Equal(t,
@@ -493,6 +593,40 @@ func TestAmbientIndex_WaypointAddressAddedToWorkloads(t *testing.T) {
 		nil)
 }
 
+func TestAmbientIndex_WaypointInboundBinding(t *testing.T) {
+	s := newAmbientTestServer(t, testC, testNW)
+	s.gwcls.Update(&k8sbeta.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: constants.WaypointGatewayClassName,
+			Annotations: map[string]string{
+				constants.AmbientWaypointInboundBinding: "PROXY/15088",
+			},
+		},
+	})
+	s.addWaypoint(t, "1.2.3.4", "proxy-sandwich", constants.AllTraffic, true)
+	// TODO needing this check seems suspicious. We should really wait for up to 2 pod events.
+	assert.EventuallyEqual(t, func() int { return len(s.waypoints.List("")) }, 1)
+
+	s.addPods(t, "10.0.0.1", "proxy-sandwich-instance", "", map[string]string{constants.GatewayNameLabel: "proxy-sandwich"}, nil, true, corev1.PodRunning)
+	s.assertEvent(t, s.podXdsName("proxy-sandwich-instance"))
+	appTunnel := s.lookup(s.podXdsName("proxy-sandwich-instance"))[0].GetWorkload().GetApplicationTunnel()
+	assert.Equal(t, appTunnel, &workloadapi.ApplicationTunnel{
+		Protocol: workloadapi.ApplicationTunnel_PROXY,
+		Port:     15088,
+	})
+}
+
+// define constants for the different types of XDS events which occur during policy unit tests
+const (
+	xdsConvertedPeerAuthSelector       = "converted_peer_authentication_selector"
+	xdsConvertedPeerAuthSelectorStrict = "converted_peer_authentication_selector-strict"
+	xdsConvertedStaticStrict           = "istio_converted_static_strict"
+	xdsGlobal                          = "global"
+	xdsGlobalSelector                  = "global-selector"
+	xdsNamespace                       = "namespace"
+	xdsSelector                        = "selector"
+)
+
 // TODO(nmittler): Consider splitting this into multiple, smaller tests.
 func TestAmbientIndex_Policy(t *testing.T) {
 	s := newAmbientTestServer(t, testC, testNW)
@@ -502,14 +636,14 @@ func TestAmbientIndex_Policy(t *testing.T) {
 	s.addPods(t, "127.0.0.200", "waypoint-ns-pod", "namespace-wide",
 		map[string]string{
 			constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel,
-			constants.GatewayNameLabel:    "namespace-wide",
+			constants.GatewayNameLabel:    "waypoint-ns",
 		}, nil, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("waypoint-ns-pod"))
 	s.addPods(t, "127.0.0.201", "waypoint2-sa", "waypoint-sa",
 		map[string]string{constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel},
-		map[string]string{constants.WaypointServiceAccount: "sa2"}, true, corev1.PodRunning)
+		map[string]string{}, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("waypoint2-sa"))
-	s.addWaypoint(t, "10.0.0.2", "waypoint-ns", "", true)
+	s.addWaypoint(t, "10.0.0.2", "waypoint-ns", constants.AllTraffic, true)
 	s.ns.Update(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: testNS,
@@ -522,9 +656,8 @@ func TestAmbientIndex_Policy(t *testing.T) {
 	s.addService(t, "waypoint-ns",
 		map[string]string{constants.ManagedGatewayLabel: constants.ManagedGatewayMeshControllerLabel},
 		map[string]string{},
-		[]int32{80}, map[string]string{constants.GatewayNameLabel: "namespace-wide"}, "10.0.0.2")
+		[]int32{80}, map[string]string{constants.GatewayNameLabel: "waypoint-ns"}, "10.0.0.2")
 	s.assertUnorderedEvent(t, s.podXdsName("waypoint-ns-pod"), s.svcXdsName("waypoint-ns"))
-	s.clearEvents()
 	selectorPolicyName := "selector"
 
 	// Test that PeerAuthentications are added to the ambient index
@@ -534,7 +667,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			Mode: auth.PeerAuthentication_MutualTLS_PERMISSIVE,
 		}
 	})
-	s.clearEvents()
+	s.assertEvent(t, xdsConvertedStaticStrict)
 
 	s.addPolicy(t, "namespace", testNS, nil, gvk.PeerAuthentication, func(c controllers.Object) {
 		pol := c.(*clientsecurityv1beta1.PeerAuthentication)
@@ -547,7 +680,6 @@ func TestAmbientIndex_Policy(t *testing.T) {
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{fmt.Sprintf("istio-system/%s", staticStrictPolicyName)})
-	s.clearEvents()
 
 	s.addPolicy(t, selectorPolicyName, testNS, map[string]string{"app": "a"}, gvk.PeerAuthentication, func(c controllers.Object) {
 		pol := c.(*clientsecurityv1beta1.PeerAuthentication)
@@ -584,8 +716,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			},
 		}
 	})
-	s.assertEvent(t, s.podXdsName("pod1")) // Selector policy should be added back since there is now a STRICT exception
-	time.Sleep(time.Second)
+	s.assertEvent(t, s.podXdsName("pod1"), xdsConvertedPeerAuthSelector) // Selector policy should be added back since there is now a STRICT exception
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{fmt.Sprintf("ns1/%s", model.GetAmbientPolicyConfigName(model.ConfigKey{
@@ -643,7 +774,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 		}
 	})
 	// There should be an event since effective policy moves to PERMISSIVE
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"), xdsConvertedPeerAuthSelector)
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		nil)
@@ -689,7 +820,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			},
 		}
 	})
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2")) // Matching pods receive an event
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"), xdsConvertedPeerAuthSelector) // Matching pods receive an event
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{fmt.Sprintf("ns1/%s", model.GetAmbientPolicyConfigName(model.ConfigKey{
@@ -709,6 +840,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 		}
 	})
 	// The policy should still be added since the effective policy is PERMISSIVE
+	s.assertEvent(t, xdsConvertedPeerAuthSelector)
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{fmt.Sprintf("ns1/%s", model.GetAmbientPolicyConfigName(model.ConfigKey{
@@ -740,7 +872,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			},
 		}
 	})
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2")) // Matching pods receive an event
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"), xdsConvertedPeerAuthSelector) // Matching pods receive an event
 	// The policy should still be added since the effective policy is STRICT
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -752,7 +884,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 
 	// Clear PeerAuthentication from workload
 	s.pa.Delete("selector", testNS)
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod2"), xdsConvertedPeerAuthSelector)
 	// Effective policy is still STRICT so the static policy should still be set
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -762,18 +894,18 @@ func TestAmbientIndex_Policy(t *testing.T) {
 	s.pa.Delete("namespace", testNS)
 	s.pa.Delete("global", systemNS)
 	s.deletePod(t, "pod2")
-	s.assertEvent(t, s.podXdsName("pod2"), s.podXdsName("pod1"))
-	s.clearEvents()
+	s.assertEvent(t, s.podXdsName("pod2"), s.podXdsName("pod1"), xdsConvertedStaticStrict, s.podXdsName("waypoint-ns-pod"), s.podXdsName("waypoint2-sa"))
 
 	// Test AuthorizationPolicies
 	s.addPolicy(t, "global", systemNS, nil, gvk.AuthorizationPolicy, nil)
 	s.addPolicy(t, "namespace", testNS, nil, gvk.AuthorizationPolicy, nil)
+	s.assertEvent(t, xdsGlobal, xdsNamespace)
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		nil)
 
 	s.addPolicy(t, selectorPolicyName, testNS, map[string]string{"app": "a"}, gvk.AuthorizationPolicy, nil)
-	s.assertEvent(t, s.podXdsName("pod1"))
+	s.assertEvent(t, s.podXdsName("pod1"), xdsSelector)
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{"ns1/selector"})
@@ -793,7 +925,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 		[]string{"ns1/selector"})
 
 	s.addPolicy(t, "global-selector", systemNS, map[string]string{"app": "a"}, gvk.AuthorizationPolicy, nil)
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), xdsGlobalSelector)
 
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -801,7 +933,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 
 	// Update selector to not select
 	s.addPolicy(t, "global-selector", systemNS, map[string]string{"app": "not-a"}, gvk.AuthorizationPolicy, nil)
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), xdsGlobalSelector)
 
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -815,7 +947,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 		}
 	})
 	// Every workload should receive an event
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), s.podXdsName("waypoint-ns-pod"), s.podXdsName("waypoint2-sa"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), s.podXdsName("waypoint-ns-pod"), s.podXdsName("waypoint2-sa"), xdsConvertedStaticStrict)
 	// Static STRICT policy should be sent
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -854,8 +986,6 @@ func TestAmbientIndex_Policy(t *testing.T) {
 		}
 	})
 
-	// No event because there's effectively no change
-
 	// Static STRICT policy should disappear
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -873,7 +1003,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			},
 		}
 	})
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3")) // Matching workloads should receive an event
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), xdsConvertedPeerAuthSelectorStrict) // Matching workloads should receive an event
 	// Workload policy should be added since there's a port level exclusion
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -902,9 +1032,10 @@ func TestAmbientIndex_Policy(t *testing.T) {
 			Name:      "selector-strict",
 			Namespace: "ns1",
 		}))})
+	s.assertEvent(t, xdsSelector)
 
 	s.authz.Delete("selector", testNS)
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), xdsSelector)
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		[]string{fmt.Sprintf("ns1/%s", model.GetAmbientPolicyConfigName(model.ConfigKey{
@@ -915,7 +1046,7 @@ func TestAmbientIndex_Policy(t *testing.T) {
 
 	// Delete selector policy
 	s.pa.Delete("selector-strict", testNS)
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3")) // Matching workloads should receive an event
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), xdsConvertedPeerAuthSelectorStrict) // Matching workloads should receive an event
 	// Static STRICT policy should now be sent because of the global policy
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
@@ -924,13 +1055,12 @@ func TestAmbientIndex_Policy(t *testing.T) {
 	// Delete global policy
 	s.pa.Delete("strict", systemNS)
 	// Every workload should receive an event
-	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), s.podXdsName("waypoint-ns-pod"), s.podXdsName("waypoint2-sa"))
+	s.assertEvent(t, s.podXdsName("pod1"), s.podXdsName("pod3"), s.podXdsName("waypoint-ns-pod"), s.podXdsName("waypoint2-sa"), xdsConvertedStaticStrict)
 	// Now no policies are in effect
 	assert.Equal(t,
 		s.lookup(s.addrXdsName("127.0.0.1"))[0].Address.GetWorkload().AuthorizationPolicies,
 		nil)
 
-	s.clearEvents()
 	s.addPolicy(t, "gateway-targeted", testNS, nil, gvk.AuthorizationPolicy, func(o controllers.Object) {
 		p := o.(*clientsecurityv1beta1.AuthorizationPolicy)
 		p.Spec.TargetRef = &v1beta1.PolicyTargetReference{
@@ -1092,9 +1222,9 @@ func TestUpdateWaypointForWorkload(t *testing.T) {
 
 	// add our waypoints but they won't be used until annotations are added
 	// add a new waypoint
-	s.addWaypoint(t, "10.0.0.2", "waypoint-sa1", "sa1", true)
+	s.addWaypoint(t, "10.0.0.2", "waypoint-sa1", constants.WorkloadTraffic, true)
 	// Add a namespace waypoint to the pod
-	s.addWaypoint(t, "10.0.0.1", "waypoint-ns", "", true)
+	s.addWaypoint(t, "10.0.0.1", "waypoint-ns", constants.WorkloadTraffic, true)
 
 	s.addPods(t, "127.0.0.1", "pod1", "sa1", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
 	s.assertAddresses(t, "", "pod1")
@@ -1182,8 +1312,10 @@ func TestWorkloadsForWaypoint(t *testing.T) {
 		assert.Equal(t, wl, sets.New(expected...))
 	}
 	// Add a namespace waypoint to the pod
-	s.addWaypoint(t, "10.0.0.1", "waypoint-ns", "", true)
-	s.addWaypoint(t, "10.0.0.2", "waypoint-sa1", "sa1", true)
+	s.addWaypoint(t, "10.0.0.1", "waypoint-ns", constants.WorkloadTraffic, true)
+	s.addWaypoint(t, "10.0.0.2", "waypoint-sa1", constants.WorkloadTraffic, true)
+	// Wait until waypoints are available
+	assert.EventuallyEqual(t, func() int { return len(s.waypoints.List("")) }, 2)
 
 	s.addPods(t, "127.0.0.1", "pod1", "sa1", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
 	s.assertEvent(t, s.podXdsName("pod1"))
@@ -1233,7 +1365,9 @@ func TestWorkloadsForWaypointOrder(t *testing.T) {
 		}
 		assert.Equal(t, wl, expected)
 	}
-	s.addWaypoint(t, "10.0.0.1", "waypoint", "", true)
+	s.addWaypoint(t, "10.0.0.1", "waypoint", constants.WorkloadTraffic, true)
+	// Wait until waypoint is available
+	assert.EventuallyEqual(t, func() int { return len(s.waypoints.List("")) }, 1)
 
 	// expected order is pod3, pod1, pod2, which is the order of creation
 	s.addPods(t,
@@ -1290,9 +1424,10 @@ type ambientTestServer struct {
 	network   network.ID
 	fx        *xdsfake.Updater
 	pc        clienttest.TestClient[*corev1.Pod]
-	sc        clienttest.TestWriter[*corev1.Service]
+	sc        clienttest.TestClient[*corev1.Service]
 	ns        clienttest.TestWriter[*corev1.Namespace]
 	grc       clienttest.TestWriter[*k8sbeta.Gateway]
+	gwcls     clienttest.TestWriter[*k8sbeta.GatewayClass]
 	se        clienttest.TestWriter[*apiv1alpha3.ServiceEntry]
 	we        clienttest.TestWriter[*apiv1alpha3.WorkloadEntry]
 	pa        clienttest.TestWriter[*clientsecurityv1beta1.PeerAuthentication]
@@ -1304,10 +1439,12 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 	up := xdsfake.NewFakeXDS()
 	up.SplitEvents = true
 	cl := kubeclient.NewFakeClient()
+	t.Cleanup(cl.Shutdown)
 	for _, crd := range []schema.GroupVersionResource{
 		gvr.AuthorizationPolicy,
 		gvr.PeerAuthentication,
 		gvr.KubernetesGateway,
+		gvr.GatewayClass,
 		gvr.WorkloadEntry,
 		gvr.ServiceEntry,
 	} {
@@ -1341,14 +1478,25 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 		index:     idx.(*index),
 		fx:        up,
 		pc:        clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
-		sc:        clienttest.NewWriter[*corev1.Service](t, cl),
+		sc:        clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
 		ns:        clienttest.NewWriter[*corev1.Namespace](t, cl),
 		grc:       clienttest.NewWriter[*k8sbeta.Gateway](t, cl),
+		gwcls:     clienttest.NewWriter[*k8sbeta.GatewayClass](t, cl),
 		se:        clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
 		we:        clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
 		pa:        clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
 		authz:     clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
 	}
+
+	// assume this is installed with istio
+	a.gwcls.Create(&k8sbeta.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: constants.WaypointGatewayClassName,
+		},
+		Spec: k8sv1.GatewayClassSpec{
+			ControllerName: constants.ManagedGatewayMeshController,
+		},
+	})
 
 	// ns is more important now that we want to be able to annotate ns for svc, wl waypoint selection
 	// always create the testNS enabled for ambient
@@ -1362,7 +1510,7 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 	return a
 }
 
-func (s *ambientTestServer) addWaypoint(t *testing.T, ip, name, sa string, ready bool) {
+func (s *ambientTestServer) addWaypoint(t *testing.T, ip, name, trafficType string, ready bool) {
 	t.Helper()
 
 	fromSame := k8sv1.NamespacesFromSame
@@ -1394,11 +1542,14 @@ func (s *ambientTestServer) addWaypoint(t *testing.T, ip, name, sa string, ready
 		Spec:   gatewaySpec,
 		Status: k8sbeta.GatewayStatus{},
 	}
-	if sa != "" {
-		annotations := make(map[string]string, 1)
-		annotations[constants.WaypointServiceAccount] = sa
-		gateway.Annotations = annotations
+	annotations := make(map[string]string, 2)
+	if trafficType != "" && validTrafficTypes.Contains(trafficType) {
+		annotations[constants.AmbientWaypointForTrafficType] = trafficType
+	} else {
+		annotations[constants.AmbientWaypointForTrafficType] = constants.ServiceTraffic
 	}
+	gateway.Annotations = annotations
+
 	if ready {
 		addrType := k8sbeta.IPAddressType
 		gateway.Status = k8sbeta.GatewayStatus{
@@ -1459,6 +1610,19 @@ func (s *ambientTestServer) annotatePod(t *testing.T, name, ns string, annotatio
 	}
 	p.ObjectMeta.Annotations = annotations
 	s.pc.Update(p)
+}
+
+// just overwrites the annotations
+// nolint: unparam
+func (s *ambientTestServer) annotateService(t *testing.T, name, ns string, annotations map[string]string) {
+	t.Helper()
+
+	svc := s.sc.Get(name, testNS)
+	if svc == nil {
+		return
+	}
+	svc.ObjectMeta.Annotations = annotations
+	s.sc.Update(svc)
 }
 
 func (s *ambientTestServer) addWorkloadEntries(t *testing.T, ip string, name, sa string, labels map[string]string) {

@@ -45,8 +45,10 @@ type Index interface {
 	Lookup(key string) []model.AddressInfo
 	All() []model.AddressInfo
 	WorkloadsForWaypoint(key model.WaypointKey) []model.WorkloadInfo
+	ServicesForWaypoint(key model.WaypointKey) []model.ServiceInfo
 	Waypoint(network, address string) []netip.Addr
 	SyncAll()
+	HasSynced() bool
 	model.AmbientIndexes
 }
 
@@ -132,6 +134,9 @@ func New(options Options) Index {
 	gatewayClient := kclient.NewDelayedInformer[*v1beta1.Gateway](options.Client, gvr.KubernetesGateway, kubetypes.StandardInformer, filter)
 	Gateways := krt.WrapClient[*v1beta1.Gateway](gatewayClient, krt.WithName("Gateways"))
 
+	gatewayClassClient := kclient.NewDelayedInformer[*v1beta1.GatewayClass](options.Client, gvr.GatewayClass, kubetypes.StandardInformer, filter)
+	GatewayClasses := krt.WrapClient[*v1beta1.GatewayClass](gatewayClassClient, krt.WithName("GatewayClasses"))
+
 	Services := krt.NewInformerFiltered[*v1.Service](options.Client, filter, krt.WithName("Services"))
 	Pods := krt.NewInformerFiltered[*v1.Pod](options.Client, kclient.Filter{
 		ObjectFilter:    options.Client.ObjectFilter(),
@@ -142,7 +147,7 @@ func New(options Options) Index {
 	Namespaces := krt.NewInformer[*v1.Namespace](options.Client, krt.WithName("Namespaces"))
 
 	MeshConfig := MeshConfigCollection(ConfigMaps, options)
-	Waypoints := WaypointsCollection(Gateways)
+	Waypoints := WaypointsCollection(Gateways, GatewayClasses)
 
 	// AllPolicies includes peer-authentication converted policies
 	AuthorizationPolicies, AllPolicies := PolicyCollections(AuthzPolicies, PeerAuths, MeshConfig)
@@ -380,6 +385,13 @@ func (a *index) AddressInformation(addresses sets.String) ([]model.AddressInfo, 
 	return res, sets.New(removed...)
 }
 
+func (a *index) ServicesForWaypoint(key model.WaypointKey) []model.ServiceInfo {
+	return a.services.ByOwningWaypoint.Lookup(networkAddress{
+		network: key.Network,
+		ip:      key.Addresses[0],
+	})
+}
+
 func (a *index) WorkloadsForWaypoint(key model.WaypointKey) []model.WorkloadInfo {
 	// TODO: we should be able to handle multiple IPs or a hostname
 	if len(key.Addresses) == 0 {
@@ -389,17 +401,6 @@ func (a *index) WorkloadsForWaypoint(key model.WaypointKey) []model.WorkloadInfo
 		network: key.Network,
 		ip:      key.Addresses[0],
 	})
-	services := a.services.ByOwningWaypoint.Lookup(networkAddress{
-		network: key.Network,
-		ip:      key.Addresses[0],
-	})
-	workloadsFromServices := make([]model.WorkloadInfo, 0)
-	for _, s := range services {
-		svcWls := a.workloads.ByServiceKey.Lookup(namespacedHostname(s.Namespace, s.Hostname))
-		workloadsFromServices = append(workloadsFromServices, svcWls...)
-	}
-	// this is not deduplicated...
-	workloads = append(workloads, workloadsFromServices...)
 	workloads = model.SortWorkloadsByCreationTime(workloads)
 	return workloads
 }
@@ -469,6 +470,13 @@ func (a *index) AdditionalPodSubscriptions(
 
 func (a *index) SyncAll() {
 	a.networkUpdateTrigger.TriggerRecomputation()
+}
+
+func (a *index) HasSynced() bool {
+	return a.services.Synced().HasSynced() &&
+		a.workloads.Synced().HasSynced() &&
+		a.waypoints.Synced().HasSynced() &&
+		a.authorizationPolicies.Synced().HasSynced()
 }
 
 type LookupNetwork func(endpointIP string, labels labels.Instance) network.ID

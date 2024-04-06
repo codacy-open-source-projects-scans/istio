@@ -27,7 +27,6 @@ import (
 	istioKube "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/crd"
-	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
@@ -40,7 +39,6 @@ var _ io.Closer = &kubeComponent{}
 type kubeComponent struct {
 	id resource.ID
 
-	sa       string
 	ns       namespace.Instance
 	inbound  istioKube.PortForwarder
 	outbound istioKube.PortForwarder
@@ -49,10 +47,6 @@ type kubeComponent struct {
 
 func (k kubeComponent) Namespace() namespace.Instance {
 	return k.ns
-}
-
-func (k kubeComponent) ServiceAccount() string {
-	return k.sa
 }
 
 func (k kubeComponent) PodIP() string {
@@ -84,17 +78,15 @@ func (k kubeComponent) Close() error {
 // WaypointProxy describes a waypoint proxy deployment
 type WaypointProxy interface {
 	Namespace() namespace.Instance
-	ServiceAccount() string
 	Inbound() string
 	Outbound() string
 	PodIP() string
 }
 
 // NewWaypointProxy creates a new WaypointProxy.
-func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, sa string) (WaypointProxy, error) {
+func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, name string) (WaypointProxy, error) {
 	server := &kubeComponent{
 		ns: ns,
-		sa: sa,
 	}
 	server.id = ctx.TrackResource(server)
 	if err := crd.DeployGatewayAPI(ctx); err != nil {
@@ -113,8 +105,10 @@ func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, sa string) (W
 		"apply",
 		"--namespace",
 		ns.Name(),
-		"--service-account",
-		sa,
+		"--name",
+		name,
+		"--for",
+		constants.AllTraffic,
 	})
 	if err != nil {
 		return nil, err
@@ -122,7 +116,7 @@ func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, sa string) (W
 
 	cls := ctx.Clusters().Kube().Default()
 	// Find the Waypoint pod and service, and start forwarding a local port.
-	fetchFn := testKube.NewSinglePodFetch(cls, ns.Name(), fmt.Sprintf("%s=%s", constants.GatewayNameLabel, sa))
+	fetchFn := testKube.NewSinglePodFetch(cls, ns.Name(), fmt.Sprintf("%s=%s", constants.GatewayNameLabel, name))
 	pods, err := testKube.WaitUntilPodsAreReady(fetchFn)
 	if err != nil {
 		return nil, err
@@ -151,42 +145,13 @@ func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, sa string) (W
 }
 
 // NewWaypointProxyOrFail calls NewWaypointProxy and fails if an error occurs.
-func NewWaypointProxyOrFail(t framework.TestContext, ns namespace.Instance, sa string) WaypointProxy {
+func NewWaypointProxyOrFail(t framework.TestContext, ns namespace.Instance, name string) WaypointProxy {
 	t.Helper()
-	s, err := NewWaypointProxy(t, ns, sa)
+	s, err := NewWaypointProxy(t, ns, name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
-}
-
-func WaypointForInstance(ctx resource.Context, instance echo.Instance) (WaypointProxy, error) {
-	if !instance.Config().HasWaypointProxy() {
-		return nil, fmt.Errorf("%s does not have a WaypointProxy", instance.NamespaceName())
-	}
-
-	var waypoints []WaypointProxy
-	if err := ctx.GetResource(&waypoints); err != nil {
-		return nil, err
-	}
-
-	// TODO match the cluster of instance
-	ns := instance.NamespaceName()
-	sa := instance.Config().AccountName()
-	for _, waypoint := range waypoints {
-		if waypoint.Namespace().Name() == ns && waypoint.ServiceAccount() == sa {
-			return waypoint, nil
-		}
-	}
-	return nil, fmt.Errorf("could not find Waypoint %s/%s in test context", ns, sa)
-}
-
-func WaypointForInstanceOrFail(t framework.TestContext, instance echo.Instance) WaypointProxy {
-	out, err := WaypointForInstance(t, instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
 
 // ------------------------------
@@ -222,7 +187,6 @@ func DeleteWaypoint(t framework.TestContext, ns namespace.Instance, waypoint str
 		"delete",
 		"--namespace",
 		ns.Name(),
-		"--service-account",
 		waypoint,
 	})
 	waypointError := retry.UntilSuccess(func() error {
