@@ -62,8 +62,9 @@ import (
 
 // Constants for duration fields
 const (
+	// Set some high upper bound to avoid weird configurations
 	// nolint: revive
-	connectTimeoutMax = time.Second * 30
+	connectTimeoutMax = time.Hour
 	// nolint: revive
 	connectTimeoutMin = time.Millisecond
 
@@ -2610,6 +2611,18 @@ func validateTCPMatch(match *networking.L4MatchAttributes) (errs error) {
 	errs = appendErrors(errs, labels.Instance(match.SourceLabels).Validate())
 	errs = appendErrors(errs, validateGatewayNames(match.Gateways))
 	return
+}
+
+func validateStringMatch(sm *networking.StringMatch, where string) error {
+	switch sm.GetMatchType().(type) {
+	case *networking.StringMatch_Prefix:
+		if sm.GetPrefix() == "" {
+			return fmt.Errorf("%q: prefix string match should not be empty", where)
+		}
+	case *networking.StringMatch_Regex:
+		return validateStringMatchRegexp(sm, where)
+	}
+	return nil
 }
 
 func validateStringMatchRegexp(sm *networking.StringMatch, where string) error {
