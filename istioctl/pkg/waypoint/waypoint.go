@@ -92,10 +92,10 @@ func Cmd(ctx cli.Context) *cobra.Command {
 			return nil, fmt.Errorf("invalid traffic type: %s. Valid options are: %s", trafficType, validTrafficTypes.String())
 		}
 
-		if gw.Annotations == nil {
-			gw.Annotations = map[string]string{}
+		if gw.Labels == nil {
+			gw.Labels = map[string]string{}
 		}
-		gw.Annotations[constants.AmbientWaypointForTrafficType] = trafficType
+		gw.Labels[constants.AmbientWaypointForTrafficType] = trafficType
 
 		if revision != "" {
 			gw.Labels = map[string]string{label.IoIstioRev.Name: revision}
@@ -139,6 +139,24 @@ func Cmd(ctx cli.Context) *cobra.Command {
 			kubeClient, err := ctx.CLIClientWithRevision(revision)
 			if err != nil {
 				return fmt.Errorf("failed to create Kubernetes client: %v", err)
+			}
+			ns := ctx.NamespaceOrDefault(ctx.Namespace())
+			// If a user decides to enroll their namespace with a waypoint, verify that they have labeled their namespace as ambient.
+			// If they don't, the user will be warned and be presented with the command to label their namespace as ambient if they
+			// choose to do so.
+			//
+			// NOTE: This is a warning and not an error because the user may not intend to label their namespace as ambient.
+			//
+			// e.g. Users are handling ambient redirection per workload rather than at the namespace level.
+			if enrollNamespace {
+				namespaceIsLabeledAmbient, err := namespaceIsLabeledAmbient(kubeClient, ns)
+				if err != nil {
+					return fmt.Errorf("failed to check if namespace is labeled ambient: %v", err)
+				}
+				if !namespaceIsLabeledAmbient {
+					fmt.Fprintf(cmd.OutOrStdout(), "Warning: namespace is not enrolled in ambient. Consider running\t"+
+						"`"+"kubectl label namespace %s istio.io/dataplane-mode=ambient"+"`\n", ns)
+				}
 			}
 			gw, err := makeGateway(true)
 			if err != nil {
@@ -188,14 +206,15 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "waypoint %v/%v applied\n", gw.Namespace, gw.Name)
-			// If a user decides to enroll their namespace with a waypoint, annotate the namespace with the waypoint name.
+
+			// If a user decides to enroll their namespace with a waypoint, label the namespace with the waypoint name
+			// after the waypoint has been applied.
 			if enrollNamespace {
-				ns := ctx.NamespaceOrDefault(ctx.Namespace())
-				err = annotateNamespaceWithWaypoint(kubeClient, ns)
+				err = labelNamespaceWithWaypoint(kubeClient, ns)
 				if err != nil {
-					return fmt.Errorf("failed to annotate namespace with waypoint: %v", err)
+					return fmt.Errorf("failed to label namespace with waypoint: %v", err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "namespace %v annotated with waypoint %v\n", ctx.NamespaceOrDefault(ctx.Namespace()), gw.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "namespace %v labeled with \"%v: %v\"\n", ctx.NamespaceOrDefault(ctx.Namespace()), constants.AmbientUseWaypoint, gw.Name)
 			}
 			return nil
 		},
@@ -203,11 +222,11 @@ func Cmd(ctx cli.Context) *cobra.Command {
 	waypointApplyCmd.PersistentFlags().StringVar(&trafficType,
 		"for",
 		"service",
-		fmt.Sprintf("Specify the traffic type %s for the waypoint", validTrafficTypes.String()),
+		fmt.Sprintf("Specify the traffic type %s for the waypoint", sets.SortedList(validTrafficTypes)),
 	)
 
 	waypointApplyCmd.PersistentFlags().BoolVarP(&enrollNamespace, "enroll-namespace", "", false,
-		"If set, the namespace will be annotated with the waypoint name")
+		"If set, the namespace will be labeled with the waypoint name")
 
 	waypointDeleteCmd := &cobra.Command{
 		Use:   "delete",
@@ -398,19 +417,32 @@ func deleteWaypoints(cmd *cobra.Command, kubeClient kube.CLIClient, namespace st
 	return multiErr.ErrorOrNil()
 }
 
-func annotateNamespaceWithWaypoint(kubeClient kube.CLIClient, ns string) error {
+func labelNamespaceWithWaypoint(kubeClient kube.CLIClient, ns string) error {
 	nsObj, err := kubeClient.Kube().CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return fmt.Errorf("namespace: %s not found", ns)
 	} else if err != nil {
 		return fmt.Errorf("failed to get namespace %s: %v", ns, err)
 	}
-	if nsObj.Annotations == nil {
-		nsObj.Annotations = map[string]string{}
+	if nsObj.Labels == nil {
+		nsObj.Labels = map[string]string{}
 	}
-	nsObj.Annotations[constants.AmbientUseWaypoint] = waypointName
+	nsObj.Labels[constants.AmbientUseWaypoint] = waypointName
 	if _, err := kubeClient.Kube().CoreV1().Namespaces().Update(context.Background(), nsObj, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("failed to update namespace %s: %v", ns, err)
 	}
 	return nil
+}
+
+func namespaceIsLabeledAmbient(kubeClient kube.CLIClient, ns string) (bool, error) {
+	nsObj, err := kubeClient.Kube().CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return false, fmt.Errorf("namespace: %s not found", ns)
+	} else if err != nil {
+		return false, fmt.Errorf("failed to get namespace %s: %v", ns, err)
+	}
+	if nsObj.Labels == nil {
+		return false, nil
+	}
+	return nsObj.Labels[constants.DataplaneMode] == constants.DataplaneModeAmbient, nil
 }

@@ -32,12 +32,9 @@ import (
 	"istio.io/istio/istioctl/pkg/completion"
 	"istio.io/istio/istioctl/pkg/kubeinject"
 	istioctlutil "istio.io/istio/istioctl/pkg/util"
-	ambientutil "istio.io/istio/istioctl/pkg/util/ambient"
-	"istio.io/istio/istioctl/pkg/writer"
 	sdscompare "istio.io/istio/istioctl/pkg/writer/compare/sds"
 	"istio.io/istio/istioctl/pkg/writer/envoy/clusters"
 	"istio.io/istio/istioctl/pkg/writer/envoy/configdump"
-	ztunnelDump "istio.io/istio/istioctl/pkg/writer/ztunnel/configdump"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/host"
@@ -61,7 +58,7 @@ var (
 	verboseProxyConfig      bool
 	waypointProxyConfig     bool
 
-	address, listenerType, statsType, node string
+	address, listenerType, statsType string
 
 	routeName string
 
@@ -141,23 +138,6 @@ func extractConfigDump(kubeClient kube.CLIClient, podName, podNamespace string, 
 	return debug, err
 }
 
-func extractZtunnelConfigDump(kubeClient kube.CLIClient, podName, podNamespace string) ([]byte, error) {
-	path := "config_dump"
-	debug, err := kubeClient.EnvoyDoWithPort(context.TODO(), podName, podNamespace, "GET", path, 15000)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute command on %s.%s ztunnel: %v", podName, podNamespace, err)
-	}
-	return debug, err
-}
-
-func setupZtunnelConfigDumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, out io.Writer) (*ztunnelDump.ConfigWriter, error) {
-	debug, err := extractZtunnelConfigDump(kubeClient, podName, podNamespace)
-	if err != nil {
-		return nil, err
-	}
-	return setupConfigdumpZtunnelConfigWriter(debug, out)
-}
-
 func setupPodConfigdumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, includeEds bool, out io.Writer) (*configdump.ConfigWriter, error) {
 	debug, err := extractConfigDump(kubeClient, podName, podNamespace, includeEds)
 	if err != nil {
@@ -183,29 +163,12 @@ func readFile(filename string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-func setupFileZtunnelConfigdumpWriter(filename string, out io.Writer) (*ztunnelDump.ConfigWriter, error) {
-	data, err := readFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	return setupConfigdumpZtunnelConfigWriter(data, out)
-}
-
 func setupFileConfigdumpWriter(filename string, out io.Writer) (*configdump.ConfigWriter, error) {
 	data, err := readFile(filename)
 	if err != nil {
 		return nil, err
 	}
 	return setupConfigdumpEnvoyConfigWriter(data, out)
-}
-
-func setupConfigdumpZtunnelConfigWriter(debug []byte, out io.Writer) (*ztunnelDump.ConfigWriter, error) {
-	cw := &ztunnelDump.ConfigWriter{Stdout: out}
-	err := cw.Prime(debug)
-	if err != nil {
-		return nil, err
-	}
-	return cw, nil
 }
 
 func setupConfigdumpEnvoyConfigWriter(debug []byte, out io.Writer) (*configdump.ConfigWriter, error) {
@@ -378,9 +341,7 @@ func clusterConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	clusterConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -434,12 +395,7 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					ztunnelPod := ambientutil.IsZtunnelPod(kubeClient, podName, podNamespace)
-					if ztunnelPod {
-						dump, err = extractZtunnelConfigDump(kubeClient, podName, podNamespace)
-					} else {
-						dump, err = extractConfigDump(kubeClient, podName, podNamespace, true)
-					}
+					dump, err = extractConfigDump(kubeClient, podName, podNamespace, true)
 					if err != nil {
 						return err
 					}
@@ -462,20 +418,6 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 					podName, podNamespace, err := getPodName(ctx, args[0])
 					if err != nil {
 						return err
-					}
-
-					ztunnelPod := ambientutil.IsZtunnelPod(kubeClient, podName, podNamespace)
-					if ztunnelPod {
-						w, err := setupZtunnelConfigDumpWriter(kubeClient, podName, podNamespace, c.OutOrStdout())
-						if err != nil {
-							return err
-						}
-
-						return w.PrintFullSummary(ztunnelDump.WorkloadFilter{
-							Address: address,
-							Node:    node,
-							Verbose: verboseProxyConfig,
-						})
 					}
 
 					configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, true, c.OutOrStdout())
@@ -520,9 +462,7 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 			}
 			return nil
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	allConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -612,9 +552,7 @@ func listenerConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	listenerConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -698,9 +636,7 @@ func StatsConfigCmd(ctx cli.Context) *cobra.Command {
 
 			return nil
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 	statsConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short|prom|prom-merged")
 	statsConfigCmd.PersistentFlags().StringVarP(&statsType, "type", "t", "server", "Where to grab the stats: one of server|clusters")
@@ -833,9 +769,7 @@ func logCmd(ctx cli.Context) *cobra.Command {
 			}
 			return nil
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	levelListString := fmt.Sprintf("[%s, %s, %s, %s, %s, %s, %s]",
@@ -915,9 +849,7 @@ func routeConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	routeConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -996,9 +928,7 @@ func endpointConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	endpointConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -1084,9 +1014,7 @@ func edsConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	endpointConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -1155,9 +1083,7 @@ func bootstrapConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	bootstrapConfigCmd.Flags().StringVarP(&outputFormat, "output", "o", jsonOutput, "Output format: one of json|yaml|short")
@@ -1189,7 +1115,7 @@ func secretConfigCmd(ctx cli.Context) *cobra.Command {
 			return nil
 		},
 		RunE: func(c *cobra.Command, args []string) error {
-			var newWriter writer.ConfigDumpWriter
+			var cw *configdump.ConfigWriter
 			kubeClient, err := ctx.CLIClient()
 			if err != nil {
 				return err
@@ -1198,22 +1124,11 @@ func secretConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				ztunnelPod := ambientutil.IsZtunnelPod(kubeClient, podName, podNamespace)
-				if ztunnelPod {
-					newWriter, err = setupZtunnelConfigDumpWriter(kubeClient, podName, podNamespace, c.OutOrStdout())
-				} else {
-					newWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
-				}
+				cw, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
 			} else {
-				newWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
+				cw, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 				if err != nil {
-					envoyError := err
-					newWriter, err = setupFileZtunnelConfigdumpWriter(configDumpFile, c.OutOrStdout())
-					if err != nil {
-						// failed to parse envoy and ztunnel formats
-						log.Warnf("couldn't parse envoy secrets dump: %v", envoyError)
-						log.Warnf("couldn't parse ztunnel secrets dump %v", err)
-					}
+					log.Warnf("couldn't parse envoy secrets dump: %v", err)
 				}
 			}
 			if err != nil {
@@ -1221,16 +1136,14 @@ func secretConfigCmd(ctx cli.Context) *cobra.Command {
 			}
 			switch outputFormat {
 			case summaryOutput:
-				return newWriter.PrintSecretSummary()
+				return cw.PrintSecretSummary()
 			case jsonOutput, yamlOutput:
-				return newWriter.PrintSecretDump(outputFormat)
+				return cw.PrintSecretDump(outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	secretConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
@@ -1297,9 +1210,7 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 			}
 			return returnErr
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	rootCACompareConfigCmd.Long += "\n\n" + istioctlutil.ExperimentalMsg
@@ -1307,14 +1218,6 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 }
 
 func extractRootCA(client kube.CLIClient, podName, podNamespace string, out io.Writer) (string, error) {
-	ztunnelPod := ambientutil.IsZtunnelPod(client, podName, podNamespace)
-	if ztunnelPod {
-		configWriter, err := setupZtunnelConfigDumpWriter(client, podName, podNamespace, out)
-		if err != nil {
-			return "", err
-		}
-		return configWriter.PrintPodRootCAFromDynamicSecretDump()
-	}
 	configWriter, err := setupPodConfigdumpWriter(client, podName, podNamespace, false, out)
 	if err != nil {
 		return "", err
@@ -1440,9 +1343,7 @@ func ecdsConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return completion.ValidPodsNameArgs(cmd, ctx, args, toComplete)
-		},
+		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
 
 	ecdsConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")

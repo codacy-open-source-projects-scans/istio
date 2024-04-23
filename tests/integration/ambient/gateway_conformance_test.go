@@ -122,6 +122,7 @@ func TestGatewayConformance(t *testing.T) {
 				NamespaceLabels: map[string]string{
 					constants.DataplaneMode: "ambient",
 				},
+				TimeoutConfig: ctx.Settings().GatewayConformanceTimeoutConfig,
 			}
 
 			ctx.Cleanup(func() {
@@ -157,12 +158,12 @@ func TestGatewayConformance(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				annotations := ns.Annotations
-				if annotations == nil {
-					annotations = make(map[string]string)
+				labels := ns.Labels
+				if labels == nil {
+					labels = make(map[string]string)
 				}
-				annotations[constants.AmbientUseWaypoint] = "namespace"
-				ns.Annotations = annotations
+				labels[constants.AmbientUseWaypoint] = "namespace"
+				ns.Labels = labels
 				k.Kube().CoreV1().Namespaces().Update(ctx.Context(), ns, metav1.UpdateOptions{})
 			}
 

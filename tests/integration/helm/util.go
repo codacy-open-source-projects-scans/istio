@@ -27,9 +27,11 @@ import (
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/client-go/pkg/apis/networking/v1alpha3"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
@@ -81,6 +83,89 @@ global:
   variant: %q
 profile: ambient
 `
+	sampleEnvoyFilter = `
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: sample
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+  - applyTo: NETWORK_FILTER # http connection manager is a filter in Envoy
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          sni: app.example.com
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+    patch:
+      operation: MERGE
+      value:
+        typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
+          xff_num_trusted_hops: 5
+          common_http_protocol_options:
+            idle_timeout: 30s
+`
+
+	revisionedSampleEnvoyFilter = `
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: sample
+  labels:
+    istio.io/rev: %s
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+  - applyTo: NETWORK_FILTER # http connection manager is a filter in Envoy
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          sni: app.example.com
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+    patch:
+      operation: MERGE
+      value:
+        typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
+          xff_num_trusted_hops: 5
+          common_http_protocol_options:
+            idle_timeout: 30s
+`
+
+	extendedTelemetry = `
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: sample
+spec:
+  metrics:
+    - providers:
+      - name: prometheus
+      reportingInterval: 10s
+`
+
+	revisionedExtendedTelemetry = `
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: sample
+  labels:
+    istio.io/rev: %s
+spec:
+  metrics:
+    - providers:
+      - name: prometheus
+      reportingInterval: 10s
+`
 )
 
 // ManifestsChartPath is path of local Helm charts used for testing.
@@ -102,10 +187,52 @@ func GetValuesOverrides(ctx framework.TestContext, hub, tag, variant, revision s
 	return overrideValuesFile
 }
 
+var DefaultNamespaceConfig = NewNamespaceConfig()
+
+func NewNamespaceConfig(config ...types.NamespacedName) NamespaceConfig {
+	return &nsConfig{
+		config: config,
+	}
+}
+
+type nsConfig struct {
+	config []types.NamespacedName
+}
+
+func (n *nsConfig) Get(name string) string {
+	for _, nsn := range n.config {
+		if name == nsn.Name {
+			return nsn.Namespace
+		}
+	}
+	return IstioNamespace
+}
+
+func (n *nsConfig) AllNamespaces() []string {
+	unique := map[string]any{}
+	for _, nsname := range n.config {
+		unique[nsname.Namespace] = struct{}{}
+	}
+	namespaces := make([]string, 0, 4)
+	for k := range unique {
+		namespaces = append(namespaces, k)
+	}
+	return namespaces
+}
+
+type NamespaceConfig interface {
+	Get(name string) string
+	AllNamespaces() []string
+}
+
 // InstallIstio install Istio using Helm charts with the provided
 // override values file and fails the tests on any failures.
-func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, overrideValuesFile, version string, installGateway bool, ambientProfile bool,
+func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, overrideValuesFile,
+	version string, installGateway bool, ambientProfile bool, nsConfig NamespaceConfig,
 ) {
+	for _, ns := range nsConfig.AllNamespaces() {
+		CreateNamespace(t, cs, ns)
+	}
 	CreateNamespace(t, cs, IstioNamespace)
 
 	versionArgs := ""
@@ -138,19 +265,19 @@ func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, ove
 	}
 
 	// Install base chart
-	err := h.InstallChart(BaseReleaseName, baseChartPath, IstioNamespace, overrideValuesFile, Timeout, versionArgs)
+	err := h.InstallChart(BaseReleaseName, baseChartPath, nsConfig.Get(BaseReleaseName), overrideValuesFile, Timeout, versionArgs)
 	if err != nil {
 		t.Fatalf("failed to install istio %s chart: %v", BaseChart, err)
 	}
 
 	// Install discovery chart
-	err = h.InstallChart(IstiodReleaseName, discoveryChartPath, IstioNamespace, overrideValuesFile, Timeout, versionArgs)
+	err = h.InstallChart(IstiodReleaseName, discoveryChartPath, nsConfig.Get(IstiodReleaseName), overrideValuesFile, Timeout, versionArgs)
 	if err != nil {
 		t.Fatalf("failed to install istio %s chart: %v", DiscoveryChartsDir, err)
 	}
 
 	if installGateway {
-		err = h.InstallChart(IngressReleaseName, gatewayChartPath, IstioNamespace, gatewayOverrideValuesFile, Timeout, versionArgs)
+		err = h.InstallChart(IngressReleaseName, gatewayChartPath, nsConfig.Get(IngressReleaseName), gatewayOverrideValuesFile, Timeout, versionArgs)
 		if err != nil {
 			t.Fatalf("failed to install istio %s chart: %v", GatewayChartsDir, err)
 		}
@@ -158,13 +285,13 @@ func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, ove
 
 	if ambientProfile {
 		// Install cni chart
-		err = h.InstallChart(CniReleaseName, cniChartPath, IstioNamespace, overrideValuesFile, Timeout, versionArgs)
+		err = h.InstallChart(CniReleaseName, cniChartPath, nsConfig.Get(CniReleaseName), overrideValuesFile, Timeout, versionArgs)
 		if err != nil {
 			t.Fatalf("failed to install istio %s chart: %v", CniChartsDir, err)
 		}
 
 		// Install ztunnel chart
-		err = h.InstallChart(ZtunnelReleaseName, ztunnelChartPath, IstioNamespace, overrideValuesFile, Timeout, versionArgs)
+		err = h.InstallChart(ZtunnelReleaseName, ztunnelChartPath, nsConfig.Get(ZtunnelReleaseName), overrideValuesFile, Timeout, versionArgs)
 		if err != nil {
 			t.Fatalf("failed to install istio %s chart: %v", ZtunnelChartsDir, err)
 		}
@@ -232,37 +359,42 @@ func CreateNamespace(t test.Failer, cs cluster.Cluster, namespace string) {
 }
 
 // DeleteIstio deletes installed Istio Helm charts and resources
-func DeleteIstio(t framework.TestContext, h *helm.Helm, cs *kube.Cluster, isAmbient bool) {
+func DeleteIstio(t framework.TestContext, h *helm.Helm, cs *kube.Cluster, config NamespaceConfig, isAmbient bool) {
 	scopes.Framework.Infof("cleaning up resources")
-	if err := h.DeleteChart(IngressReleaseName, IstioNamespace); err != nil {
+	if err := h.DeleteChart(IngressReleaseName, config.Get(IngressReleaseName)); err != nil {
 		t.Errorf("failed to delete %s release: %v", IngressReleaseName, err)
 	}
-	if err := h.DeleteChart(IstiodReleaseName, IstioNamespace); err != nil {
+	if err := h.DeleteChart(IstiodReleaseName, config.Get(IstiodReleaseName)); err != nil {
 		t.Errorf("failed to delete %s release: %v", IstiodReleaseName, err)
 	}
 	if isAmbient {
-		if err := h.DeleteChart(ZtunnelReleaseName, IstioNamespace); err != nil {
+		if err := h.DeleteChart(ZtunnelReleaseName, config.Get(ZtunnelReleaseName)); err != nil {
 			t.Errorf("failed to delete %s release: %v", ZtunnelReleaseName, err)
 		}
-		if err := h.DeleteChart(CniReleaseName, IstioNamespace); err != nil {
+		if err := h.DeleteChart(CniReleaseName, config.Get(CniReleaseName)); err != nil {
 			t.Errorf("failed to delete %s release: %v", CniReleaseName, err)
 		}
 	}
-	if err := h.DeleteChart(BaseReleaseName, IstioNamespace); err != nil {
+	if err := h.DeleteChart(BaseReleaseName, config.Get(BaseReleaseName)); err != nil {
 		t.Errorf("failed to delete %s release: %v", BaseReleaseName, err)
 	}
-	if err := cs.Kube().CoreV1().Namespaces().Delete(context.TODO(), IstioNamespace, metav1.DeleteOptions{}); err != nil {
-		t.Errorf("failed to delete istio namespace: %v", err)
-	}
-	if err := kubetest.WaitForNamespaceDeletion(cs.Kube(), IstioNamespace, retry.Timeout(RetryTimeOut)); err != nil {
-		t.Errorf("waiting for istio namespace to be deleted: %v", err)
+	for _, ns := range config.AllNamespaces() {
+		if ns == constants.KubeSystemNamespace {
+			continue
+		}
+		if err := cs.Kube().CoreV1().Namespaces().Delete(context.TODO(), ns, metav1.DeleteOptions{}); err != nil {
+			t.Errorf("failed to delete %s namespace: %v", ns, err)
+		}
+		if err := kubetest.WaitForNamespaceDeletion(cs.Kube(), ns, retry.Timeout(RetryTimeOut)); err != nil {
+			t.Errorf("waiting for %s namespace to be deleted: %v", ns, err)
+		}
 	}
 }
 
 // VerifyInstallation verify that the Helm installation is successful
-func VerifyPodReady(ctx framework.TestContext, cs cluster.Cluster, label string) {
+func VerifyPodReady(ctx framework.TestContext, cs cluster.Cluster, ns, label string) {
 	retry.UntilSuccessOrFail(ctx, func() error {
-		if _, err := kubetest.CheckPodsAreReady(kubetest.NewPodFetch(cs, IstioNamespace, label)); err != nil {
+		if _, err := kubetest.CheckPodsAreReady(kubetest.NewPodFetch(cs, ns, label)); err != nil {
 			return fmt.Errorf("%s pod is not ready: %v", label, err)
 		}
 		return nil
@@ -270,20 +402,24 @@ func VerifyPodReady(ctx framework.TestContext, cs cluster.Cluster, label string)
 }
 
 // VerifyInstallation verify that the Helm installation is successful
-func VerifyInstallation(ctx framework.TestContext, cs cluster.Cluster, verifyGateway bool, verifyAmbient bool) {
+func VerifyInstallation(ctx framework.TestContext, cs cluster.Cluster, nsConfig NamespaceConfig, verifyGateway bool, verifyAmbient bool, revision string) {
 	scopes.Framework.Infof("=== verifying istio installation === ")
 
+	validatingwebhookName := "istiod-default-validator"
+	if revision != "" {
+		validatingwebhookName = fmt.Sprintf("istio-validator-%s-istio-system", revision)
+	}
 	VerifyValidatingWebhookConfigurations(ctx, cs, []string{
-		"istiod-default-validator",
+		validatingwebhookName,
 	})
 
-	VerifyPodReady(ctx, cs, "app=istiod")
+	VerifyPodReady(ctx, cs, nsConfig.Get(IstiodReleaseName), "app=istiod")
 	if verifyAmbient {
-		VerifyPodReady(ctx, cs, "app=ztunnel")
-		VerifyPodReady(ctx, cs, "k8s-app=istio-cni-node")
+		VerifyPodReady(ctx, cs, nsConfig.Get(ZtunnelReleaseName), "app=ztunnel")
+		VerifyPodReady(ctx, cs, nsConfig.Get(CniReleaseName), "k8s-app=istio-cni-node")
 	}
 	if verifyGateway {
-		VerifyPodReady(ctx, cs, "app=istio-ingress")
+		VerifyPodReady(ctx, cs, nsConfig.Get(IngressReleaseName), "app=istio-ingress")
 	}
 	scopes.Framework.Infof("=== succeeded ===")
 }
@@ -343,7 +479,7 @@ func VerifyValidatingWebhookConfigurations(ctx framework.TestContext, cs cluster
 }
 
 // verifyValidation verifies that Istio resource validation is active on the cluster.
-func verifyValidation(ctx framework.TestContext) {
+func verifyValidation(ctx framework.TestContext, revision string) {
 	ctx.Helper()
 	invalidGateway := &v1alpha3.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -353,6 +489,11 @@ func verifyValidation(ctx framework.TestContext) {
 		Spec: networking.Gateway{},
 	}
 
+	if revision != "" {
+		invalidGateway.Labels = map[string]string{
+			"istio.io/rev": revision,
+		}
+	}
 	createOptions := metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}}
 	istioClient := ctx.Clusters().Default().Istio().NetworkingV1alpha3()
 	retry.UntilOrFail(ctx, func() bool {

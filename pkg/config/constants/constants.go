@@ -98,7 +98,7 @@ const (
 	IstioMeshGateway = "mesh"
 
 	// DefaultNamespaceWaypoint is the default name for a waypoint in a namespace.
-	DefaultNamespaceWaypoint = "default-namespace"
+	DefaultNamespaceWaypoint = "waypoint"
 
 	// The data name in the ConfigMap of each namespace storing the root cert of non-Kube CA.
 	CACertNamespaceConfigMapDataName = "root-cert.pem"
@@ -197,10 +197,10 @@ const (
 	// AmbientRedirectionDisabled is an opt-out, configured by user.
 	AmbientRedirectionDisabled = "disabled"
 
-	// AmbientUseWaypoint is the annotation used to specify which waypoint should be used for a given pod, service, etc...
+	// AmbientUseWaypoint is the label used to specify which waypoint should be used for a given pod, service, etc...
 	AmbientUseWaypoint = "istio.io/use-waypoint"
-	// AmbientWaypointForTrafficType is the annotation used to specify which traffic is allowed through the Waypoint.
-	// This annotation is applied to the Waypoint. Valid traffic types are "service", "workload", "all", and "none".
+	// AmbientWaypointForTrafficType is the label used to specify which traffic is allowed through the Waypoint.
+	// This label is applied to the Waypoint. Valid traffic types are "service", "workload", "all", and "none".
 	AmbientWaypointForTrafficType = "istio.io/waypoint-for"
 
 	// AmbientWaypointInboundBinding has the format `<protocol>` or `<protocol>/<port>`. If the waypoint is
