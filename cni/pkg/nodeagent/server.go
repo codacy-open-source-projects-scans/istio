@@ -44,8 +44,7 @@ type MeshDataplane interface {
 
 	//	IsPodInMesh(ctx context.Context, pod *metav1.ObjectMeta, netNs string) (bool, error)
 	AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs []netip.Addr, netNs string) error
-	RemovePodFromMesh(ctx context.Context, pod *corev1.Pod) error
-	DelPodFromMesh(ctx context.Context, pod *corev1.Pod) error
+	RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error
 
 	Stop()
 }
@@ -86,21 +85,20 @@ func NewServer(ctx context.Context, ready *atomic.Value, pluginSocket string, ar
 		return nil, fmt.Errorf("error initializing the ztunnel server: %w", err)
 	}
 
-	iptablesConfigurator, err := iptables.NewIptablesConfigurator(cfg, realDependencies(), iptables.RealNlDeps())
+	hostIptables, podIptables, err := iptables.NewIptablesConfigurator(cfg, realDependenciesHost(), realDependenciesInpod(), iptables.RealNlDeps())
 	if err != nil {
 		return nil, fmt.Errorf("error configuring iptables: %w", err)
 	}
 
 	// Create hostprobe rules now, in the host netns
-	// Later we will reuse this same configurator inside the pod netns for adding other rules
-	iptablesConfigurator.DeleteHostRules()
+	hostIptables.DeleteHostRules()
 
-	if err := iptablesConfigurator.CreateHostRulesForHealthChecks(&HostProbeSNATIP, &HostProbeSNATIPV6); err != nil {
+	if err := hostIptables.CreateHostRulesForHealthChecks(&HostProbeSNATIP, &HostProbeSNATIPV6); err != nil {
 		return nil, fmt.Errorf("error initializing the host rules for health checks: %w", err)
 	}
 
 	podNetns := NewPodNetnsProcFinder(os.DirFS(filepath.Join(pconstants.HostMountsPath, "proc")))
-	netServer := newNetServer(ztunnelServer, podNsMap, iptablesConfigurator, podNetns, set)
+	netServer := newNetServer(ztunnelServer, podNsMap, hostIptables, podIptables, podNetns, set)
 
 	// Set some defaults
 	s := &Server{
@@ -225,9 +223,9 @@ func (s *meshDataplane) AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIP
 	return retErr
 }
 
-func (s *meshDataplane) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod) error {
+func (s *meshDataplane) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error {
 	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
-	err := s.netServer.RemovePodFromMesh(ctx, pod)
+	err := s.netServer.RemovePodFromMesh(ctx, pod, isDelete)
 	if err != nil {
 		log.Errorf("failed to remove pod from mesh: %v", err)
 		return err
@@ -238,15 +236,4 @@ func (s *meshDataplane) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod) 
 		log.Errorf("failed to annotate pod unenrollment: %v", err)
 	}
 	return err
-}
-
-// Delete pod from mesh: pod is deleted. iptables rules will die with it, we just need to update ztunnel
-func (s *meshDataplane) DelPodFromMesh(ctx context.Context, pod *corev1.Pod) error {
-	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
-	err := s.netServer.DelPodFromMesh(ctx, pod)
-	if err != nil {
-		log.Errorf("failed to delete pod from mesh: %v", err)
-		return err
-	}
-	return nil
 }

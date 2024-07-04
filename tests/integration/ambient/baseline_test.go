@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ import (
 
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/http/headers"
 	"istio.io/istio/pkg/kube/inject"
 	"istio.io/istio/pkg/ptr"
@@ -53,6 +55,7 @@ import (
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
+	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource/config/apply"
 	"istio.io/istio/pkg/test/framework/resource/config/cleanup"
 	kubetest "istio.io/istio/pkg/test/kube"
@@ -1283,86 +1286,88 @@ spec:
 }
 
 func TestL7JWT(t *testing.T) {
-	framework.NewTest(t).Run(func(t framework.TestContext) {
-		applyDrainingWorkaround(t)
-		runTestToServiceWaypoint(t, func(t framework.TestContext, src echo.Instance, dst echo.Instance, opt echo.CallOptions) {
-			if opt.Scheme != scheme.HTTP {
-				return
-			}
-			// Ensure we don't get stuck on old connections with old RBAC rules. This causes 45s test times
-			// due to draining.
-			opt.NewConnectionPerRequest = true
-
-			switch {
-			case dst.Config().HasWorkloadAddressedWaypointProxy() && !dst.Config().HasServiceAddressedWaypointProxy():
-				// send traffic to the workload instead of the service so it will redirect to the WL waypoint
-				opt.Address = dst.MustWorkloads().Addresses()[0]
-				opt.Port = echo.Port{ServicePort: ports.All().MustForName(opt.Port.Name).WorkloadPort}
-				if src == dst {
-					t.Skip("self call is not captured, L7 features will not work")
+	framework.NewTest(t).
+		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
+		Run(func(t framework.TestContext) {
+			applyDrainingWorkaround(t)
+			runTestToServiceWaypoint(t, func(t framework.TestContext, src echo.Instance, dst echo.Instance, opt echo.CallOptions) {
+				if opt.Scheme != scheme.HTTP {
+					return
 				}
-			}
+				// Ensure we don't get stuck on old connections with old RBAC rules. This causes 45s test times
+				// due to draining.
+				opt.NewConnectionPerRequest = true
 
-			t.ConfigIstio().New().EvalFile(apps.Namespace.Name(), map[string]any{
-				param.Namespace.String(): apps.Namespace.Name(),
-				"Services":               apps.ServiceAddressedWaypoint,
-				"To":                     dst,
-			}, "testdata/requestauthn/waypoint-jwt.yaml.tmpl").ApplyOrFail(t)
+				switch {
+				case dst.Config().HasWorkloadAddressedWaypointProxy() && !dst.Config().HasServiceAddressedWaypointProxy():
+					// send traffic to the workload instead of the service so it will redirect to the WL waypoint
+					opt.Address = dst.MustWorkloads().Addresses()[0]
+					opt.Port = echo.Port{ServicePort: ports.All().MustForName(opt.Port.Name).WorkloadPort}
+					if src == dst {
+						t.Skip("self call is not captured, L7 features will not work")
+					}
+				}
 
-			t.NewSubTest("deny without token").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/"
-				opt.Check = check.Status(http.StatusForbidden)
-				src.CallOrFail(t, opt)
-			})
+				t.ConfigIstio().New().EvalFile(apps.Namespace.Name(), map[string]any{
+					param.Namespace.String(): apps.Namespace.Name(),
+					"Services":               apps.ServiceAddressedWaypoint,
+					"To":                     dst,
+				}, "testdata/requestauthn/waypoint-jwt.yaml.tmpl").ApplyOrFail(t)
 
-			t.NewSubTest("allow with sub-1 token").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/"
-				opt.HTTP.Headers = headers.New().
-					WithAuthz(jwt.TokenIssuer1).
-					Build()
-				opt.Check = check.OK()
-			})
+				t.NewSubTest("deny without token").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/"
+					opt.Check = check.Status(http.StatusForbidden)
+					src.CallOrFail(t, opt)
+				})
 
-			t.NewSubTest("deny with sub-3 token due to ignored RequestAuthentication").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/"
-				opt.HTTP.Headers = headers.New().
-					WithAuthz(jwt.TokenIssuer3).
-					Build()
-				opt.Check = check.Status(http.StatusUnauthorized)
-				src.CallOrFail(t, opt)
-			})
+				t.NewSubTest("allow with sub-1 token").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/"
+					opt.HTTP.Headers = headers.New().
+						WithAuthz(jwt.TokenIssuer1).
+						Build()
+					opt.Check = check.OK()
+				})
 
-			t.NewSubTest("deny with sub-2 token").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/"
-				opt.HTTP.Headers = headers.New().
-					WithAuthz(jwt.TokenIssuer2).
-					Build()
-				opt.Check = check.Status(http.StatusForbidden)
-				src.CallOrFail(t, opt)
-			})
+				t.NewSubTest("deny with sub-3 token due to ignored RequestAuthentication").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/"
+					opt.HTTP.Headers = headers.New().
+						WithAuthz(jwt.TokenIssuer3).
+						Build()
+					opt.Check = check.Status(http.StatusUnauthorized)
+					src.CallOrFail(t, opt)
+				})
 
-			t.NewSubTest("deny with expired token").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/"
-				opt.HTTP.Headers = headers.New().
-					WithAuthz(jwt.TokenExpired).
-					Build()
-				opt.Check = check.Status(http.StatusUnauthorized)
-				src.CallOrFail(t, opt)
-			})
+				t.NewSubTest("deny with sub-2 token").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/"
+					opt.HTTP.Headers = headers.New().
+						WithAuthz(jwt.TokenIssuer2).
+						Build()
+					opt.Check = check.Status(http.StatusForbidden)
+					src.CallOrFail(t, opt)
+				})
 
-			t.NewSubTest("allow healthz").Run(func(t framework.TestContext) {
-				opt := opt.DeepCopy()
-				opt.HTTP.Path = "/healthz"
-				opt.Check = check.OK()
-				src.CallOrFail(t, opt)
+				t.NewSubTest("deny with expired token").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/"
+					opt.HTTP.Headers = headers.New().
+						WithAuthz(jwt.TokenExpired).
+						Build()
+					opt.Check = check.Status(http.StatusUnauthorized)
+					src.CallOrFail(t, opt)
+				})
+
+				t.NewSubTest("allow healthz").Run(func(t framework.TestContext) {
+					opt := opt.DeepCopy()
+					opt.HTTP.Path = "/healthz"
+					opt.Check = check.OK()
+					src.CallOrFail(t, opt)
+				})
 			})
 		})
-	})
 }
 
 func applyDrainingWorkaround(t framework.TestContext) {
@@ -1702,17 +1707,18 @@ spec:
         host: "{{.Destination}}"
 `).ApplyOrFail(t)
 
+			// TODO(https://github.com/istio/istio/issues/51747) use a single SE instead of one for v4 and one for v6
 			cfg := config.YAML(`
 {{ $to := .To }}
 apiVersion: networking.istio.io/v1beta1
 kind: ServiceEntry
 metadata:
-  name: test-se
+  name: test-se-v4
 spec:
   hosts:
-  - serviceentry.istio.io # not used
+  - dummy-v4.example.com
   addresses:
-  - 111.111.222.222
+  - 240.240.240.255
   ports:
   - number: 80
     name: http
@@ -1723,14 +1729,38 @@ spec:
   # we send directly to a Pod IP here. This is essentially headless
   - address: {{.IngressIp}} # TODO won't work with DNS resolution tests
     ports:
-      http: {{.IngressHttpPort}}`).
+      http: {{.IngressHttpPort}}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: test-se-v6
+spec:
+  hosts:
+  - dummy-v6.example.com
+  addresses:
+  - 2001:2::f0f0:255
+  ports:
+  - number: 80
+    name: http
+    protocol: HTTP
+  resolution: {{.Resolution}}
+  location: {{.Location}}
+  endpoints:
+  # we send directly to a Pod IP here. This is essentially headless
+  - address: {{.IngressIp}} # TODO won't work with DNS resolution tests
+    ports:
+      http: {{.IngressHttpPort}}
+---
+`).
 				WithParams(param.Params{}.SetWellKnown(param.Namespace, apps.Namespace))
 
+			v4, v6 := getSupportedIPFamilies(t)
 			ips, ports := istio.DefaultIngressOrFail(t, t).HTTPAddresses()
 			for _, tc := range testCases {
 				tc := tc
 				for i, ip := range ips {
-					t.NewSubTestf("%s %s %s", tc.location, tc.resolution, ip).Run(func(t framework.TestContext) {
+					t.NewSubTestf("%s %s %d", tc.location, tc.resolution, i).Run(func(t framework.TestContext) {
 						echotest.
 							New(t, apps.All).
 							// TODO eventually we can do this for uncaptured -> l7
@@ -1746,17 +1776,44 @@ spec:
 							})).
 							Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
 								// TODO validate L7 processing/some headers indicating we reach the svc we wanted
-								from.CallOrFail(t, echo.CallOptions{
-									Address: "111.111.222.222",
-									Port:    to.PortForName("http"),
-									// If request is sent before service is processed it will hit 10s timeout, so fail faster
-									Timeout: time.Millisecond * 500,
-								})
+								if v4 {
+									from.CallOrFail(t, echo.CallOptions{
+										Address: "240.240.240.255",
+										Port:    to.PortForName("http"),
+										// If request is sent before service is processed it will hit 10s timeout, so fail faster
+										Timeout: time.Millisecond * 500,
+									})
+								}
+								if v6 {
+									from.CallOrFail(t, echo.CallOptions{
+										Address: "2001:2::f0f0:255",
+										Port:    to.PortForName("http"),
+										// If request is sent before service is processed it will hit 10s timeout, so fail faster
+										Timeout: time.Millisecond * 500,
+									})
+								}
 							})
 					})
 				}
 			}
 		})
+}
+
+func getSupportedIPFamilies(t framework.TestContext) (v4 bool, v6 bool) {
+	addrs := apps.Captured.WorkloadsOrFail(t).Addresses()
+	for _, a := range addrs {
+		ip, err := netip.ParseAddr(a)
+		assert.NoError(t, err)
+		if ip.Is4() {
+			v4 = true
+		} else if ip.Is6() {
+			v6 = true
+		}
+	}
+	if !v4 && !v6 {
+		t.Fatalf("pod is neither v4 nor v6? %v", addrs)
+	}
+	return
 }
 
 func TestServiceEntrySelectsWorkloadEntry(t *testing.T) {
@@ -1812,6 +1869,7 @@ spec:
         host: "{{.Destination}}"
 `).ApplyOrFail(t)
 
+			// TODO(https://github.com/istio/istio/issues/51747) use a single SE instead of one for v4 and one for v6
 			cfg := config.YAML(`
 {{ $to := .To }}
 apiVersion: networking.istio.io/v1beta1
@@ -1828,12 +1886,12 @@ spec:
 apiVersion: networking.istio.io/v1beta1
 kind: ServiceEntry
 metadata:
-  name: test-se
+  name: test-se-v4
 spec:
   hosts:
-  - serviceentry.istio.io # not used
+  - dummy-v4.example.com
   addresses:
-  - 111.111.222.222
+  - 240.240.240.255
   ports:
   - number: 80
     name: http
@@ -1842,14 +1900,36 @@ spec:
   location: {{.Location}}
   workloadSelector:
     labels:
-      app: selected`).
+      app: selected
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: test-se-v6
+spec:
+  hosts:
+  - dummy-v6.example.com
+  addresses:
+  - 2001:2::f0f0:255
+  ports:
+  - number: 80
+    name: http
+    protocol: HTTP
+  resolution: {{.Resolution}}
+  location: {{.Location}}
+  workloadSelector:
+    labels:
+      app: selected
+---
+`).
 				WithParams(param.Params{}.SetWellKnown(param.Namespace, apps.Namespace))
 
+			v4, v6 := getSupportedIPFamilies(t)
 			ips, ports := istio.DefaultIngressOrFail(t, t).HTTPAddresses()
 			for _, tc := range testCases {
 				tc := tc
 				for i, ip := range ips {
-					t.NewSubTestf("%s %s %s", tc.location, tc.resolution, ip).Run(func(t framework.TestContext) {
+					t.NewSubTestf("%s %s %d", tc.location, tc.resolution, i).Run(func(t framework.TestContext) {
 						echotest.
 							New(t, apps.All).
 							// TODO eventually we can do this for uncaptured -> l7
@@ -1865,10 +1945,20 @@ spec:
 							})).
 							Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
 								// TODO validate L7 processing/some headers indicating we reach the svc we wanted
-								from.CallOrFail(t, echo.CallOptions{
-									Address: "111.111.222.222",
-									Port:    to.PortForName("http"),
-								})
+								if v4 {
+									from.CallOrFail(t, echo.CallOptions{
+										Address: "240.240.240.255",
+										Port:    to.PortForName("http"),
+										Timeout: time.Millisecond * 500,
+									})
+								}
+								if v6 {
+									from.CallOrFail(t, echo.CallOptions{
+										Address: "2001:2::f0f0:255",
+										Port:    to.PortForName("http"),
+										Timeout: time.Millisecond * 500,
+									})
+								}
 							})
 					})
 				}
@@ -1906,9 +1996,10 @@ metadata:
   name: test-se
 spec:
   hosts:
-  - serviceentry.istio.io
+  - test.example.com
   addresses:
-  - 111.111.222.222
+  - 240.240.240.251
+  - 2001:2::f0f0:251
   ports:
   - number: 80
     name: http
@@ -1927,10 +2018,16 @@ spec:
 					echotest.
 						New(t, apps.All).
 						// TODO eventually we can do this for uncaptured -> l7
-						FromMatch(match.Not(match.ServiceName(echo.NamespacedName{
-							Name:      "uncaptured",
-							Namespace: apps.Namespace,
-						}))).
+						FromMatch(match.And(
+							match.Not(match.ServiceName(echo.NamespacedName{
+								Name:      "uncaptured",
+								Namespace: apps.Namespace,
+							})),
+							match.Not(match.ServiceName(echo.NamespacedName{
+								Name:      "sidecar",
+								Namespace: apps.Namespace,
+							})),
+						)).
 						ToMatch(match.ServiceName(echo.NamespacedName{
 							Name:      "uncaptured",
 							Namespace: apps.Namespace,
@@ -1941,7 +2038,7 @@ spec:
 						})).
 						Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
 							from.CallOrFail(t, echo.CallOptions{
-								Address: "serviceentry.istio.io", // host here is important to test ztunnel DNS resolution
+								Address: "test.example.com", // host here is important to test ztunnel DNS resolution
 								Port:    to.PortForName("http"),
 								// sample response:
 								//
@@ -2235,6 +2332,7 @@ func runIngressTest(t *testing.T, f func(t framework.TestContext, src ingress.In
 
 func TestL7Telemetry(t *testing.T) {
 	framework.NewTest(t).
+		Label(label.IPv4). // pending https://github.com/istio/proxy/pull/5653
 		Run(func(tc framework.TestContext) {
 			// ensure that some traffic from each captured workload is
 			// sent to each waypoint proxy. This will likely have happened in
@@ -2560,6 +2658,96 @@ func TestDirect(t *testing.T) {
 				Scheme:  scheme.HTTP,
 				HBONE:   hbsvc,
 				Check:   check.Error(),
+			})
+		})
+		t.NewSubTest("sidecar").Run(func(t framework.TestContext) {
+			c := common.NewCaller()
+			cert, err := istio.CreateCertificate(t, i, apps.Captured.ServiceName(), apps.Namespace.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wl := apps.Sidecar[0].WorkloadsOrFail(t)[0]
+			pf, err := wl.Cluster().NewPortForwarder(wl.PodName(), apps.Namespace.Name(), "", 0, 15008)
+			assert.NoError(t, err)
+			assert.NoError(t, pf.Start())
+
+			// this is real odd but we're going to assume for now that we've just got the one waypoint I guess?
+			hbone := echo.HBONE{
+				Address:            pf.Address(),
+				Headers:            nil,
+				Cert:               string(cert.ClientCert),
+				Key:                string(cert.Key),
+				CaCert:             string(cert.RootCert),
+				InsecureSkipVerify: true,
+			}
+			run := func(name string, options echo.CallOptions) {
+				t.NewSubTest(name).Run(func(t framework.TestContext) {
+					_, err := c.CallEcho(nil, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+			internalPorts := []int{15000, 15001, 15006, 15008}
+			for _, p := range internalPorts {
+				run(fmt.Sprintf("admin port %d localhost", p), echo.CallOptions{
+					Count:   1,
+					Address: "127.0.0.1",
+					Port:    echo.Port{ServicePort: p, Protocol: protocol.HTTP},
+					HBONE:   hbone,
+					// This ought to deny!
+					Check: check.Error(),
+				})
+			}
+			for _, p := range internalPorts {
+				run(fmt.Sprintf("admin port %d pod ip", p), echo.CallOptions{
+					Count:   1,
+					Address: wl.Address(),
+					Port:    echo.Port{ServicePort: p, Protocol: protocol.HTTP},
+					HBONE:   hbone,
+					// This ought to deny!
+					Check: check.Or(check.Error(), check.Status(503)),
+				})
+			}
+			run("exposed port localhost", echo.CallOptions{
+				Count:   1,
+				Address: "127.0.0.1",
+				Port:    echo.Port{ServicePort: ports.HTTP.WorkloadPort, Protocol: protocol.HTTP},
+				HBONE:   hbone,
+				// This port is exposed so it technically doesn't really matter if it was exposed, but they requested localhost which is unaccepted.
+				Check: check.Error(),
+			})
+			run("exposed port podip", echo.CallOptions{
+				Count:   1,
+				Address: wl.Address(),
+				Port:    echo.Port{ServicePort: ports.HTTP.WorkloadPort, Protocol: protocol.HTTP},
+				HBONE:   hbone,
+				// normal request, allow
+				Check: check.OK(),
+			})
+			run("workload port", echo.CallOptions{
+				Count:   1,
+				Address: wl.Address(),
+				Port:    echo.Port{ServicePort: ports.HTTPWorkloadOnly.WorkloadPort, Protocol: protocol.HTTP},
+				HBONE:   hbone,
+				// This port is not exposed in a service but should be call-able
+				Check: check.OK(),
+			})
+			run("local port localhost", echo.CallOptions{
+				Count:   1,
+				Address: "127.0.0.1",
+				Port:    echo.Port{ServicePort: ports.HTTPLocalHost.WorkloadPort, Protocol: protocol.HTTP},
+				HBONE:   hbone,
+				// This port is NOT exposed, so it must not be callable
+				Check: check.Error(),
+			})
+			run("local port pod ip", echo.CallOptions{
+				Count:   1,
+				Address: wl.Address(),
+				Port:    echo.Port{ServicePort: ports.HTTPLocalHost.WorkloadPort, Protocol: protocol.HTTP},
+				HBONE:   hbone,
+				// This port is NOT exposed, so it must not be callable
+				Check: check.Status(503),
 			})
 		})
 	})

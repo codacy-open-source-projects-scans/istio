@@ -34,10 +34,11 @@ import (
 
 // Adapts CNI to ztunnel server. decoupled from k8s for easier integration testing.
 type NetServer struct {
-	ztunnelServer        ZtunnelServer
-	currentPodSnapshot   *podNetnsCache
-	iptablesConfigurator *iptables.IptablesConfigurator
-	podNs                PodNetnsFinder
+	ztunnelServer      ZtunnelServer
+	currentPodSnapshot *podNetnsCache
+	hostIptables       *iptables.IptablesConfigurator
+	podIptables        *iptables.IptablesConfigurator
+	podNs              PodNetnsFinder
 	// allow overriding for tests
 	netnsRunner        func(fdable NetnsFd, toRun func() error) error
 	hostsideProbeIPSet ipset.IPSet
@@ -46,16 +47,17 @@ type NetServer struct {
 var _ MeshDataplane = &NetServer{}
 
 func newNetServer(ztunnelServer ZtunnelServer, podNsMap *podNetnsCache,
-	iptablesConfigurator *iptables.IptablesConfigurator, podNs PodNetnsFinder,
+	hostIptables *iptables.IptablesConfigurator, podIptables *iptables.IptablesConfigurator, podNs PodNetnsFinder,
 	probeSet ipset.IPSet,
 ) *NetServer {
 	return &NetServer{
-		ztunnelServer:        ztunnelServer,
-		currentPodSnapshot:   podNsMap,
-		podNs:                podNs,
-		iptablesConfigurator: iptablesConfigurator,
-		netnsRunner:          NetnsDo,
-		hostsideProbeIPSet:   probeSet,
+		ztunnelServer:      ztunnelServer,
+		currentPodSnapshot: podNsMap,
+		podNs:              podNs,
+		hostIptables:       hostIptables,
+		podIptables:        podIptables,
+		netnsRunner:        NetnsDo,
+		hostsideProbeIPSet: probeSet,
 	}
 }
 
@@ -66,7 +68,7 @@ func (s *NetServer) Start(ctx context.Context) {
 
 func (s *NetServer) Stop() {
 	log.Debug("removing host iptables rules")
-	s.iptablesConfigurator.DeleteHostRules()
+	s.hostIptables.DeleteHostRules()
 
 	log.Debug("destroying host ipset")
 	s.hostsideProbeIPSet.Flush()
@@ -133,7 +135,8 @@ func (s *NetServer) getNetns(pod *corev1.Pod) (Netns, error) {
 // which always has the firsthand info of the IPs, even before K8S does - so we pass them separately here because
 // we actually may have them before K8S in the Pod object.
 func (s *NetServer) AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs []netip.Addr, netNs string) error {
-	log.Infof("in pod mode - adding pod %s/%s to ztunnel ", pod.Namespace, pod.Name)
+	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
+	log.Infof("adding pod to the mesh")
 	// make sure the cache is aware of the pod, even if we don't have the netns yet.
 	s.currentPodSnapshot.Ensure(string(pod.UID))
 	openNetns, err := s.getOrOpenNetns(pod, netNs)
@@ -150,7 +153,7 @@ func (s *NetServer) AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs []
 
 	log.Debug("calling CreateInpodRules")
 	if err := s.netnsRunner(openNetns, func() error {
-		return s.iptablesConfigurator.CreateInpodRules(&HostProbeSNATIP, &HostProbeSNATIPV6)
+		return s.podIptables.CreateInpodRules(log, &HostProbeSNATIP, &HostProbeSNATIPV6)
 	}); err != nil {
 		log.Errorf("failed to update POD inpod: %s/%s %v", pod.Namespace, pod.Name, err)
 		return err
@@ -217,64 +220,62 @@ func (s *NetServer) scanProcForPodsAndCache(pods map[types.UID]*corev1.Pod) erro
 	return nil
 }
 
-func realDependencies() *dep.RealDependencies {
+func realDependenciesHost() *dep.RealDependencies {
 	return &dep.RealDependencies{
-		CNIMode:          false, // we are in cni, but as we do the netns ourselves, we should keep this as false.
-		NetworkNamespace: "",
+		// We are in the host FS *and* the Host network
+		HostFilesystemPodNetwork: false,
+		NetworkNamespace:         "",
 	}
 }
 
-// Remove pod from mesh: pod is not deleted, we just want to remove it from the mesh.
-func (s *NetServer) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod) error {
+func realDependenciesInpod() *dep.RealDependencies {
+	return &dep.RealDependencies{
+		// We are running the host FS, but the pod network -- setup rules differently (locking, etc)
+		HostFilesystemPodNetwork: true,
+		NetworkNamespace:         "",
+	}
+}
+
+// RemovePodFromMesh is called when a pod needs to be removed from the mesh
+func (s *NetServer) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error {
 	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
-	log.Debugf("Pod is now opt out... cleaning up.")
+	log.WithLabels("delete", isDelete).Debugf("removing pod from the mesh")
 
-	openNetns := s.currentPodSnapshot.Take(string(pod.UID))
-	if openNetns == nil {
-		log.Warn("failed to find pod netns during removal")
-		return fmt.Errorf("failed to find pod netns during removal")
-	}
-	// pod is removed from the mesh, but is still running. remove iptables rules
-	log.Debugf("calling DeleteInpodRules.")
-	if err := s.netnsRunner(openNetns, func() error { return s.iptablesConfigurator.DeleteInpodRules() }); err != nil {
-		log.Errorf("failed to delete inpod rules %v", err)
-		return fmt.Errorf("failed to delete inpod rules %w", err)
-	}
+	// Aggregate errors together, so that if part of the cleanup fails we still proceed with other steps.
+	var errs []error
 
+	// Remove the hostside ipset entry first, and unconditionally - if later failures happen, we never
+	// want to leave stale entries
 	if err := removePodFromHostNSIpset(pod, &s.hostsideProbeIPSet); err != nil {
 		log.Errorf("failed to remove pod %s from host ipset, error was: %v", pod.Name, err)
-		return err
+		errs = append(errs, err)
 	}
 
-	log.Debug("in pod mode - removing pod from ztunnel")
+	// Whether pod is already deleted or not, we need to let go of our netns ref.
+	openNetns := s.currentPodSnapshot.Take(string(pod.UID))
+	if openNetns == nil {
+		log.Debug("failed to find pod netns during removal")
+	}
+
+	// If the pod is already deleted or terminated, we do not need to clean up the pod network -- only the host side.
+	if !isDelete {
+		if openNetns != nil {
+			// pod is removed from the mesh, but is still running. remove iptables rules
+			log.Debugf("calling DeleteInpodRules")
+			if err := s.netnsRunner(openNetns, func() error { return s.podIptables.DeleteInpodRules() }); err != nil {
+				return fmt.Errorf("failed to delete inpod rules: %w", err)
+			}
+		} else {
+			log.Warn("pod netns already gone, not deleting inpod rules")
+		}
+	}
+
+	log.Debug("removing pod from ztunnel")
 	if err := s.ztunnelServer.PodDeleted(ctx, string(pod.UID)); err != nil {
 		log.Errorf("failed to delete pod from ztunnel: %v", err)
+		errs = append(errs, err)
 	}
-	return nil
-}
-
-// Delete pod from mesh: pod is deleted. iptables rules will die with it, we just need to update ztunnel
-func (s *NetServer) DelPodFromMesh(ctx context.Context, pod *corev1.Pod) error {
-	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
-	log.Debug("Pod is now stopped... cleaning up.")
-
-	if err := removePodFromHostNSIpset(pod, &s.hostsideProbeIPSet); err != nil {
-		log.Errorf("failed to remove pod %s from host ipset, error was: %v", pod.Name, err)
-		return err
-	}
-
-	log.Info("in pod mode - deleting pod from ztunnel")
-
-	// pod is deleted, clean-up its open netns
-	openNetns := s.currentPodSnapshot.Take(string(pod.UID))
-	if openNetns == nil {
-		log.Warn("failed to find pod netns")
-	}
-
-	if err := s.ztunnelServer.PodDeleted(ctx, string(pod.UID)); err != nil {
-		return err
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // syncHostIPSets is called after the host node ipset has been created (or found + flushed)
