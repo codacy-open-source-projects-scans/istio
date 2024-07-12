@@ -39,6 +39,7 @@ import (
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/api/security/v1beta1"
+	"istio.io/istio/pilot/pkg/controllers/ipallocate"
 	"istio.io/istio/pilot/pkg/controllers/untaint"
 	kubecredentials "istio.io/istio/pilot/pkg/credentials/kube"
 	"istio.io/istio/pilot/pkg/features"
@@ -53,7 +54,6 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pilot/pkg/status"
-	"istio.io/istio/pilot/pkg/status/distribution"
 	tb "istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pilot/pkg/xds"
 	"istio.io/istio/pkg/cluster"
@@ -174,8 +174,7 @@ type Server struct {
 
 	webhookInfo *webhookInfo
 
-	statusReporter *distribution.Reporter
-	statusManager  *status.Manager
+	statusManager *status.Manager
 	// RWConfigStore is the configstore which allows updates, particularly for status.
 	RWConfigStore model.ConfigStoreController
 }
@@ -223,7 +222,6 @@ func (w *webhookInfo) addHandler(fn func()) {
 func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	e := model.NewEnvironment()
 	e.DomainSuffix = args.RegistryOptions.KubeOptions.DomainSuffix
-	e.SetLedger(buildLedger(args.RegistryOptions))
 
 	ac := aggregate.NewController(aggregate.Options{
 		MeshHolder: e,
@@ -879,15 +877,6 @@ func (s *Server) initRegistryEventHandlers() {
 
 	if s.configController != nil {
 		configHandler := func(prev config.Config, curr config.Config, event model.Event) {
-			if s.statusReporter != nil {
-				defer func() {
-					if event != model.EventDelete {
-						s.statusReporter.AddInProgressResource(curr)
-					} else {
-						s.statusReporter.DeleteInProgressResource(curr)
-					}
-				}()
-			}
 			log.Debugf("Handle event %s for configuration %s", event, curr.Key())
 			// For update events, trigger push only if spec has changed.
 			if event == model.EventUpdate && !needsPush(prev, curr) {
@@ -1149,6 +1138,10 @@ func (s *Server) initControllers(args *PilotArgs) error {
 		s.initNodeUntaintController(args)
 	}
 
+	if features.EnableIPAutoallocate {
+		s.initIPAutoallocateController(args)
+	}
+
 	if err := s.initConfigController(args); err != nil {
 		return fmt.Errorf("error initializing config controller: %v", err)
 	}
@@ -1165,6 +1158,18 @@ func (s *Server) initNodeUntaintController(args *PilotArgs) {
 			AddRunFunction(func(leaderStop <-chan struct{}) {
 				nodeUntainter := untaint.NewNodeUntainter(leaderStop, s.kubeClient, args.CniNamespace, args.Namespace)
 				nodeUntainter.Run(leaderStop)
+			}).Run(stop)
+		return nil
+	})
+}
+
+func (s *Server) initIPAutoallocateController(args *PilotArgs) {
+	s.addStartFunc("ip autoallocate controller", func(stop <-chan struct{}) error {
+		go leaderelection.
+			NewLeaderElection(args.Namespace, args.PodName, leaderelection.IPAutoallocateController, args.Revision, s.kubeClient).
+			AddRunFunction(func(leaderStop <-chan struct{}) {
+				ipallocate := ipallocate.NewIPAllocator(leaderStop, s.kubeClient)
+				ipallocate.Run(leaderStop)
 			}).Run(stop)
 		return nil
 	})

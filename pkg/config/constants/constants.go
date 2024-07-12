@@ -20,6 +20,9 @@ const (
 	// UnspecifiedIPv6 constant for empty IPv6 address
 	UnspecifiedIPv6 = "::"
 
+	// ClusterAltStatNameDelimeter constant for the stat delimer
+	ClusterAltStatNameDelimeter = ";"
+
 	// PilotWellKnownDNSCertPath is the path location for Pilot dns serving cert, often used with custom CA integrations
 	PilotWellKnownDNSCertPath   = "./var/run/secrets/istiod/tls/"
 	PilotWellKnownDNSCaCertPath = "./var/run/secrets/istiod/ca/"
@@ -206,4 +209,6 @@ const (
 	AllTraffic = "all"
 	// NoTraffic indicates that no traffic should go through the intended waypoint.
 	NoTraffic = "none"
+
+	EnableV2AutoAllocationLabel = "networking.istio.io/enable-autoallocate-ip"
 )

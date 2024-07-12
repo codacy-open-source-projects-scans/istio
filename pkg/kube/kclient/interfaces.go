@@ -63,7 +63,7 @@ type Informer[T controllers.Object] interface {
 
 // RawIndexer is an internal-ish interface for indexes. Strongly recommended to use NewIndex.
 type RawIndexer interface {
-	Lookup(key string) []interface{}
+	Lookup(key string) []any
 }
 
 type Writer[T controllers.Object] interface {
@@ -75,6 +75,7 @@ type Writer[T controllers.Object] interface {
 	UpdateStatus(object T) (T, error)
 	// Patch patches the resource, returning the newly applied resource.
 	Patch(name, namespace string, pt apitypes.PatchType, data []byte) (T, error)
+	PatchStatus(name, namespace string, pt apitypes.PatchType, data []byte) (T, error)
 	// Delete removes a resource.
 	Delete(name, namespace string) error
 }
