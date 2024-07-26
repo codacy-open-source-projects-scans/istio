@@ -516,11 +516,6 @@ templates:
         configMap:
           name: istio-ca-root-cert
       {{- end }}
-      {{- if eq .Values.global.pilotCertProvider "kubernetes" }}
-      - name: kube-ca-cert
-        configMap:
-          name: kube-root-ca.crt
-      {{- end }}
       {{- if .Values.global.mountMtlsCerts }}
       # Use the key and cert mounted to /etc/certs/ for the in-cluster mTLS communications.
       - name: istio-certs
@@ -1360,13 +1355,10 @@ templates:
             - name: ISTIO_META_MESH_ID
               value: "{{ (valueOrDefault .MeshConfig.TrustDomain .Values.global.trustDomain) }}"
             {{- end }}
+            {{- if .Values.global.waypoint.resources }}
             resources:
-              limits:
-                cpu: "2"
-                memory: 1Gi
-              requests:
-                cpu: 100m
-                memory: 128Mi
+            {{- toYaml .Values.global.waypoint.resources | nindent 10 }}
+            {{- end }}
             startupProbe:
               failureThreshold: 30
               httpGet:
