@@ -891,23 +891,21 @@ type AmbientIndexes interface {
 }
 
 // WaypointKey is a multi-address extension of NetworkAddress which is commonly used for lookups in AmbientIndex
-// We likely need to consider alternative keying options internally such as hostname as we look to expand beyong istio-waypoint
+// We likely need to consider alternative keying options internally such as hostname as we look to expand beyond istio-waypoint
 // This extension can ideally support that type of lookup in the interface without introducing scope creep into things
 // like NetworkAddress
 type WaypointKey struct {
-	Network   string
-	Addresses []string
+	Namespace string
+	Hostnames []string
 }
 
-// WaypointKey contains all of the VIPs that the Proxy serves.
+// WaypointKeyForProxy builds a key from a proxy to lookup
 func WaypointKeyForProxy(node *Proxy) WaypointKey {
-	// TODO IP based lookup should switch to looking up services by name/ns
 	key := WaypointKey{
-		Network: node.Metadata.Network.String(),
+		Namespace: node.ConfigNamespace,
 	}
 	for _, svct := range node.ServiceTargets {
-		ips := svct.Service.ClusterVIPs.GetAddressesFor(node.GetClusterID())
-		key.Addresses = append(key.Addresses, ips...)
+		key.Hostnames = append(key.Hostnames, svct.Service.Hostname.String())
 	}
 	return key
 }
@@ -1267,7 +1265,7 @@ func (s *Service) GetAddressForProxy(node *Proxy) string {
 			}
 		}
 
-		if node.Metadata.DNSCapture && node.Metadata.DNSAutoAllocate && s.DefaultAddress == constants.UnspecifiedIP {
+		if nodeUsesAutoallocatedIPs(node) && s.DefaultAddress == constants.UnspecifiedIP {
 			if node.SupportsIPv4() && s.AutoAllocatedIPv4Address != "" {
 				return s.AutoAllocatedIPv4Address
 			}
@@ -1298,20 +1296,48 @@ func (s *Service) GetAllAddressesForProxy(node *Proxy) []string {
 	return s.getAllAddressesForProxy(node)
 }
 
+// nodeUsesAutoallocatedIPs checks to see if this node is eligible to consume automatically allocated IPs
+func nodeUsesAutoallocatedIPs(node *Proxy) bool {
+	if node == nil {
+		return false
+	}
+	var DNSAutoAllocate, DNSCapture bool
+	if node.Metadata != nil {
+		DNSAutoAllocate = bool(node.Metadata.DNSAutoAllocate)
+		DNSCapture = bool(node.Metadata.DNSCapture)
+	}
+	// check whether either version of auto-allocation is enabled
+	autoallocationEnabled := DNSAutoAllocate || features.EnableIPAutoallocate
+
+	// check if this proxy is a type that always consumes or has consumption explicitly enabled
+	nodeConsumesAutoIP := DNSCapture || node.Type == Waypoint
+
+	return autoallocationEnabled && nodeConsumesAutoIP
+}
+
 func (s *Service) getAllAddressesForProxy(node *Proxy) []string {
+	addresses := []string{}
 	if node.Metadata != nil && node.Metadata.ClusterID != "" {
-		addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
-		if (features.EnableDualStack || features.EnableAmbient) && node.GetIPMode() == Dual {
-			return addresses
+		addresses = s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
+	}
+	if len(addresses) == 0 && nodeUsesAutoallocatedIPs(node) {
+		// The criteria to use AutoAllocated addresses is met so we should go ahead and use them if they are populated
+		if s.AutoAllocatedIPv4Address != "" {
+			addresses = append(addresses, s.AutoAllocatedIPv4Address)
 		}
-		addresses = filterAddresses(addresses, node.SupportsIPv4(), node.SupportsIPv6())
-		if len(addresses) > 0 {
-			return addresses
+		if s.AutoAllocatedIPv6Address != "" {
+			addresses = append(addresses, s.AutoAllocatedIPv6Address)
 		}
 	}
+	if (!features.EnableDualStack && !features.EnableAmbient) || node.GetIPMode() != Dual {
+		addresses = filterAddresses(addresses, node.SupportsIPv4(), node.SupportsIPv6())
+	}
+	if len(addresses) > 0 {
+		return addresses
+	}
 
-	// fallback to the auto-allocated address and then to the default address
-	if a := s.GetAddressForProxy(node); len(a) > 0 {
+	// fallback to the default address
+	if a := s.DefaultAddress; len(a) > 0 {
 		return []string{a}
 	}
 	return nil

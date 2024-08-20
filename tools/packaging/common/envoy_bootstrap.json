@@ -96,6 +96,10 @@
       },
       {{- end }}
       {
+        "tag_name": "thread_name",
+        "regex": "^server(\\.(.+))\\.watchdog"
+      },
+      {
         "tag_name": "tcp_prefix",
         "regex": "^tcp\\.((.*?)\\.)\\w+?$"
       },
@@ -814,5 +818,11 @@
     "load_stats_config": {{- .load_stats_config_json_str }}
     {{- end }}
   }
+  {{ if .deferred_stats_creation }}
+  ,
+  "deferred_stat_options": {
+    "enable_deferred_creation_stats": true
+  }
+  {{- end }}
   {{ end }}
 }
