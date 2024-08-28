@@ -423,7 +423,7 @@ message GlobalConfig {
   google.protobuf.Struct defaultNodeSelector = 6 [deprecated = true];
 
   // Specifies the default pod disruption budget configuration.
-  DefaultPodDisruptionBudgetConfig defaultPodDisruptionBudget = 7 [deprecated = true];
+  DefaultPodDisruptionBudgetConfig defaultPodDisruptionBudget = 7;
 
   // Default k8s resources settings for all Istio control plane components.
   //
@@ -1443,4 +1443,9 @@ message WaypointConfig {
   //
   // See https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#resource-requests-and-limits-of-pod-and-container
   Resources resources = 1;
+
+  // K8s affinity settings for waypoint pods.
+  //
+  // See https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#inter-pod-affinity-and-anti-affinity
+  k8s.io.api.core.v1.Affinity affinity = 2;
 }

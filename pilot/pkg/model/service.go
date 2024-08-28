@@ -741,6 +741,9 @@ type K8sAttributes struct {
 	// NodeLocal means the proxy will only forward traffic to node local endpoints
 	// spec.InternalTrafficPolicy == Local
 	NodeLocal bool
+
+	// ObjectName is the object name of the underlying object. This may differ from the Service.Attributes.Name for legacy semantics.
+	ObjectName string
 }
 
 // DeepCopy creates a deep copy of ServiceAttributes, but skips internal mutexes.
@@ -979,6 +982,11 @@ func (i AddressInfo) ResourceName() string {
 	return name
 }
 
+type TypedObject struct {
+	types.NamespacedName
+	Kind kind.Kind
+}
+
 type ServicePortName struct {
 	PortName       string
 	TargetPortName string
@@ -991,9 +999,60 @@ type ServiceInfo struct {
 	// PortNames provides a mapping of ServicePort -> port names. Note these are only used internally, not sent over XDS
 	PortNames map[int32]ServicePortName
 	// Source is the type that introduced this service.
-	Source kind.Kind
-	// Waypoint that clients should use when addressing traffic to this Service.
-	Waypoint string
+	Source   TypedObject
+	Waypoint WaypointBindingStatus
+}
+
+func (i ServiceInfo) GetStatusTarget() TypedObject {
+	return i.Source
+}
+
+type ConditionType string
+
+const (
+	WaypointBound ConditionType = "istio.io/WaypointBound"
+)
+
+type ConditionSet = map[ConditionType]*Condition
+
+type Condition struct {
+	Reason  string
+	Message string
+	Status  bool
+}
+
+func (i ServiceInfo) GetConditions() ConditionSet {
+	set := map[ConditionType]*Condition{
+		// Write all conditions here, then overide if we want them set.
+		// This ensures we can properly prune the condition if its no longer needed (such as if there is no waypoint attached at all).
+		WaypointBound: nil,
+	}
+	if i.Waypoint.ResourceName != "" {
+		set[WaypointBound] = &Condition{
+			Status:  true,
+			Reason:  "WaypointAccepted",
+			Message: fmt.Sprintf("Successfully attached to waypoint %v", i.Waypoint.ResourceName),
+		}
+	} else if i.Waypoint.Error != nil {
+		set[WaypointBound] = &Condition{
+			Status:  false,
+			Reason:  i.Waypoint.Error.Reason,
+			Message: i.Waypoint.Error.Message,
+		}
+	}
+	return set
+}
+
+type WaypointBindingStatus struct {
+	// ResourceName that clients should use when addressing traffic to this Service.
+	ResourceName string
+	// Error represents some error
+	Error *StatusMessage
+}
+
+type StatusMessage struct {
+	Reason  string
+	Message string
 }
 
 func (i ServiceInfo) NamespacedName() types.NamespacedName {
@@ -1004,7 +1063,8 @@ func (i ServiceInfo) Equals(other ServiceInfo) bool {
 	return proto.Equal(i.Service, other.Service) &&
 		maps.Equal(i.LabelSelector.Labels, other.LabelSelector.Labels) &&
 		maps.Equal(i.PortNames, other.PortNames) &&
-		i.Source == other.Source
+		i.Source == other.Source &&
+		i.Waypoint == other.Waypoint
 }
 
 func (i ServiceInfo) ResourceName() string {
@@ -1014,8 +1074,6 @@ func (i ServiceInfo) ResourceName() string {
 func serviceResourceName(s *workloadapi.Service) string {
 	return s.Namespace + "/" + s.Hostname
 }
-
-type WorkloadSource string
 
 type WorkloadInfo struct {
 	*workloadapi.Workload
