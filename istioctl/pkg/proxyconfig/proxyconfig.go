@@ -15,7 +15,9 @@
 package proxyconfig
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -261,6 +263,13 @@ func printStatus(c *cobra.Command, kubeClient kube.CLIClient, statsType, podName
 			return err
 		}
 		_, _ = fmt.Fprint(c.OutOrStdout(), string(out))
+	case jsonOutput:
+		var prettyJSON bytes.Buffer
+		err := json.Indent(&prettyJSON, []byte(stats), "", "    ")
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprint(c.OutOrStdout(), prettyJSON.String()+"\n")
 	default:
 		_, _ = fmt.Fprint(c.OutOrStdout(), stats)
 	}
@@ -1281,7 +1290,7 @@ func ProxyConfig(ctx cli.Context) *cobra.Command {
 		Short: "Retrieve information about proxy configuration from Envoy [kube only]",
 		Long:  `A group of commands used to retrieve information about proxy configuration from the Envoy config dump`,
 		Example: `  # Retrieve information about proxy configuration from an Envoy instance.
-  istioctl proxy-config <clusters|listeners|routes|endpoints|bootstrap|log|secret> <pod-name[.namespace]>`,
+  istioctl proxy-config <clusters|listeners|routes|endpoints|ecds|bootstrap|log|secret> <pod-name[.namespace]>`,
 		Aliases: []string{"pc"},
 	}
 
