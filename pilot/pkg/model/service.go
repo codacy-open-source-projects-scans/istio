@@ -50,6 +50,7 @@ import (
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 	"istio.io/istio/pkg/workloadapi/security"
@@ -746,6 +747,9 @@ type K8sAttributes struct {
 
 	// ObjectName is the object name of the underlying object. This may differ from the Service.Attributes.Name for legacy semantics.
 	ObjectName string
+
+	// spec.PublishNotReadyAddresses
+	PublishNotReadyAddresses bool
 }
 
 // DeepCopy creates a deep copy of ServiceAttributes, but skips internal mutexes.
@@ -864,6 +868,7 @@ type ServiceDiscovery interface {
 }
 
 type AmbientIndexes interface {
+	ServicesWithWaypoint(key string) []ServiceWaypointInfo
 	AddressInformation(addresses sets.String) ([]AddressInfo, sets.String)
 	AdditionalPodSubscriptions(
 		proxy *Proxy,
@@ -882,15 +887,34 @@ type AmbientIndexes interface {
 type WaypointKey struct {
 	Namespace string
 	Hostnames []string
+
+	Network   string
+	Addresses []string
 }
 
 // WaypointKeyForProxy builds a key from a proxy to lookup
 func WaypointKeyForProxy(node *Proxy) WaypointKey {
 	key := WaypointKey{
 		Namespace: node.ConfigNamespace,
+		Network:   node.Metadata.Network.String(),
 	}
 	for _, svct := range node.ServiceTargets {
 		key.Hostnames = append(key.Hostnames, svct.Service.Hostname.String())
+
+		ips := svct.Service.ClusterVIPs.GetAddressesFor(node.GetClusterID())
+		// if we find autoAllocated addresses then ips should contain constants.UnspecifiedIP which should not be used
+		foundAutoAllocated := false
+		if svct.Service.AutoAllocatedIPv4Address != "" {
+			key.Addresses = append(key.Addresses, svct.Service.AutoAllocatedIPv4Address)
+			foundAutoAllocated = true
+		}
+		if svct.Service.AutoAllocatedIPv6Address != "" {
+			key.Addresses = append(key.Addresses, svct.Service.AutoAllocatedIPv6Address)
+			foundAutoAllocated = true
+		}
+		if !foundAutoAllocated {
+			key.Addresses = append(key.Addresses, ips...)
+		}
 	}
 	return key
 }
@@ -923,6 +947,10 @@ func (u NoopAmbientIndexes) Waypoint(string, string) []netip.Addr {
 }
 
 func (u NoopAmbientIndexes) WorkloadsForWaypoint(WaypointKey) []WorkloadInfo {
+	return nil
+}
+
+func (u NoopAmbientIndexes) ServicesWithWaypoint(string) []ServiceWaypointInfo {
 	return nil
 }
 
@@ -964,6 +992,11 @@ func (i AddressInfo) ResourceName() string {
 	return name
 }
 
+type ServiceWaypointInfo struct {
+	Service          *workloadapi.Service
+	WaypointHostname string
+}
+
 type TypedObject struct {
 	types.NamespacedName
 	Kind kind.Kind
@@ -1000,9 +1033,10 @@ const (
 type ConditionSet = map[ConditionType][]Condition
 
 type Condition struct {
-	Reason  string
-	Message string
-	Status  bool
+	ObservedGeneration int64
+	Reason             string
+	Message            string
+	Status             bool
 }
 
 func (i ServiceInfo) GetConditions() ConditionSet {
@@ -1011,12 +1045,23 @@ func (i ServiceInfo) GetConditions() ConditionSet {
 		// This ensures we can properly prune the condition if its no longer needed (such as if there is no waypoint attached at all).
 		WaypointBound: nil,
 	}
+
 	if i.Waypoint.ResourceName != "" {
+		buildMsg := strings.Builder{}
+		buildMsg.WriteString("Successfully attached to waypoint ")
+		buildMsg.WriteString(i.Waypoint.ResourceName)
+
+		if i.Waypoint.IngressUseWaypoint {
+			buildMsg.WriteString(". Ingress traffic will traverse the waypoint")
+		} else if i.Waypoint.IngressLabelPresent {
+			buildMsg.WriteString(". Ingress traffic is not using the waypoint, set the istio.io/ingress-use-waypoint label to true if desired.")
+		}
+
 		set[WaypointBound] = []Condition{
 			{
 				Status:  true,
-				Reason:  "WaypointAccepted",
-				Message: fmt.Sprintf("Successfully attached to waypoint %v", i.Waypoint.ResourceName),
+				Reason:  string(WaypointAccepted),
+				Message: buildMsg.String(),
 			},
 		}
 	} else if i.Waypoint.Error != nil {
@@ -1028,12 +1073,17 @@ func (i ServiceInfo) GetConditions() ConditionSet {
 			},
 		}
 	}
+
 	return set
 }
 
 type WaypointBindingStatus struct {
 	// ResourceName that clients should use when addressing traffic to this Service.
 	ResourceName string
+	// IngressUseWaypoint specifies whether ingress gateways should use the waypoint for this service.
+	IngressUseWaypoint bool
+	// IngressLabelPresent specifies whether the istio.io/ingress-use-waypoint label is set on the service.
+	IngressLabelPresent bool
 	// Error represents some error
 	Error *StatusMessage
 }
@@ -1041,6 +1091,10 @@ type WaypointBindingStatus struct {
 type StatusMessage struct {
 	Reason  string
 	Message string
+}
+
+func (i WaypointBindingStatus) Equals(other WaypointBindingStatus) bool {
+	return i.ResourceName == other.ResourceName && i.IngressUseWaypoint == other.IngressUseWaypoint && ptr.Equal(i.Error, other.Error)
 }
 
 func (i ServiceInfo) NamespacedName() types.NamespacedName {
@@ -1052,7 +1106,7 @@ func (i ServiceInfo) Equals(other ServiceInfo) bool {
 		maps.Equal(i.LabelSelector.Labels, other.LabelSelector.Labels) &&
 		maps.Equal(i.PortNames, other.PortNames) &&
 		i.Source == other.Source &&
-		i.Waypoint == other.Waypoint
+		i.Waypoint.Equals(other.Waypoint)
 }
 
 func (i ServiceInfo) ResourceName() string {
@@ -1086,7 +1140,7 @@ func workloadResourceName(w *workloadapi.Workload) string {
 
 func (i *WorkloadInfo) Clone() *WorkloadInfo {
 	return &WorkloadInfo{
-		Workload:     proto.Clone(i).(*workloadapi.Workload),
+		Workload:     protomarshal.Clone(i.Workload),
 		Labels:       maps.Clone(i.Labels),
 		Source:       i.Source,
 		CreationTime: i.CreationTime,
@@ -1138,18 +1192,24 @@ func flattenConditions(conditions []PolicyBindingStatus) Condition {
 	if len(conditions) == 1 {
 		c := conditions[0]
 		return Condition{
-			Reason:  c.Status.Reason,
-			Message: c.Status.Message,
-			Status:  c.Bound,
+			ObservedGeneration: c.ObservedGeneration,
+			Reason:             c.Status.Reason,
+			Message:            c.Status.Message,
+			Status:             c.Bound,
 		}
 	}
 
+	var highestObservedGeneration int64
 	for _, c := range conditions {
 		if c.Bound {
 			// if anything was true we consider the overall bind to be true
 			status = true
 		} else {
 			unboundAncestors = append(unboundAncestors, c.Ancestor)
+		}
+
+		if c.ObservedGeneration > highestObservedGeneration {
+			highestObservedGeneration = c.ObservedGeneration
 		}
 	}
 
@@ -1168,6 +1228,7 @@ func flattenConditions(conditions []PolicyBindingStatus) Condition {
 	}
 
 	return Condition{
+		highestObservedGeneration,
 		reason,
 		message,
 		status,
@@ -1182,15 +1243,17 @@ func (i WaypointPolicyStatus) ResourceName() string {
 // end impl ResourceNamer
 
 type PolicyBindingStatus struct {
-	Ancestor string
-	Status   *StatusMessage
-	Bound    bool
+	ObservedGeneration int64
+	Ancestor           string
+	Status             *StatusMessage
+	Bound              bool
 }
 
 func (i PolicyBindingStatus) Equals(other PolicyBindingStatus) bool {
 	return ptr.Equal(i.Status, other.Status) &&
 		i.Bound == other.Bound &&
-		i.Ancestor == other.Ancestor
+		i.Ancestor == other.Ancestor &&
+		i.ObservedGeneration == other.ObservedGeneration
 }
 
 type WorkloadAuthorization struct {
@@ -1213,18 +1276,20 @@ func (i WorkloadAuthorization) GetConditions() ConditionSet {
 	if i.Binding.Status != nil {
 		set[ZtunnelAccepted] = []Condition{
 			{
-				Reason:  i.Binding.Status.Reason,
-				Message: i.Binding.Status.Message,
-				Status:  i.Binding.Bound,
+				ObservedGeneration: i.Binding.ObservedGeneration,
+				Reason:             i.Binding.Status.Reason,
+				Message:            i.Binding.Status.Message,
+				Status:             i.Binding.Bound,
 			},
 		}
 	} else {
 		message := "attached to ztunnel"
 		set[ZtunnelAccepted] = []Condition{
 			{
-				Reason:  "Accepted",
-				Message: message,
-				Status:  i.Binding.Bound,
+				ObservedGeneration: i.Binding.ObservedGeneration,
+				Reason:             "Accepted",
+				Message:            message,
+				Status:             i.Binding.Bound,
 			},
 		}
 	}

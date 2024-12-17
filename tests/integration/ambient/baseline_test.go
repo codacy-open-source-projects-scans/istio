@@ -206,7 +206,6 @@ func TestPodIP(t *testing.T) {
 	framework.NewTest(t).Run(func(t framework.TestContext) {
 		for _, src := range apps.All {
 			for _, srcWl := range src.WorkloadsOrFail(t) {
-				srcWl := srcWl
 				t.NewSubTestf("from %v %v", src.Config().Service, srcWl.Address()).Run(func(t framework.TestContext) {
 					for _, dst := range apps.All {
 						for _, dstWl := range dst.WorkloadsOrFail(t) {
@@ -769,8 +768,9 @@ spec:
 				}
 				src.CallOrFail(t, opt)
 			})
-			// globally peerauth == STRICT, but we have a port-specific allowlist that is PERMISSIVE,
-			// so anything hitting that port should not be rejected
+			// general workload peerauth == STRICT, but we have a port-specific allowlist that is PERMISSIVE,
+			// so anything hitting that port should not be rejected.
+			// NOTE: Using port 18080 since that's the http port for the echo deployment
 			t.NewSubTest("strict-permissive-ports").Run(func(t framework.TestContext) {
 				t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
 					"Destination": dst.Config().Service,
@@ -788,11 +788,83 @@ spec:
   mtls:
     mode: STRICT
   portLevelMtls:
-    8080:
+    18080:
       mode: PERMISSIVE
 				`).ApplyOrFail(t)
 				opt = opt.DeepCopy()
 				// Should pass for all workloads, in or out of mesh, targeting this port
+				src.CallOrFail(t, opt)
+			})
+
+			// global peer auth is strict, but we have a permissive port-level rule
+			t.NewSubTest("global-strict-permissive-workload-ports").Run(func(t framework.TestContext) {
+				t.ConfigIstio().YAML(i.Settings().SystemNamespace, `
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: global-strict
+spec:
+  mtls:
+    mode: STRICT
+        `).ApplyOrFail(t)
+				t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
+					"Destination": dst.Config().Service,
+					"Source":      src.Config().Service,
+					"Namespace":   apps.Namespace.Name(),
+				}, `
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: local-port-override
+spec:
+  selector:
+    matchLabels:
+      app: "{{ .Destination }}"
+  portLevelMtls:
+    18080:
+      mode: PERMISSIVE
+    19090:
+      mode: STRICT
+        `).ApplyOrFail(t)
+				opt = opt.DeepCopy()
+				// Should pass for all workloads, in or out of mesh, targeting this port
+				src.CallOrFail(t, opt)
+			})
+
+			t.NewSubTest("global-permissive-strict-workload-ports").Run(func(t framework.TestContext) {
+				t.ConfigIstio().YAML(i.Settings().SystemNamespace, `
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: global-strict
+spec:
+  mtls:
+    mode: PERMISSIVE
+        `).ApplyOrFail(t)
+				t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
+					"Destination": dst.Config().Service,
+					"Namespace":   apps.Namespace.Name(),
+				}, `
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: local-port-override
+spec:
+  selector:
+    matchLabels:
+      app: "{{ .Destination }}"
+  portLevelMtls:
+    18080:
+      mode: STRICT
+    19090:
+      mode: STRICT
+
+        `).ApplyOrFail(t)
+				opt = opt.DeepCopy()
+				if !src.Config().HasProxyCapabilities() && dst.Config().HasProxyCapabilities() {
+					// Expect deny if the dest is in the mesh (enforcing mTLS) but src is not (not sending mTLS)
+					opt.Check = CheckDeny
+				}
 				src.CallOrFail(t, opt)
 			})
 		})
@@ -1888,7 +1960,6 @@ spec:
 
 			ips, ports := istio.DefaultIngressOrFail(t, t).HTTPAddresses()
 			for _, tc := range testCases {
-				tc := tc
 				for i, ip := range ips {
 					t.NewSubTestf("%s %s %d", tc.location, tc.resolution, i).Run(func(t framework.TestContext) {
 						echotest.
@@ -2023,7 +2094,6 @@ spec:
 
 			ips, ports := istio.DefaultIngressOrFail(t, t).HTTPAddresses()
 			for _, tc := range testCases {
-				tc := tc
 				for i, ip := range ips {
 					t.NewSubTestf("%s %s %d", tc.location, tc.resolution, i).Run(func(t framework.TestContext) {
 						echotest.
@@ -2050,7 +2120,6 @@ spec:
 							})
 					})
 				}
-
 			}
 		})
 }
@@ -2101,7 +2170,6 @@ spec:
 				WithParams(param.Params{}.SetWellKnown(param.Namespace, apps.Namespace))
 
 			for _, tc := range testCases {
-				tc := tc
 				t.NewSubTestf("%s %s", tc.location, tc.resolution).Run(func(t framework.TestContext) {
 					echotest.
 						New(t, apps.All).
@@ -2233,13 +2301,10 @@ func RunReachability(testCases []reachability.TestCase, t framework.TestContext)
 	runTest := func(t framework.TestContext, f func(t framework.TestContext, src echo.Instance, dst echo.Instance, opt echo.CallOptions)) {
 		svcs := apps.All
 		for _, src := range svcs {
-			src := src
 			t.NewSubTestf("from %v", src.Config().Service).RunParallel(func(t framework.TestContext) {
 				for _, dst := range svcs {
-					dst := dst
 					t.NewSubTestf("to %v", dst.Config().Service).RunParallel(func(t framework.TestContext) {
 						for _, opt := range callOptions {
-							opt := opt
 							t.NewSubTestf("%v", opt.Scheme).RunParallel(func(t framework.TestContext) {
 								opt = opt.DeepCopy()
 								opt.To = dst
@@ -2253,8 +2318,6 @@ func RunReachability(testCases []reachability.TestCase, t framework.TestContext)
 		}
 	}
 	for _, c := range testCases {
-		// Create a copy to avoid races, as tests are run in parallel
-		c := c
 		testName := strings.TrimSuffix(c.ConfigFile, filepath.Ext(c.ConfigFile))
 		t.NewSubTest(testName).Run(func(t framework.TestContext) {
 			// Apply the policy.
@@ -2440,7 +2503,6 @@ func runTestContext(t framework.TestContext, f func(t framework.TestContext, src
 			for _, dst := range svcs {
 				t.NewSubTestf("to %v", dst.Config().Service).Run(func(t framework.TestContext) {
 					for _, opt := range callOptions {
-						src, dst, opt := src, dst, opt
 						t.NewSubTestf("%v", opt.Scheme).Run(func(t framework.TestContext) {
 							opt = opt.DeepCopy()
 							opt.To = dst
@@ -2546,7 +2608,7 @@ spec:
     - match:
         metric: REQUEST_COUNT
       tagOverrides:
-        custom_dimension: 
+        custom_dimension:
           value: "'test'"
         source_principal:
           operation: REMOVE
@@ -2729,7 +2791,6 @@ func TestMetadataServer(t *testing.T) {
 		}
 		svcs := apps.All
 		for _, src := range svcs {
-			src := src
 			t.NewSubTestf("from %v", src.Config().Service).Run(func(t framework.TestContext) {
 				// curl -H "Metadata-Flavor: Google" 169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity
 				opts := echo.CallOptions{
@@ -2764,7 +2825,6 @@ func TestAPIServer(t *testing.T) {
 		assert.NoError(t, err)
 
 		for _, src := range svcs {
-			src := src
 			t.NewSubTestf("from %v", src.Config().Service).Run(func(t framework.TestContext) {
 				opts := echo.CallOptions{
 					Address: "kubernetes.default.svc",
@@ -3159,6 +3219,45 @@ func daemonsetsetComplete(ds *appsv1.DaemonSet) bool {
 	return ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
 		ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
 		ds.Status.ObservedGeneration >= ds.Generation
+}
+
+func TestWaypointWithInvalidBackend(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			// We should expect a 500 error since the backend is invalid.
+			t.ConfigIstio().
+				Eval(apps.Namespace.Name(), apps.Namespace.Name(), `apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: add-header
+spec:
+  parentRefs:
+  - name: sidecar
+    kind: Service
+    group: ""
+    port: 80
+  rules:
+  - filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        add:
+        - name: greeting
+          value: "hello world!"
+    backendRefs:
+    - name: invalid
+      port: 80
+`).
+				ApplyOrFail(t)
+			SetWaypoint(t, Sidecar, "waypoint")
+			client := apps.Captured
+			client[0].CallOrFail(t, echo.CallOptions{
+				To:   apps.Sidecar,
+				Port: ports.HTTP,
+				Check: check.And(
+					check.Status(500),
+				),
+			})
+		})
 }
 
 func TestWaypointWithSidecarBackend(t *testing.T) {

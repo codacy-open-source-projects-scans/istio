@@ -22,7 +22,6 @@ import (
 	proxyprotocol "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/proxy_protocol/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -35,6 +34,7 @@ import (
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -197,6 +197,12 @@ func shouldH2Upgrade(clusterName string, port *model.Port, mesh *meshconfig.Mesh
 	// Upgrade if tls.GetMode() == networking.TLSSettings_ISTIO_MUTUAL
 	if connectionPool != nil && connectionPool.Http != nil {
 		override := connectionPool.Http.H2UpgradePolicy
+		// If useClientProtocol is set, do not upgrade
+		if connectionPool.Http.UseClientProtocol {
+			log.Debugf("Not upgrading cluster because useClientProtocol is set: %v (%v %v)",
+				clusterName, mesh.H2UpgradePolicy, override)
+			return false
+		}
 		// If user wants an upgrade at destination rule/port level that means he is sure that
 		// it is a Http port - upgrade in such case. This is useful incase protocol sniffing is
 		// enabled and user wants to upgrade/preserve http protocol from client.
@@ -223,7 +229,7 @@ func shouldH2Upgrade(clusterName string, port *model.Port, mesh *meshconfig.Mesh
 }
 
 func (cb *ClusterBuilder) applyDefaultConnectionPool(cluster *cluster.Cluster) {
-	cluster.ConnectTimeout = proto.Clone(cb.req.Push.Mesh.ConnectTimeout).(*durationpb.Duration)
+	cluster.ConnectTimeout = protomarshal.Clone(cb.req.Push.Mesh.ConnectTimeout)
 }
 
 func applyLoadBalancer(c *cluster.Cluster, lb *networking.LoadBalancerSettings, port *model.Port,

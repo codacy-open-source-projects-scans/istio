@@ -15,7 +15,6 @@
 package iptables
 
 import (
-	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,33 +36,32 @@ import (
 func TestIptablesCleanRoundTrip(t *testing.T) {
 	setup(t)
 	tt := struct {
-		name   string
-		config func(cfg *Config)
+		name         string
+		config       func(cfg *IptablesConfig)
+		podOverrides PodLevelOverrides
 	}{
 		"default",
-		func(cfg *Config) {
+		func(cfg *IptablesConfig) {
 			cfg.RedirectDNS = true
 		},
+		PodLevelOverrides{},
 	}
 
-	probeSNATipv4 := netip.MustParseAddr("169.254.7.127")
-	probeSNATipv6 := netip.MustParseAddr("e9ac:1e77:90ca:399f:4d6d:ece2:2f9b:3164")
-
-	cfg := &Config{}
+	cfg := constructTestConfig()
 	tt.config(cfg)
 
 	deps := &dep.RealDependencies{}
 	iptConfigurator, _, _ := NewIptablesConfigurator(cfg, deps, deps, EmptyNlDeps())
-	assert.NoError(t, iptConfigurator.CreateInpodRules(scopes.CNIAgent, probeSNATipv4, probeSNATipv6, false))
+	assert.NoError(t, iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides))
 
 	t.Log("starting cleanup")
 	// Cleanup, should work
-	assert.NoError(t, iptConfigurator.DeleteInpodRules())
+	assert.NoError(t, iptConfigurator.DeleteInpodRules(log))
 	validateIptablesClean(t)
 
 	t.Log("second run")
 	// Add again, should still work
-	assert.NoError(t, iptConfigurator.CreateInpodRules(scopes.CNIAgent, probeSNATipv4, probeSNATipv6, false))
+	assert.NoError(t, iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides))
 }
 
 func validateIptablesClean(t *testing.T) {

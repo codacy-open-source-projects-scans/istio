@@ -81,7 +81,6 @@ import (
 	clienttelemetryalpha "istio.io/client-go/pkg/apis/telemetry/v1alpha1"
 	istioclient "istio.io/client-go/pkg/clientset/versioned"
 	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collections"
@@ -1007,7 +1006,6 @@ func (c *client) PodsForSelector(ctx context.Context, namespace string, labelSel
 func (c *client) ApplyYAMLFiles(namespace string, yamlFiles ...string) error {
 	g, _ := errgroup.WithContext(context.TODO())
 	for _, f := range removeEmptyFiles(yamlFiles) {
-		f := f
 		g.Go(func() error {
 			return c.ssapplyYAMLFile(namespace, false, f)
 		})
@@ -1020,7 +1018,6 @@ func (c *client) ApplyYAMLContents(namespace string, yamls ...string) error {
 	for _, yaml := range yamls {
 		cfgs := yml.SplitString(yaml)
 		for _, cfg := range cfgs {
-			cfg := cfg
 			g.Go(func() error {
 				return c.ssapplyYAML(cfg, namespace, false)
 			})
@@ -1032,7 +1029,6 @@ func (c *client) ApplyYAMLContents(namespace string, yamls ...string) error {
 func (c *client) ApplyYAMLFilesDryRun(namespace string, yamlFiles ...string) error {
 	g, _ := errgroup.WithContext(context.TODO())
 	for _, f := range removeEmptyFiles(yamlFiles) {
-		f := f
 		g.Go(func() error {
 			return c.ssapplyYAMLFile(namespace, true, f)
 		})
@@ -1140,7 +1136,6 @@ func (c *client) DeleteYAMLFiles(namespace string, yamlFiles ...string) (err err
 	errs := make([]error, len(yamlFiles))
 	g, _ := errgroup.WithContext(context.TODO())
 	for i, f := range yamlFiles {
-		i, f := i, f
 		g.Go(func() error {
 			errs[i] = c.deleteYAMLFile(namespace, false, f)
 			return errs[i]
@@ -1157,7 +1152,6 @@ func (c *client) DeleteYAMLFilesDryRun(namespace string, yamlFiles ...string) (e
 	errs := make([]error, len(yamlFiles))
 	g, _ := errgroup.WithContext(context.TODO())
 	for i, f := range yamlFiles {
-		i, f := i, f
 		g.Go(func() error {
 			errs[i] = c.deleteYAMLFile(namespace, true, f)
 			return errs[i]
@@ -1328,12 +1322,4 @@ func FindIstiodMonitoringPort(pod *v1.Pod) int {
 		}
 	}
 	return 15014
-}
-
-// FilterIfEnhancedFilteringEnabled returns the namespace filter if EnhancedResourceScoping is enabled, otherwise a NOP filter.
-func FilterIfEnhancedFilteringEnabled(k Client) kubetypes.DynamicObjectFilter {
-	if features.EnableEnhancedResourceScoping {
-		return k.ObjectFilter()
-	}
-	return nil
 }

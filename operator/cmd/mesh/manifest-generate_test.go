@@ -517,8 +517,9 @@ func TestManifestGeneratePilot(t *testing.T) {
 			fileSelect: []string{"templates/deployment.yaml", "templates/autoscale.yaml"},
 		},
 		{
-			desc:       "pilot_override_kubernetes",
-			diffSelect: "Deployment:*:istiod, Service:*:istiod,MutatingWebhookConfiguration:*:istio-sidecar-injector,ServiceAccount:*:istio-reader-service-account",
+			desc: "pilot_override_kubernetes",
+			// nolint: lll
+			diffSelect: "Deployment:*:istiod, Service:*:istiod,PodDisruptionBudget:*:istiod,MutatingWebhookConfiguration:*:istio-sidecar-injector,ServiceAccount:*:istio-reader-service-account",
 			fileSelect: []string{
 				"templates/deployment.yaml", "templates/mutatingwebhook.yaml",
 				"templates/service.yaml", "templates/reader-serviceaccount.yaml",
@@ -817,9 +818,20 @@ func TestLDFlags(t *testing.T) {
 	assert.Equal(t, vals.GetPathString("spec.tag"), version.DockerInfo.Tag)
 }
 
+// TestManifestGenerateStructure makes some basic assertions about the structure of GeneratedManifests output.
+// This is to ensure that we only generate a single ManifestSet per component-type (in this case ingress gateways).
+// prevent an `istioctl install` regression of https://github.com/istio/istio/issues/53875
+func TestManifestGenerateStructure(t *testing.T) {
+	multiGatewayFile := filepath.Join(testDataDir, "input/gateways.yaml")
+	sets, _, err := render.GenerateManifest([]string{multiGatewayFile}, []string{}, false, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, len(sets), 1) // if this produces more than 1 ManifestSet it will cause a deadlock during install
+	gateways := sets[0].Manifests
+	assert.Equal(t, len(gateways), 21) // 7 kube resources * 3 gateways
+}
+
 func runTestGroup(t *testing.T, tests testGroup) {
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			t.Parallel()
 			inPath := filepath.Join(testDataDir, "input", tt.desc+".yaml")
