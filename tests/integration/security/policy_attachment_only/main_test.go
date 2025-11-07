@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 //  Copyright Istio Authors
 //
@@ -49,7 +48,7 @@ func TestMain(m *testing.M) {
 		NewSuite(m).
 		Label(label.CustomSetup).
 		Setup(istio.Setup(&i, func(c resource.Context, cfg *istio.Config) {
-			if !c.Settings().EnableDualStack {
+			if len(c.Settings().IPFamilies) < 2 {
 				cfg.ControlPlaneValues = `
 values:
   pilot: 

@@ -64,7 +64,8 @@ func newCrdWatcher(client kube.Client) kubetypes.CrdWatcher {
 }
 
 var minimumCRDVersions = map[string]*semver.Version{
-	"grpcroutes.gateway.networking.k8s.io": semver.New(1, 1, 0, "", ""),
+	"grpcroutes.gateway.networking.k8s.io":         semver.New(1, 1, 0, "", ""),
+	"backendtlspolicies.gateway.networking.k8s.io": semver.New(1, 4, 0, "", ""),
 }
 
 // minimumVersionFilter filters CRDs that do not meet a minimum "version".
@@ -122,6 +123,7 @@ func (c *crdWatcher) Run(stop <-chan struct{}) {
 	c.mutex.Unlock()
 	kube.WaitForCacheSync("crd watcher", stop, c.crds.HasSynced)
 	c.queue.Run(stop)
+	log.Info("Stopping CRD watcher")
 	c.crds.ShutdownHandlers()
 }
 

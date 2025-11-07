@@ -248,7 +248,7 @@ func (s *Controller) workloadEntryHandler(old, curr config.Config, event model.E
 		event = model.EventDelete
 	}
 
-	wi := s.convertWorkloadEntryToWorkloadInstance(curr, s.Cluster())
+	wi := s.convertWorkloadEntryToWorkloadInstance(wle, curr.Meta, s.Cluster())
 	if wi != nil && !wi.DNSServiceEntryOnly {
 		// fire off the k8s handlers
 		s.NotifyWorkloadInstanceHandlers(wi, event)
@@ -273,7 +273,7 @@ func (s *Controller) workloadEntryHandler(old, curr config.Config, event model.E
 	currSes := getWorkloadServiceEntries(cfgs, wle)
 	var oldSes map[types.NamespacedName]*config.Config
 	if oldWle != nil {
-		if labels.Instance(oldWle.Labels).Equals(curr.Labels) {
+		if labels.Instance(oldWle.Labels).Equals(wle.Labels) {
 			oldSes = currSes
 		} else {
 			// labels update should trigger proxy update
@@ -345,11 +345,15 @@ func (s *Controller) workloadEntryHandler(old, curr config.Config, event model.E
 	// update eds cache only
 	s.edsUpdate(allInstances, false)
 
+	// TODO: if len(configsUpdated) == 0 we're firing a Forced push for compatibility because no configs have been updated,
+	// we should actually skip the push.
 	pushReq := &model.PushRequest{
 		Full:           true,
 		ConfigsUpdated: configsUpdated,
 		Reason:         model.NewReasonStats(model.EndpointUpdate),
+		Forced:         len(configsUpdated) == 0,
 	}
+
 	// trigger a full push
 	s.XdsUpdater.ConfigUpdate(pushReq)
 }
@@ -378,7 +382,6 @@ func (s *Controller) serviceEntryHandler(old, curr config.Config, event model.Ev
 	log.Debugf("Handle event %s for service entry %s/%s", event, curr.Namespace, curr.Name)
 	currentServiceEntry := curr.Spec.(*networking.ServiceEntry)
 	cs := convertServices(curr)
-	configsUpdated := sets.New[model.ConfigKey]()
 	key := curr.NamespacedName()
 
 	s.mutex.Lock()
@@ -426,6 +429,7 @@ func (s *Controller) serviceEntryHandler(old, curr config.Config, event model.Ev
 
 	shard := model.ShardKeyFromRegistry(s)
 
+	configsUpdated := sets.NewWithLength[model.ConfigKey](len(addedSvcs) + len(updatedSvcs) + len(deletedSvcs) + len(unchangedSvcs))
 	for _, svc := range addedSvcs {
 		s.XdsUpdater.SvcUpdate(shard, string(svc.Hostname), svc.Attributes.Namespace, model.EventAdd)
 		configsUpdated.Insert(makeConfigKey(svc))
@@ -440,7 +444,7 @@ func (s *Controller) serviceEntryHandler(old, curr config.Config, event model.Ev
 		instanceKey := instancesKey{namespace: svc.Attributes.Namespace, hostname: svc.Hostname}
 		// There can be multiple service entries of same host reside in same namespace.
 		// Delete endpoint shards only if there are no service instances.
-		if len(s.serviceInstances.getByKey(instanceKey)) == 0 {
+		if s.serviceInstances.countByKey(instanceKey) == 0 {
 			s.XdsUpdater.SvcUpdate(shard, string(svc.Hostname), svc.Attributes.Namespace, model.EventDelete)
 		} else {
 			// If there are some endpoints remaining for the host, add svc to updatedSvcs to trigger eds cache update
@@ -484,10 +488,13 @@ func (s *Controller) serviceEntryHandler(old, curr config.Config, event model.Ev
 
 	s.queueEdsEvent(keys, false)
 
+	// TODO: if len(configsUpdated) == 0 we're firing a Forced push for compatibility because no configs have been updated,
+	// we should actually skip the push.
 	pushReq := &model.PushRequest{
 		Full:           true,
 		ConfigsUpdated: configsUpdated,
 		Reason:         model.NewReasonStats(model.ServiceUpdate),
+		Forced:         len(configsUpdated) == 0,
 	}
 	s.XdsUpdater.ConfigUpdate(pushReq)
 }
@@ -626,10 +633,13 @@ func (s *Controller) WorkloadInstanceHandler(wi *model.WorkloadInstance, event m
 	if fullPush {
 		log.Debugf("Full push triggered during event %s for workload instance (%s/%v) in namespace %s", event,
 			wi.Kind, wi.Endpoint.Addresses, wi.Namespace)
+		// TODO: if len(configsUpdated) == 0 we're firing a Forced push for compatibility because no configs have been updated,
+		// we should actually skip the push.
 		pushReq := &model.PushRequest{
 			Full:           true,
 			ConfigsUpdated: configsUpdated,
 			Reason:         model.NewReasonStats(model.EndpointUpdate),
+			Forced:         len(configsUpdated) == 0,
 		}
 		s.XdsUpdater.ConfigUpdate(pushReq)
 	}
@@ -665,20 +675,19 @@ func (s *Controller) HasSynced() bool {
 func (s *Controller) Services() []*model.Service {
 	s.mutex.Lock()
 	allServices := s.services.getAllServices()
-	out := make([]*model.Service, 0, len(allServices))
 	if s.services.allocateNeeded {
 		autoAllocateIPs(allServices)
 		s.services.allocateNeeded = false
 	}
 	s.mutex.Unlock()
-	for _, svc := range allServices {
+	for i, svc := range allServices {
 		// shallow copy, copy `AutoAllocatedIPv4Address` and `AutoAllocatedIPv6Address`
 		// if return the pointer directly, there will be a race with `BuildNameTable`
 		// nolint: govet
 		shallowSvc := *svc
-		out = append(out, &shallowSvc)
+		allServices[i] = &shallowSvc
 	}
-	return out
+	return allServices
 }
 
 // GetService retrieves a service by host name if it exists.
@@ -898,8 +907,7 @@ func autoAllocateIPs(services []*model.Service) []*model.Service {
 		//   for NONE because we will not know the original DST IP that the application requested.
 		// 2. the address is not set (0.0.0.0)
 		// 3. the hostname is not a wildcard
-		if svc.DefaultAddress == constants.UnspecifiedIP && !svc.Hostname.IsWildCarded() &&
-			svc.Resolution != model.Passthrough {
+		if svc.DefaultAddress == constants.UnspecifiedIP && !svc.Hostname.IsWildCarded() && svc.Resolution != model.Passthrough {
 			if j >= maxIPs {
 				log.Errorf("out of IPs to allocate for service entries. maxips:= %d", maxIPs)
 				break

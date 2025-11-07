@@ -56,7 +56,6 @@ func TestDependencies(t *testing.T) {
 				`envoy/extensions/wasm/`,
 				`envoy/extensions/filters/(http|network)/wasm/`,
 				`github.com/envoyproxy/protoc-gen-validate/validate`,
-				`github.com/envoyproxy/go-control-plane/pkg/conversion`,
 				`github.com/envoyproxy/go-control-plane/envoy/config`,
 				`github.com/envoyproxy/go-control-plane/envoy/extensions/filters`,
 				`contrib/envoy/extensions/private_key_providers/`,
@@ -81,12 +80,10 @@ func TestDependencies(t *testing.T) {
 		{
 			entrypoint: "pilot/cmd/pilot-discovery",
 			tag:        "vtprotobuf,disable_pgv",
-			exceptions: []string{},
 			denied: []string{
 				// Deps meant only for other components; if we import them, something may be wrong
 				`^github\.com/containernetworking/`,
 				`^github\.com/fatih/color`,
-				`^github\.com/florianl/go-nflog/v2`,
 				`^github\.com/vishvananda/`,
 				`^helm\.sh/helm/v3`,
 				`^sigs\.k8s\.io/controller-runtime`,
@@ -94,19 +91,18 @@ func TestDependencies(t *testing.T) {
 				`^github\.com/AdaLogics/go-fuzz-headers`,
 				`^github\.com/google/shlex`,
 				`^github\.com/howardjohn/unshare-go`,
-				`^github\.com/pmezard/go-difflib`,
 			},
 			wantToDeny: []string{
 				`^testing$`,
+				// Ideally only used for testing, but client-go uses it
+				`^github\.com/pmezard/go-difflib`,
 			},
 		},
 		{
 			entrypoint: "istioctl/cmd/istioctl",
-			exceptions: []string{},
 			denied: []string{
 				// Deps meant only for other components; if we import them, something may be wrong
 				`^github\.com/containernetworking/`,
-				`^github\.com/florianl/go-nflog/v2`,
 				`^github\.com/vishvananda/`,
 				`^sigs\.k8s\.io/controller-runtime`,
 				// Testing deps

@@ -29,11 +29,13 @@ import (
 	"istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/api/type/v1beta1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
@@ -2724,7 +2726,7 @@ func TestCreateSidecarScope(t *testing.T) {
 			ps := NewPushContext()
 			meshConfig := mesh.DefaultMeshConfig()
 			env := NewEnvironment()
-			env.Watcher = mesh.NewFixedWatcher(meshConfig)
+			env.Watcher = meshwatcher.NewTestWatcher(meshConfig)
 			ps.Mesh = env.Mesh()
 
 			env.ServiceDiscovery = &localServiceDiscovery{services: tt.services}
@@ -2749,6 +2751,9 @@ func TestCreateSidecarScope(t *testing.T) {
 			}
 
 			sidecarScope := convertToSidecarScope(ps, sidecarConfig, "mynamespace")
+			if features.EnableLazySidecarEvaluation {
+				sidecarScope.initFunc()
+			}
 
 			numberListeners := len(sidecarScope.EgressListeners)
 			if numberListeners != configuredListeneres {
@@ -3029,7 +3034,10 @@ func TestContainsEgressDependencies(t *testing.T) {
 			ps.setDestinationRules(destinationRules)
 			sidecarScope := convertToSidecarScope(ps, cfg, "default")
 			if len(tt.egress) == 0 {
-				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
+				sidecarScope = convertToSidecarScope(ps, nil, "default")
+			}
+			if features.EnableLazySidecarEvaluation {
+				sidecarScope.initFunc()
 			}
 
 			for k, v := range tt.contains {
@@ -3088,7 +3096,10 @@ func TestRootNsSidecarDependencies(t *testing.T) {
 			ps.Mesh = meshConfig
 			sidecarScope := convertToSidecarScope(ps, cfg, "default")
 			if len(tt.egress) == 0 {
-				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
+				sidecarScope = convertToSidecarScope(ps, nil, "default")
+			}
+			if features.EnableLazySidecarEvaluation {
+				sidecarScope.initFunc()
 			}
 
 			for k, v := range tt.contains {
@@ -3218,9 +3229,13 @@ outboundTrafficPolicy:
 
 			var sidecarScope *SidecarScope
 			if test.sidecar == nil {
-				sidecarScope = DefaultSidecarScopeForNamespace(ps, "not-default")
+				sidecarScope = convertToSidecarScope(ps, nil, "not-default")
 			} else {
 				sidecarScope = convertToSidecarScope(ps, test.sidecar, test.sidecar.Namespace)
+			}
+
+			if features.EnableLazySidecarEvaluation {
+				sidecarScope.initFunc()
 			}
 
 			if !reflect.DeepEqual(test.outboundTrafficPolicy, sidecarScope.OutboundTrafficPolicy) {
@@ -3377,6 +3392,9 @@ func TestInboundConnectionPoolForPort(t *testing.T) {
 				Spec: tt.sidecar,
 			}
 			scope := convertToSidecarScope(ps, sidecar, sidecar.Namespace)
+			if features.EnableLazySidecarEvaluation {
+				scope.initFunc()
+			}
 
 			for port, expected := range tt.want {
 				actual := scope.InboundConnectionPoolForPort(port)

@@ -155,10 +155,8 @@ func (s Schemas) FindByGroupVersionAliasesKind(gvk config.GroupVersionKind) (res
 // FindByGroupKind provides future proofing against versions we don't yet know about; given we don't know them, its risky.
 func (s Schemas) FindByGroupKind(gvk config.GroupVersionKind) (resource.Schema, bool) {
 	for _, rs := range s.byAddOrder {
-		for _, va := range rs.GroupVersionAliasKinds() {
-			if va == gvk {
-				return rs, true
-			}
+		if rs.Group() == gvk.Group && rs.Kind() == gvk.Kind {
+			return rs, true
 		}
 	}
 	return nil, false
@@ -240,7 +238,7 @@ func (s Schemas) Validate() (err error) {
 	for _, c := range s.byAddOrder {
 		err = multierror.Append(err, c.Validate()).ErrorOrNil()
 	}
-	return
+	return err
 }
 
 func (s Schemas) Equal(o Schemas) bool {

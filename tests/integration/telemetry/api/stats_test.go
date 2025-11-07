@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -45,7 +44,9 @@ import (
 	util "istio.io/istio/tests/integration/telemetry"
 )
 
-var PeerAuthenticationConfig = `
+const (
+	additionalLabelConfigPath          = "testdata/additional-labels.yaml"
+	strictMtlsPeerAuthenticationConfig = `
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
@@ -54,6 +55,7 @@ spec:
   mtls:
     mode: STRICT
 `
+)
 
 func GetClientInstances() echo.Instances {
 	return apps.A
@@ -72,119 +74,157 @@ func TestStatsFilter(t *testing.T) {
 	expectedBuckets := DefaultBucketCount
 	framework.NewTest(t).
 		Run(func(t framework.TestContext) {
-			// Enable strict mTLS. This is needed for mock secured prometheus scraping test.
-			t.ConfigIstio().YAML(ist.Settings().SystemNamespace, PeerAuthenticationConfig).ApplyOrFail(t)
-			g, _ := errgroup.WithContext(context.Background())
-			for _, cltInstance := range GetClientInstances() {
-				g.Go(func() error {
-					err := retry.UntilSuccess(func() error {
-						if err := SendTraffic(cltInstance); err != nil {
-							return err
-						}
-						c := cltInstance.Config().Cluster
-						sourceCluster := constants.DefaultClusterName
-						if len(t.AllClusters()) > 1 {
-							sourceCluster = c.Name()
-						}
-						sourceQuery, destinationQuery, appQuery := buildQuery(sourceCluster)
-						// Query client side metrics
-						prom := promInst
-						if _, err := prom.QuerySum(c, sourceQuery); err != nil {
-							util.PromDiff(t, prom, c, sourceQuery)
-							return err
-						}
-						// Query client side metrics for non-injected server
-						outOfMeshServerQuery := buildOutOfMeshServerQuery(sourceCluster)
-						if _, err := prom.QuerySum(c, outOfMeshServerQuery); err != nil {
-							util.PromDiff(t, prom, c, outOfMeshServerQuery)
-							return err
-						}
-						// Query server side metrics.
-						if _, err := prom.QuerySum(c, destinationQuery); err != nil {
-							util.PromDiff(t, prom, c, destinationQuery)
-							return err
-						}
-						// This query will continue to increase due to readiness probe; don't wait for it to converge
-						if _, err := prom.QuerySum(c, appQuery); err != nil {
-							util.PromDiff(t, prom, c, appQuery)
-							return err
-						}
-
-						if err := ValidateBucket(c, prom, cltInstance.Config().Service, "source", expectedBuckets); err != nil {
-							return err
-						}
-
-						return nil
-					}, retry.Delay(framework.TelemetryRetryDelay), retry.Timeout(framework.TelemetryRetryTimeout))
-					if err != nil {
-						return err
-					}
-					return nil
-				})
-			}
-			if err := g.Wait(); err != nil {
-				t.Fatalf("test failed: %v", err)
-			}
-
+			t.NewSubTest("default").Run(func(t framework.TestContext) {
+				runStatsTest(t, expectedBuckets, false)
+			})
+			t.NewSubTest("additional-labels").Run(func(t framework.TestContext) {
+				if t.Settings().PeerMetadataDiscovery {
+					t.Skipf("Peer metadata discovery is enabled, skipping additional-labels test")
+				}
+				runStatsTest(t, expectedBuckets, true)
+			})
 			// In addition, verifies that mocked prometheus could call metrics endpoint with proxy provisioned certs
 			t.NewSubTest("mockprom-to-metrics").Run(
 				func(t framework.TestContext) {
+					// Enable strict mTLS. This is needed for mock secured prometheus scraping test.
+					t.ConfigIstio().YAML(ist.Settings().SystemNamespace, strictMtlsPeerAuthenticationConfig).ApplyOrFail(t)
 					for _, prom := range mockProm {
-						st := match.Cluster(prom.Config().Cluster).FirstOrFail(t, GetTarget().Instances())
-						prom.CallOrFail(t, echo.CallOptions{
-							ToWorkload: st,
-							Scheme:     scheme.HTTPS,
-							Port:       echo.Port{ServicePort: 15014},
-							HTTP: echo.HTTP{
-								Path: "/metrics",
-							},
-							TLS: echo.TLS{
-								CertFile:           "/etc/certs/custom/cert-chain.pem",
-								KeyFile:            "/etc/certs/custom/key.pem",
-								CaCertFile:         "/etc/certs/custom/root-cert.pem",
-								InsecureSkipVerify: true,
-							},
+						retry.UntilSuccessOrFail(t, func() error {
+							st := match.Cluster(prom.Config().Cluster).FirstOrFail(t, GetTarget().Instances())
+							_, callErr := prom.Call(echo.CallOptions{
+								ToWorkload: st,
+								Scheme:     scheme.HTTPS,
+								Port:       echo.Port{ServicePort: 15014},
+								HTTP: echo.HTTP{
+									Path: "/metrics",
+								},
+								TLS: echo.TLS{
+									CertFile:           "/etc/certs/custom/cert-chain.pem",
+									KeyFile:            "/etc/certs/custom/key.pem",
+									CaCertFile:         "/etc/certs/custom/root-cert.pem",
+									InsecureSkipVerify: true,
+								},
+							})
+							if callErr != nil {
+								t.Logf("failed to call metrics endpoint: %v", st.NamespacedName())
+							}
+							return callErr
 						})
 					}
 				})
 		})
 }
 
-// TestStatsTCPFilter includes common test logic for stats and metadataexchange filters running
-// with nullvm and wasm runtime for TCP.
+func runStatsTest(t framework.TestContext, expectedBuckets int, enableMXAdditionalLabels bool) {
+	// Enable strict mTLS. This is needed for mock secured prometheus scraping test.
+	t.ConfigIstio().YAML(ist.Settings().SystemNamespace, strictMtlsPeerAuthenticationConfig).ApplyOrFail(t)
+	if enableMXAdditionalLabels {
+		// use namespace scoped Telemetry API to override the root level config
+		t.ConfigIstio().File(apps.Namespace.Name(), additionalLabelConfigPath).ApplyOrFail(t)
+	}
+	g, _ := errgroup.WithContext(context.Background())
+	for _, cltInstance := range GetClientInstances() {
+		g.Go(func() error {
+			err := retry.UntilSuccess(func() error {
+				if err := SendTraffic(cltInstance); err != nil {
+					return err
+				}
+				c := cltInstance.Config().Cluster
+				sourceCluster := constants.DefaultClusterName
+				if len(t.AllClusters()) > 1 {
+					sourceCluster = c.Name()
+				}
+				sourceQuery, destinationQuery, appQuery := buildQuery(sourceCluster, enableMXAdditionalLabels)
+				// Query client side metrics
+				prom := promInst
+				if _, err := prom.QuerySum(c, sourceQuery); err != nil {
+					util.PromDiff(t, prom, c, sourceQuery)
+					return err
+				}
+				// Query client side metrics for non-injected server
+				outOfMeshServerQuery := buildOutOfMeshServerQuery(sourceCluster)
+				if _, err := prom.QuerySum(c, outOfMeshServerQuery); err != nil {
+					util.PromDiff(t, prom, c, outOfMeshServerQuery)
+					return err
+				}
+				// Query server side metrics.
+				if _, err := prom.QuerySum(c, destinationQuery); err != nil {
+					util.PromDiff(t, prom, c, destinationQuery)
+					return err
+				}
+				// This query will continue to increase due to readiness probe; don't wait for it to converge
+				if _, err := prom.QuerySum(c, appQuery); err != nil {
+					util.PromDiff(t, prom, c, appQuery)
+					return err
+				}
+
+				if err := ValidateBucket(c, prom, cltInstance.Config().Service, "source", expectedBuckets); err != nil {
+					return err
+				}
+
+				return nil
+			}, retry.Delay(framework.TelemetryRetryDelay), retry.Timeout(framework.TelemetryRetryTimeout))
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("test failed: %v", err)
+	}
+}
+
+// TestStatsTCPFilter includes common test logic for stats and MX filters.
 func TestStatsTCPFilter(t *testing.T) {
 	framework.NewTest(t).
 		Run(func(t framework.TestContext) {
-			g, _ := errgroup.WithContext(context.Background())
-			for _, cltInstance := range GetClientInstances() {
-				g.Go(func() error {
-					err := retry.UntilSuccess(func() error {
-						if err := SendTCPTraffic(cltInstance); err != nil {
-							return err
-						}
-						c := cltInstance.Config().Cluster
-						sourceCluster := constants.DefaultClusterName
-						if len(t.AllClusters()) > 1 {
-							sourceCluster = c.Name()
-						}
-						destinationQuery := buildTCPQuery(sourceCluster)
-						if _, err := promInst.Query(c, destinationQuery); err != nil {
-							util.PromDiff(t, promInst, c, destinationQuery)
-							return err
-						}
-
-						return nil
-					}, retry.Delay(framework.TelemetryRetryDelay), retry.Timeout(framework.TelemetryRetryTimeout))
-					if err != nil {
-						return err
-					}
-					return nil
-				})
-			}
-			if err := g.Wait(); err != nil {
-				t.Fatalf("test failed: %v", err)
-			}
+			t.NewSubTest("default").Run(func(t framework.TestContext) {
+				runTCPStatsTest(t, false)
+			})
+			t.NewSubTest("additional-labels").Run(func(t framework.TestContext) {
+				if t.Settings().PeerMetadataDiscovery {
+					t.Skipf("Peer metadata discovery is enabled, skipping additional-labels test")
+				}
+				runTCPStatsTest(t, true)
+			})
 		})
+}
+
+func runTCPStatsTest(t framework.TestContext, enableMXAdditionalLabels bool) {
+	g, _ := errgroup.WithContext(t.Context())
+	if enableMXAdditionalLabels {
+		// use namespace scoped Telemetry API to override the root level config
+		t.ConfigIstio().File(apps.Namespace.Name(), additionalLabelConfigPath).ApplyOrFail(t)
+	}
+	for _, cltInstance := range GetClientInstances() {
+		g.Go(func() error {
+			err := retry.UntilSuccess(func() error {
+				if err := SendTCPTraffic(cltInstance); err != nil {
+					return err
+				}
+				c := cltInstance.Config().Cluster
+				sourceCluster := constants.DefaultClusterName
+				if len(t.AllClusters()) > 1 {
+					sourceCluster = c.Name()
+				}
+				destinationQuery := buildTCPQuery(sourceCluster, enableMXAdditionalLabels)
+				if _, err := promInst.Query(c, destinationQuery); err != nil {
+					util.PromDiff(t, promInst, c, destinationQuery)
+					return err
+				}
+
+				return nil
+			}, retry.Delay(framework.TelemetryRetryDelay), retry.Timeout(framework.TelemetryRetryTimeout))
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("test failed: %v", err)
+	}
 }
 
 func TestStatsGatewayServerTCPFilter(t *testing.T) {
@@ -356,7 +396,7 @@ func BuildQueryCommon(labels map[string]string, ns string) (sourceQuery, destina
 	appQuery.Metric = "istio_echo_http_requests_total"
 	appQuery.Labels = map[string]string{"namespace": ns}
 
-	return
+	return sourceQuery, destinationQuery, appQuery
 }
 
 func clone(labels map[string]string) map[string]string {
@@ -367,7 +407,7 @@ func clone(labels map[string]string) map[string]string {
 	return ret
 }
 
-func buildQuery(sourceCluster string) (sourceQuery, destinationQuery, appQuery prometheus.Query) {
+func buildQuery(sourceCluster string, enableMXAdditionalLabels bool) (sourceQuery, destinationQuery, appQuery prometheus.Query) {
 	ns := apps.Namespace
 	labels := map[string]string{
 		"request_protocol":               "http",
@@ -385,7 +425,13 @@ func buildQuery(sourceCluster string) (sourceQuery, destinationQuery, appQuery p
 		"source_cluster":                 sourceCluster,
 	}
 
-	return BuildQueryCommon(labels, ns.Name())
+	sourceQuery, destinationQuery, appQuery = BuildQueryCommon(labels, ns.Name())
+	if enableMXAdditionalLabels {
+		sourceQuery.Labels["upstream_custom_label"] = "b"
+		destinationQuery.Labels["downstream_custom_label"] = "a"
+	}
+
+	return sourceQuery, destinationQuery, appQuery
 }
 
 func buildOutOfMeshServerQuery(sourceCluster string) prometheus.Query {
@@ -415,7 +461,7 @@ func buildOutOfMeshServerQuery(sourceCluster string) prometheus.Query {
 	return source
 }
 
-func buildTCPQuery(sourceCluster string) (destinationQuery prometheus.Query) {
+func buildTCPQuery(sourceCluster string, enableAdditionalLabels bool) (destinationQuery prometheus.Query) {
 	ns := apps.Namespace
 	labels := map[string]string{
 		"request_protocol":               "tcp",
@@ -432,6 +478,10 @@ func buildTCPQuery(sourceCluster string) (destinationQuery prometheus.Query) {
 		"source_workload_namespace":      ns.Name(),
 		"source_cluster":                 sourceCluster,
 		"reporter":                       "destination",
+	}
+	if enableAdditionalLabels {
+		// reporter is destination, so custom label is `b`.
+		labels["downstream_custom_label"] = "a"
 	}
 	return prometheus.Query{
 		Metric: "istio_tcp_connections_opened_total",
@@ -563,5 +613,5 @@ func getSupportedIPFamilies(t framework.TestContext) (v4 bool, v6 bool) {
 	if !v4 && !v6 {
 		t.Fatalf("pod is neither v4 nor v6? %v", addrs)
 	}
-	return
+	return v4, v6
 }

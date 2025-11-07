@@ -93,7 +93,7 @@ func (c *CitadelClient) CSRSign(csrPEM []byte, certValidTTLInSec int64) (res []s
 	// TODO(hzxuzhonghu): notify caclient rebuilding only when root cert is updated.
 	// It can happen when the istiod dns certs is resigned after root cert is updated,
 	// in this case, the ca grpc client can not automatically connect to istiod after the underlying network connection closed.
-	// Becase that the grpc client still use the old tls configuration to reconnect to istiod.
+	// Because that the grpc client still use the old tls configuration to reconnect to istiod.
 	// So here we need to rebuild the caClient in order to use the new root cert.
 	defer func() {
 		if err != nil {
@@ -105,6 +105,10 @@ func (c *CitadelClient) CSRSign(csrPEM []byte, certValidTTLInSec int64) (res []s
 	}()
 
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("ClusterID", c.opts.ClusterID))
+	for k, v := range c.opts.CAHeaders {
+		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
+	}
+
 	resp, err := c.client.CreateCertificate(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("create certificate: %v", err)

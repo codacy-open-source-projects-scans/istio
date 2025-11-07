@@ -43,7 +43,6 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/version"
 	iptables "istio.io/istio/tools/istio-iptables/pkg/cmd"
-	iptableslog "istio.io/istio/tools/istio-iptables/pkg/log"
 )
 
 const (
@@ -103,8 +102,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 			cmd.PrintFlags(c.Flags())
 			log.Infof("Version %s", version.Info.String())
 
-			raiseLimits()
-
 			err := initProxy(args)
 			if err != nil {
 				return err
@@ -151,8 +148,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 				}
 			}
 
-			go iptableslog.ReadNFLOGSocket(ctx)
-
 			// On SIGINT or SIGTERM, cancel the context, triggering a graceful shutdown
 			go cmd.WaitSignalFunc(cancel)
 
@@ -181,7 +176,7 @@ func addFlags(proxyCmd *cobra.Command) {
 	// DEPRECATED. Flags for proxy configuration
 	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ServiceCluster, "serviceCluster", constants.ServiceClusterName, "Service cluster")
 	// Log levels are provided by the library https://github.com/gabime/spdlog, used by Envoy.
-	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ProxyLogLevel, "proxyLogLevel", "warning,misc:error",
+	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ProxyLogLevel, "proxyLogLevel", "warning",
 		fmt.Sprintf("The log level used to start the Envoy proxy (choose from {%s, %s, %s, %s, %s, %s, %s})."+
 			"Level may also include one or more scopes, such as 'info,misc:error,upstream:debug'",
 			"trace", "debug", "info", "warning", "error", "critical", "off"))
@@ -341,13 +336,4 @@ func getExcludeInterfaces() sets.String {
 
 	log.Infof("Exclude IPs %v based on %s annotation", excludeAddrs, annotation.SidecarTrafficExcludeInterfaces.Name)
 	return excludeAddrs
-}
-
-func raiseLimits() {
-	limit, err := RaiseFileLimits()
-	if err != nil {
-		log.Warnf("failed setting file limit: %v", err)
-	} else {
-		log.Infof("Set max file descriptors (ulimit -n) to: %d", limit)
-	}
 }

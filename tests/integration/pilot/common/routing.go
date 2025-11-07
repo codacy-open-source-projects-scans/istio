@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -192,8 +191,13 @@ func httpGateway(host string, port int, portName, protocol string, gatewayIstioL
 func virtualServiceCases(t TrafficContext) {
 	// reduce the total # of subtests that don't give valuable coverage or just don't work
 	// TODO include proxyless as different features become supported
-	t.SetDefaultSourceMatchers(match.NotNaked, match.NotHeadless, match.NotProxylessGRPC)
-	t.SetDefaultTargetMatchers(match.NotNaked, match.NotHeadless, match.NotProxylessGRPC)
+	matchers := []match.Matcher{match.NotNaked, match.NotHeadless, match.NotProxylessGRPC}
+	if t.Settings().AmbientMultiNetwork {
+		matchers = append(matchers, match.AmbientCaptured())
+	}
+	t.SetDefaultSourceMatchers(matchers...)
+	t.SetDefaultTargetMatchers(matchers...)
+
 	includeProxyless := []match.Matcher{match.NotNaked, match.NotHeadless}
 
 	skipVM := t.Settings().Skip(echo.VM)
@@ -616,6 +620,89 @@ spec:
 						check.Status(http.StatusMovedPermanently),
 						// Note: there is "85" added, as its already NOT the protocol default
 						LocationHeader("http://b:85/foo")),
+				},
+			},
+		},
+	})
+	// Contain ever special char allowed in a header
+	absurdHeader := "a!#$%&'*+-.^_`|~z"
+	t.RunTraffic(TrafficTestCase{
+		name: "weird header matches",
+		templateVars: func(src echo.Callers, dest echo.Instances) map[string]any {
+			return map[string]any{"header": absurdHeader}
+		},
+		config: `
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: default
+spec:
+  hosts:
+    - {{ .dstSvc }}
+  http:
+  - match:
+    - headers:
+        {{.header|quote}}:
+          exact: why
+    route:
+    - destination:
+        host: {{ .dstSvc }}
+`,
+		workloadAgnostic: true,
+		children: []TrafficCall{
+			{
+				name: "no match",
+				opts: echo.CallOptions{
+					Port:  echo.Port{Name: "http"},
+					HTTP:  echo.HTTP{},
+					Check: check.Status(http.StatusNotFound),
+				},
+			},
+			{
+				name: "match",
+				opts: echo.CallOptions{
+					Port:  echo.Port{Name: "http"},
+					HTTP:  echo.HTTP{Headers: headers.New().With(absurdHeader, "why").Build()},
+					Check: check.OK(),
+				},
+			},
+		},
+	})
+	t.RunTraffic(TrafficTestCase{
+		name: "pseudo header matches",
+		config: `
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: default
+spec:
+  hosts:
+    - {{ .dstSvc }}
+  http:
+  - match:
+    - headers:
+        :method:
+          exact: GET
+    route:
+    - destination:
+        host: {{ .dstSvc }}
+`,
+		workloadAgnostic: true,
+		children: []TrafficCall{
+			{
+				name: "no match",
+				opts: echo.CallOptions{
+					Port:  echo.Port{Name: "http"},
+					HTTP:  echo.HTTP{Method: "POST"},
+					Check: check.Status(http.StatusNotFound),
+				},
+			},
+			{
+				name: "match",
+				opts: echo.CallOptions{
+					Port:  echo.Port{Name: "http"},
+					HTTP:  echo.HTTP{Method: "GET"},
+					Check: check.OK(),
 				},
 			},
 		},
@@ -3039,7 +3126,7 @@ spec:
 						}
 					}
 					if sessionCookie != nil {
-						scopes.Framework.Infof("setting the request cookie back in the request: %v %b",
+						scopes.Framework.Infof("setting the request cookie back in the request: %v %v",
 							sessionCookie.Value, sessionCookie.Expires)
 						req.AddCookie(sessionCookie)
 					} else {
@@ -3217,11 +3304,16 @@ func protocolSniffingCases(t TrafficContext) {
 
 	// so we can check all clusters are hit
 	for _, call := range protocols {
+		skip := skip{}
+		if call.scheme == scheme.TCP {
+			skip.skip = true
+			skip.reason = "https://github.com/istio/istio/issues/26798: enable sniffing tcp"
+		} else if call.scheme == scheme.HTTP && t.Settings().AmbientMultiNetwork {
+			skip.skip = true
+			skip.reason = "https://github.com/istio/istio/issues/58010"
+		}
 		t.RunTraffic(TrafficTestCase{
-			skip: skip{
-				skip:   call.scheme == scheme.TCP,
-				reason: "https://github.com/istio/istio/issues/26798: enable sniffing tcp",
-			},
+			skip: skip,
 			name: call.port,
 			opts: echo.CallOptions{
 				Count: 1,
@@ -3635,7 +3727,7 @@ spec:
 			if tt.server != "" {
 				address += "&server=" + tt.server
 			}
-			expected := aInCluster[0].Address()
+			expected := aInCluster[0].Addresses()
 			t.RunTraffic(TrafficTestCase{
 				name: fmt.Sprintf("svc/%s/%s/%s", client.Config().Service, client.Config().Cluster.StableName(), tt.name),
 				call: client.CallOrFail,
@@ -3646,10 +3738,9 @@ spec:
 					Check: func(result echo.CallResult, _ error) error {
 						for _, r := range result.Responses {
 							ips := r.Body()
-							sort.Strings(ips)
-							exp := []string{expected}
-							if !reflect.DeepEqual(ips, exp) {
-								return fmt.Errorf("unexpected dns response: wanted %v, got %v", exp, ips)
+							sort.Strings(expected)
+							if !reflect.DeepEqual(ips, expected) {
+								return fmt.Errorf("unexpected dns response: wanted %v, got %v", expected, ips)
 							}
 						}
 						return nil
@@ -3870,7 +3961,7 @@ func testServiceEntryWithMultipleVIPsAndResolutionNone(t TrafficContext) {
 	var cidrs []string
 	for _, clusterIP := range clusterIPs {
 		if ip, err := netip.ParseAddr(clusterIP); err != nil {
-			t.Errorf("failed to parse cluster IP address '%s': %s", err)
+			t.Errorf("failed to parse cluster IP address '%s': %v", clusterIP, err)
 		} else if ip.Is4() {
 			cidrs = append(cidrs, fmt.Sprintf("%s/24", clusterIP))
 		} else if ip.Is6() {
@@ -5142,8 +5233,8 @@ func createService(t TrafficContext, name, ns, appLabelValue string, instances i
 	return clusterIPs
 }
 
-func getSupportedIPFamilies(t framework.TestContext, instace echo.Instance) (v4 bool, v6 bool) {
-	for _, a := range instace.WorkloadsOrFail(t).Addresses() {
+func getSupportedIPFamilies(t framework.TestContext, instance echo.Instance) (v4 bool, v6 bool) {
+	for _, a := range instance.WorkloadsOrFail(t).Addresses() {
 		ip, err := netip.ParseAddr(a)
 		assert.NoError(t, err)
 		if ip.Is4() {
@@ -5153,7 +5244,7 @@ func getSupportedIPFamilies(t framework.TestContext, instace echo.Instance) (v4 
 		}
 	}
 	if !v4 && !v6 {
-		t.Fatalf("pod is neither v4 nor v6? %v", instace.WorkloadsOrFail(t).Addresses())
+		t.Fatalf("pod is neither v4 nor v6? %v", instance.WorkloadsOrFail(t).Addresses())
 	}
-	return
+	return v4, v6
 }

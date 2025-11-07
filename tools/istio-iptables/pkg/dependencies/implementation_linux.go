@@ -16,6 +16,7 @@ package dependencies
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -30,6 +31,8 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
+
+var testRuleAdd = []string{"-t", "nat", "-A", "INPUT", "-p", "255", "-j", "RETURN"}
 
 // TODO the entire `istio-iptables` package is linux-specific, I'm not sure we really need
 // platform-differentiators for the `dependencies` package itself.
@@ -49,6 +52,7 @@ var (
 )
 
 func shouldUseBinaryForCurrentContext(iptablesBin string) (IptablesVersion, error) {
+	log := log.WithLabels("binary", iptablesBin)
 	// We assume that whatever `iptablesXXX` binary you pass us also has a `iptablesXXX-save` and `iptablesXXX-restore`
 	// binary - which should always be true for any valid iptables installation
 	// (we use both in our iptables code later on anyway)
@@ -96,6 +100,28 @@ func shouldUseBinaryForCurrentContext(iptablesBin string) (IptablesVersion, erro
 		parsedVer = utilversion.MustParseGeneric("0.0.0")
 		isNft = false
 	}
+
+	// `filter` should ALWAYS exist if kernel support for this version is locally present,
+	// so try to add a no-op rule to that table, and make sure it doesn't fail - if it does, we can't use this version
+	// as the host is missing kernel support for it.
+	// (255 is a nonexistent protocol number, IANA reserved, see `cat /etc/protocols`, so this rule will never match anything)
+	testCmd := exec.Command(iptablesBin, testRuleAdd...)
+
+	var testStdErr bytes.Buffer
+	testCmd.Stderr = &testStdErr
+	testRes := testCmd.Run()
+	// If we can't add a rule to the basic `filter` table, we can't use this binary - bail out.
+	// Otherwise, delete the no-op rule and carry on with other checks
+	if testRes != nil || strings.Contains(testStdErr.String(), "does not exist") {
+		return IptablesVersion{}, fmt.Errorf("iptables binary %s has no loaded kernel support and cannot be used, err: %v out: %s",
+			iptablesBin, testRes, testStdErr.String())
+	}
+
+	testRuleDel := append(make([]string, 0, len(testRuleAdd)), testRuleAdd...)
+	testRuleDel[2] = "-D"
+
+	testCmd = exec.Command(iptablesBin, testRuleDel...)
+	_ = testCmd.Run()
 
 	// if binary seems to exist, check the dump of rules in our netns, and see if any rules exist there
 	// Note that this is highly dependent on context.
@@ -203,8 +229,8 @@ func mount(src, dst string) error {
 	return syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_RDONLY, "")
 }
 
-func (r *RealDependencies) executeXTablesWithOutput(log *log.Scope, cmd constants.IptablesCmd, iptVer *IptablesVersion,
-	ignoreErrors bool, stdin io.ReadSeeker, args ...string,
+func (r *RealDependencies) executeXTables(log *log.Scope, cmd constants.IptablesCmd, iptVer *IptablesVersion,
+	silenceErrors bool, stdin io.ReadSeeker, args ...string,
 ) (*bytes.Buffer, error) {
 	mode := "without lock"
 	stdout := &bytes.Buffer{}
@@ -261,42 +287,32 @@ func (r *RealDependencies) executeXTablesWithOutput(log *log.Scope, cmd constant
 			c = exec.Command(cmdBin, args...)
 		}
 	}
-	log.Infof("Running command (%s): %s %s", mode, cmdBin, strings.Join(args, " "))
+	log.Debugf("Running command (%s): %s %s", mode, cmdBin, strings.Join(args, " "))
 
 	c.Stdout = stdout
 	c.Stderr = stderr
 	c.Stdin = stdin
 	err := run(c)
 	if len(stdout.String()) != 0 {
-		log.Infof("Command output: \n%v", stdout.String())
+		log.Debugf("Command output: \n%v", stdout.String())
 	}
 
-	// TODO Check naming and redirection logic
-	if (err != nil || len(stderr.String()) != 0) && !ignoreErrors {
-		stderrStr := stderr.String()
+	stderrStr := stderr.String()
 
-		// Transform to xtables-specific error messages with more useful and actionable hints.
-		if err != nil {
-			stderrStr = transformToXTablesErrorMessage(stderrStr, err)
+	if err != nil {
+		// Transform to xtables-specific error messages
+		transformedErr := transformToXTablesErrorMessage(stderrStr, err)
+
+		if !silenceErrors {
+			log.Errorf("Command error: %v", transformedErr)
+		} else {
+			// Log ignored errors for debugging purposes
+			log.Debugf("Ignoring iptables command error: %v", transformedErr)
 		}
-
-		log.Errorf("Command error output: %v", stderrStr)
-	} else if err != nil && ignoreErrors {
-		// Log ignored errors for debugging purposes
-		log.Debugf("Ignoring iptables command error: %v", err)
+		err = errors.Join(err, errors.New(stderrStr))
+	} else if len(stderrStr) > 0 {
+		log.Debugf("Command stderr output: %s", stderrStr)
 	}
 
 	return stdout, err
-}
-
-func (r *RealDependencies) executeXTables(
-	logger *log.Scope,
-	cmd constants.IptablesCmd,
-	iptVer *IptablesVersion,
-	ignoreErrors bool,
-	stdin io.ReadSeeker,
-	args ...string,
-) error {
-	_, err := r.executeXTablesWithOutput(logger, cmd, iptVer, ignoreErrors, stdin, args...)
-	return err
 }

@@ -24,6 +24,7 @@ import (
 	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/keepalive"
+	"istio.io/istio/pkg/kube/krt"
 )
 
 // RegistryOptions provide configuration options for the configuration controller. If FileDir is set, that directory will
@@ -54,6 +55,7 @@ type PilotArgs struct {
 	NetworksConfigFile string
 	RegistryOptions    RegistryOptions
 	CtrlZOptions       *ctrlz.Options
+	KrtDebugger        *krt.DebugHandler `json:"-"`
 	KeepaliveOptions   *keepalive.Options
 	ShutdownDuration   time.Duration
 	JwtRule            string
@@ -102,7 +104,7 @@ type TLSOptions struct {
 	CertFile        string
 	KeyFile         string
 	TLSCipherSuites []string
-	CipherSuits     []uint16 // This is the parsed cipher suites
+	CipherSuites    []uint16 // This is the parsed cipher suites
 }
 
 var (
@@ -137,17 +139,19 @@ func (p *PilotArgs) applyDefaults() {
 	p.CniNamespace = PodNamespace
 	p.PodName = PodName
 	p.Revision = Revision
+	p.RegistryOptions.KubeOptions.Revision = Revision
 	p.JwtRule = JwtRule
 	p.KeepaliveOptions = keepalive.DefaultOption()
 	p.RegistryOptions.ClusterRegistriesNamespace = p.Namespace
+	p.KrtDebugger = new(krt.DebugHandler)
 }
 
 func (p *PilotArgs) Complete() error {
-	cipherSuits, err := TLSCipherSuites(p.ServerOptions.TLSOptions.TLSCipherSuites)
+	cipherSuites, err := TLSCipherSuites(p.ServerOptions.TLSOptions.TLSCipherSuites)
 	if err != nil {
 		return err
 	}
-	p.ServerOptions.TLSOptions.CipherSuits = cipherSuits
+	p.ServerOptions.TLSOptions.CipherSuites = cipherSuites
 	return nil
 }
 

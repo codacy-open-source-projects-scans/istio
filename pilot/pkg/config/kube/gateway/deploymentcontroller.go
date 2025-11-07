@@ -18,26 +18,34 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/mergepatch"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gateway "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayx "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 	"sigs.k8s.io/yaml"
 
 	"istio.io/api/annotation"
 	"istio.io/api/label"
 	meshapi "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
@@ -47,9 +55,12 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/inject"
 	"istio.io/istio/pkg/kube/kclient"
+	"istio.io/istio/pkg/kube/kubetypes"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/revisions"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test/util/tmpl"
 	"istio.io/istio/pkg/test/util/yml"
 	"istio.io/istio/pkg/util/sets"
@@ -79,22 +90,28 @@ import (
 //   - SSA using standard API types doesn't work well either: https://github.com/kubernetes-sigs/controller-runtime/issues/1669
 //   - This leaves YAML templates, converted to unstructured types and Applied with the dynamic client.
 type DeploymentController struct {
-	client         kube.Client
-	clusterID      cluster.ID
-	env            *model.Environment
-	queue          controllers.Queue
-	patcher        patcher
-	gateways       kclient.Client[*gateway.Gateway]
-	gatewayClasses kclient.Client[*gateway.GatewayClass]
+	client              kube.Client
+	clusterID           cluster.ID
+	env                 *model.Environment
+	queue               controllers.Queue
+	patcher             patcher
+	gateways            kclient.Client[*gateway.Gateway]
+	gatewayClasses      kclient.Client[*gateway.GatewayClass]
+	listenerSets        kclient.Informer[*gatewayx.XListenerSet]
+	listenerSetByParent kclient.Index[types.NamespacedName, *gatewayx.XListenerSet]
 
 	clients         map[schema.GroupVersionResource]getter
 	injectConfig    func() inject.WebhookConfig
 	deployments     kclient.Client[*appsv1.Deployment]
 	services        kclient.Client[*corev1.Service]
+	hpas            kclient.Client[*autoscalingv2.HorizontalPodAutoscaler]
+	pdbs            kclient.Client[*policyv1.PodDisruptionBudget]
+	configMaps      kclient.Client[*corev1.ConfigMap]
 	serviceAccounts kclient.Client[*corev1.ServiceAccount]
 	namespaces      kclient.Client[*corev1.Namespace]
 	tagWatcher      revisions.TagWatcher
 	revision        string
+	systemNamespace string
 }
 
 // Patcher is a function that abstracts patching logic. This is largely because client-go fakes do not handle patching
@@ -104,6 +121,8 @@ type patcher func(gvr schema.GroupVersionResource, name string, namespace string
 type classInfo struct {
 	// controller name for this class
 	controller string
+	// controller label for this class
+	controllerLabel string
 	// description for this class
 	description string
 	// The key in the templates to use for this class
@@ -114,6 +133,9 @@ type classInfo struct {
 
 	// disableRouteGeneration, if set, will make it so the controller ignores this class.
 	disableRouteGeneration bool
+
+	// supportsListenerSet declares whether a given class supports ListenerSet
+	supportsListenerSet bool
 
 	// disableNameSuffix, if set, will avoid appending -<class> to names
 	disableNameSuffix bool
@@ -138,17 +160,25 @@ func getBuiltinClasses() map[gateway.ObjectName]gateway.GatewayController {
 	if features.EnableAmbientWaypoints {
 		res[constants.WaypointGatewayClassName] = constants.ManagedGatewayMeshController
 	}
+
+	// N.B Ambient e/w gateways are just fancy waypoints, but we want a different
+	// GatewayClass for better UX
+	if features.EnableAmbientMultiNetwork {
+		res[constants.EastWestGatewayClassName] = constants.ManagedGatewayEastWestController
+	}
 	return res
 }
 
 func getClassInfos() map[gateway.GatewayController]classInfo {
 	m := map[gateway.GatewayController]classInfo{
 		gateway.GatewayController(features.ManagedGatewayController): {
-			controller:         features.ManagedGatewayController,
-			description:        "The default Istio GatewayClass",
-			templates:          "kube-gateway",
-			defaultServiceType: corev1.ServiceTypeLoadBalancer,
-			addressType:        gateway.HostnameAddressType,
+			controller:          features.ManagedGatewayController,
+			description:         "The default Istio GatewayClass",
+			templates:           "kube-gateway",
+			defaultServiceType:  corev1.ServiceTypeLoadBalancer,
+			addressType:         gateway.HostnameAddressType,
+			controllerLabel:     constants.ManagedGatewayControllerLabel,
+			supportsListenerSet: true,
 		},
 	}
 
@@ -160,18 +190,33 @@ func getClassInfos() map[gateway.GatewayController]classInfo {
 			description:            "Remote to this cluster. Does not deploy or affect configuration.",
 			disableRouteGeneration: true,
 			addressType:            gateway.HostnameAddressType,
+			supportsListenerSet:    false,
 		}
 	}
 	if features.EnableAmbientWaypoints {
 		m[constants.ManagedGatewayMeshController] = classInfo{
-			controller:         constants.ManagedGatewayMeshController,
-			description:        "The default Istio waypoint GatewayClass",
-			templates:          "waypoint",
-			disableNameSuffix:  true,
-			defaultServiceType: corev1.ServiceTypeClusterIP,
+			controller:          constants.ManagedGatewayMeshController,
+			description:         "The default Istio waypoint GatewayClass",
+			templates:           "waypoint",
+			disableNameSuffix:   true,
+			defaultServiceType:  corev1.ServiceTypeClusterIP,
+			supportsListenerSet: false,
 			// Report both. Consumers of the gateways can choose which they want.
 			// In particular, Istio across different versions consumes different address types, so this retains compat
-			addressType: "",
+			addressType:     "",
+			controllerLabel: constants.ManagedGatewayMeshControllerLabel,
+		}
+	}
+
+	if features.EnableAmbientMultiNetwork {
+		m[constants.ManagedGatewayEastWestController] = classInfo{
+			controller:         constants.ManagedGatewayEastWestController,
+			description:        "The default GatewayClass for Istio East West Gateways",
+			templates:          "waypoint",
+			disableNameSuffix:  true,
+			defaultServiceType: corev1.ServiceTypeLoadBalancer,
+			addressType:        "",
+			controllerLabel:    constants.ManagedGatewayEastWestControllerLabel,
 		}
 	}
 	return m
@@ -179,8 +224,15 @@ func getClassInfos() map[gateway.GatewayController]classInfo {
 
 // NewDeploymentController constructs a DeploymentController and registers required informers.
 // The controller will not start until Run() is called.
-func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *model.Environment,
-	webhookConfig func() inject.WebhookConfig, injectionHandler func(fn func()), tw revisions.TagWatcher, revision string,
+func NewDeploymentController(
+	client kube.Client,
+	clusterID cluster.ID,
+	env *model.Environment,
+	webhookConfig func() inject.WebhookConfig,
+	injectionHandler func(fn func()),
+	tw revisions.TagWatcher,
+	revision string,
+	systemNamespace string,
 ) *DeploymentController {
 	filter := kclient.Filter{ObjectFilter: client.ObjectFilter()}
 	gateways := kclient.NewFiltered[*gateway.Gateway](client, filter)
@@ -199,15 +251,33 @@ func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *mode
 			}, subresources...)
 			return err
 		},
-		gateways:       gateways,
-		gatewayClasses: gatewayClasses,
-		injectConfig:   webhookConfig,
-		tagWatcher:     tw,
-		revision:       revision,
+		gateways:        gateways,
+		gatewayClasses:  gatewayClasses,
+		injectConfig:    webhookConfig,
+		tagWatcher:      tw,
+		revision:        revision,
+		systemNamespace: systemNamespace,
 	}
+	gatewaysByParamsRef := kclient.CreateIndex(gateways, "parametersRef", func(o *gateway.Gateway) []types.NamespacedName {
+		p, err := fetchParameters(o)
+		if p == nil || err != nil {
+			return nil
+		}
+		return []types.NamespacedName{*p}
+	})
 	dc.queue = controllers.NewQueue("gateway deployment",
 		controllers.WithReconciler(dc.Reconcile),
 		controllers.WithMaxAttempts(5))
+
+	if features.EnableAlphaGatewayAPI {
+		dc.listenerSets = kclient.NewDelayedInformer[*gatewayx.XListenerSet](client, gvr.XListenerSet, kubetypes.StandardInformer, filter)
+		dc.listenerSetByParent = kclient.CreateIndex(dc.listenerSets, "parent", func(o *gatewayx.XListenerSet) []types.NamespacedName {
+			return []types.NamespacedName{extractListenerSetParent(o)}
+		})
+		dc.listenerSets.AddEventHandler(controllers.TypedObjectHandler(func(o *gatewayx.XListenerSet) {
+			dc.queue.Add(extractListenerSetParent(o))
+		}))
+	}
 
 	// Set up a handler that will add the parent Gateway object onto the queue.
 	// The queue will only handle Gateway objects; if child resources (Service, etc) are updated we re-add
@@ -218,6 +288,24 @@ func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *mode
 	dc.services.AddEventHandler(parentHandler)
 	dc.clients[gvr.Service] = NewUntypedWrapper(dc.services)
 
+	dc.configMaps = kclient.NewFiltered[*corev1.ConfigMap](client, filter)
+	dc.configMaps.AddEventHandler(controllers.ObjectHandler(func(o controllers.Object) {
+		// This could be a configmap referenced by a Gateway paramsRef
+		impacted := gatewaysByParamsRef.Lookup(config.NamespacedName(o))
+		for _, gw := range impacted {
+			dc.queue.AddObject(gw)
+		}
+		// Or it could also be a global GatewayClass config
+		classDefaults, classDefaultsF := o.GetLabels()[gatewayClassDefaults]
+		if classDefaultsF && o.GetNamespace() == dc.systemNamespace {
+			for _, gw := range dc.gateways.List(metav1.NamespaceAll, klabels.Everything()) {
+				if string(gw.Spec.GatewayClassName) == classDefaults {
+					dc.queue.AddObject(gw)
+				}
+			}
+		}
+	}))
+
 	dc.deployments = kclient.NewFiltered[*appsv1.Deployment](client, filter)
 	dc.deployments.AddEventHandler(parentHandler)
 	dc.clients[gvr.Deployment] = NewUntypedWrapper(dc.deployments)
@@ -225,6 +313,14 @@ func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *mode
 	dc.serviceAccounts = kclient.NewFiltered[*corev1.ServiceAccount](client, filter)
 	dc.serviceAccounts.AddEventHandler(parentHandler)
 	dc.clients[gvr.ServiceAccount] = NewUntypedWrapper(dc.serviceAccounts)
+
+	dc.hpas = kclient.NewFiltered[*autoscalingv2.HorizontalPodAutoscaler](client, filter)
+	dc.hpas.AddEventHandler(parentHandler)
+	dc.clients[gvr.HorizontalPodAutoscaler] = NewUntypedWrapper(dc.hpas)
+
+	dc.pdbs = kclient.NewFiltered[*policyv1.PodDisruptionBudget](client, filter)
+	dc.pdbs.AddEventHandler(parentHandler)
+	dc.clients[gvr.PodDisruptionBudget] = NewUntypedWrapper(dc.pdbs)
 
 	dc.namespaces = kclient.NewFiltered[*corev1.Namespace](client, filter)
 	dc.namespaces.AddEventHandler(controllers.ObjectHandler(func(o controllers.Object) {
@@ -235,7 +331,43 @@ func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *mode
 		}
 	}))
 
-	gateways.AddEventHandler(controllers.ObjectHandler(dc.queue.AddObject))
+	dc.env.Watcher.AddMeshHandler(func() {
+		// if there is a change to the meshconfig we need to reprocess all gateways
+		// to reconcile things like the deployment image
+		for _, gw := range dc.gateways.List(corev1.NamespaceAll, klabels.Everything()) {
+			dc.queue.AddObject(gw)
+		}
+	})
+
+	// we check if the generation has changed on a gateway, or if the annotations or labels have been updated
+	// reconciliation is expensive, so status updates for attachedRoutes can be skipped.
+
+	gateways.AddEventHandler(
+		controllers.FromEventHandler(func(o controllers.Event) {
+			switch o.Event {
+			case controllers.EventAdd:
+				dc.queue.AddObject(o.New)
+			case controllers.EventUpdate:
+				if o.New.GetGeneration() != o.Old.GetGeneration() {
+					dc.queue.AddObject(o.New)
+					break
+				}
+				if !maps.Equal(o.New.GetLabels(), o.Old.GetLabels()) {
+					dc.queue.AddObject(o.New)
+					break
+				}
+				if !maps.Equal(o.New.GetAnnotations(), o.Old.GetAnnotations()) {
+					dc.queue.AddObject(o.New)
+					break
+				}
+				log.Debugf("skip unchanged gateway %s", o.New.GetName())
+			case controllers.EventDelete:
+				dc.queue.AddObject(o.Old)
+			default:
+				log.Errorf("unhandled event for gateway object %v", o)
+			}
+		}))
+
 	gatewayClasses.AddEventHandler(controllers.ObjectHandler(func(o controllers.Object) {
 		for _, g := range dc.gateways.List(metav1.NamespaceAll, klabels.Everything()) {
 			if string(g.Spec.GatewayClassName) == o.GetName() {
@@ -256,6 +388,15 @@ func NewDeploymentController(client kube.Client, clusterID cluster.ID, env *mode
 	return dc
 }
 
+func extractListenerSetParent(o *gatewayx.XListenerSet) types.NamespacedName {
+	n := o.Spec.ParentRef.Name
+	ns := ptr.OrDefault(o.Spec.ParentRef.Namespace, gatewayx.Namespace(o.Namespace))
+	return types.NamespacedName{
+		Namespace: string(ns),
+		Name:      string(n),
+	}
+}
+
 func (d *DeploymentController) Run(stop <-chan struct{}) {
 	kube.WaitForCacheSync(
 		"deployment controller",
@@ -263,13 +404,27 @@ func (d *DeploymentController) Run(stop <-chan struct{}) {
 		d.namespaces.HasSynced,
 		d.deployments.HasSynced,
 		d.services.HasSynced,
+		d.configMaps.HasSynced,
 		d.serviceAccounts.HasSynced,
+		d.hpas.HasSynced,
+		d.pdbs.HasSynced,
 		d.gateways.HasSynced,
 		d.gatewayClasses.HasSynced,
 		d.tagWatcher.HasSynced,
+		d.env.Watcher.AsCollection().HasSynced,
 	)
 	d.queue.Run(stop)
-	controllers.ShutdownAll(d.namespaces, d.deployments, d.services, d.serviceAccounts, d.gateways, d.gatewayClasses)
+	controllers.ShutdownAll(
+		d.namespaces,
+		d.deployments,
+		d.services,
+		d.configMaps,
+		d.serviceAccounts,
+		d.hpas,
+		d.pdbs,
+		d.gateways,
+		d.gatewayClasses,
+	)
 }
 
 // Reconcile takes in the name of a Gateway and ensures the cluster is in the desired state
@@ -298,19 +453,10 @@ func (d *DeploymentController) Reconcile(req types.NamespacedName) error {
 		log.Debugf("skipping unknown controller %q", controller)
 		return nil
 	}
+	log.Infof("reconciling gateway with controller %s", ci.controller)
 
 	// find the tag or revision indicated by the object
-	selectedTag, ok := gw.Labels[label.IoIstioRev.Name]
-	if !ok {
-		ns := d.namespaces.Get(gw.Namespace, "")
-		if ns == nil {
-			log.Debugf("gateway is not for this revision, skipping")
-			return nil
-		}
-		selectedTag = ns.Labels[label.IoIstioRev.Name]
-	}
-	myTags := d.tagWatcher.GetMyTags()
-	if !myTags.Contains(selectedTag) && !(selectedTag == "" && myTags.Contains("default")) {
+	if !d.tagWatcher.IsMine(gw.ObjectMeta) {
 		log.Debugf("gateway is not for this revision, skipping")
 		return nil
 	}
@@ -350,16 +496,40 @@ func (d *DeploymentController) configureIstioGateway(log *istiolog.Scope, gw gat
 	if o, f := gw.Annotations[annotation.NetworkingServiceType.Name]; f {
 		serviceType = corev1.ServiceType(o)
 	}
+	listenersFromListenerSets := []gateway.Listener{}
+	if d.listenerSets != nil {
+		sets := d.listenerSetByParent.Lookup(config.NamespacedName(&gw))
+		for _, set := range sets {
+			if !namespaceAcceptedByAllowListeners(set.Namespace, &gw, func(s string) *corev1.Namespace {
+				return d.namespaces.Get(s, "")
+			}) {
+				continue
+			}
+			for _, listener := range set.Spec.Listeners {
+				s := convertListenerSetToListener(listener)
+				listenersFromListenerSets = append(listenersFromListenerSets, s)
+			}
+		}
+	}
+
+	var nativeSidecarModeEnabled bool
+	if features.EnableNativeSidecars == features.NativeSidecarModeDisabled {
+		nativeSidecarModeEnabled = false
+	} else {
+		nativeSidecarModeEnabled = true
+	}
 
 	input := TemplateInput{
 		Gateway:        &gw,
+		GatewayClass:   string(gw.Spec.GatewayClassName),
 		DeploymentName: model.GetOrDefault(gw.Annotations[annotation.GatewayNameOverride.Name], defaultName),
 		ServiceAccount: model.GetOrDefault(gw.Annotations[annotation.GatewayServiceAccount.Name], defaultName),
-		Ports:          extractServicePorts(gw),
+		Ports:          extractServicePorts(gw, listenersFromListenerSets),
 		ClusterID:      d.clusterID.String(),
 
 		KubeVersion:               kube.GetVersionAsInt(d.client),
 		Revision:                  d.revision,
+		NativeSidecars:            nativeSidecarModeEnabled,
 		ServiceType:               serviceType,
 		ProxyUID:                  proxyUID,
 		ProxyGID:                  proxyGID,
@@ -367,7 +537,10 @@ func (d *DeploymentController) configureIstioGateway(log *istiolog.Scope, gw gat
 		InfrastructureLabels:      gw.GetLabels(),
 		InfrastructureAnnotations: gw.GetAnnotations(),
 		GatewayNameLabel:          label.IoK8sNetworkingGatewayGatewayName.Name,
+		IsEastWestGateway:         features.EnableAmbientMultiNetwork && gi.controller == constants.ManagedGatewayEastWestController,
+		ControllerLabel:           gi.controllerLabel,
 	}
+
 	// Default to the gateway labels/annotations and overwrite if infrastructure labels/annotations are set
 	input.InfrastructureLabels = extractInfrastructureLabels(gw)
 	input.InfrastructureAnnotations = extractInfrastructureAnnotations(gw)
@@ -384,7 +557,9 @@ func (d *DeploymentController) configureIstioGateway(log *istiolog.Scope, gw gat
 
 	rendered, err := d.render(gi.templates, input)
 	if err != nil {
-		return fmt.Errorf("failed to render template: %v", err)
+		// Just log error, we do not need to retry since rendering errors are not ephemeral errors
+		log.Errorf("error rendering templates: %v", err)
+		return nil
 	}
 	for _, t := range rendered {
 		if err := d.apply(gi.controller, t); err != nil {
@@ -397,8 +572,8 @@ func (d *DeploymentController) configureIstioGateway(log *istiolog.Scope, gw gat
 }
 
 func (d *DeploymentController) setLabelOverrides(gw gateway.Gateway, input TemplateInput) {
-	// TODO: Codify this API (i.e how to know if a specific gateway is an Istio waypoint gateway)
 	isWaypointGateway := strings.Contains(string(gw.Spec.GatewayClassName), "waypoint")
+	isEastWestGateway := strings.Contains(string(gw.Spec.GatewayClassName), "east-west")
 
 	var hasAmbientLabel bool
 	if _, ok := gw.Labels[label.IoIstioDataplaneMode.Name]; ok {
@@ -409,13 +584,13 @@ func (d *DeploymentController) setLabelOverrides(gw gateway.Gateway, input Templ
 	}
 	// If no ambient redirection label is set explicitly, explicitly disable.
 	// TODO this sprays ambient annotations/labels all over EVER gateway resource (serviceaccts, services, etc)
-	if features.EnableAmbientWaypoints && !isWaypointGateway && !hasAmbientLabel {
+	if features.EnableAmbientWaypoints && !isWaypointGateway && !isEastWestGateway && !hasAmbientLabel {
 		input.InfrastructureLabels[label.IoIstioDataplaneMode.Name] = constants.DataplaneModeNone
 	}
 
 	// Default the network label for waypoints if not explicitly set in gateway's labels
 	network := d.injectConfig().Values.Struct().GetGlobal().GetNetwork()
-	if _, ok := gw.GetLabels()[label.TopologyNetwork.Name]; !ok && network != "" && isWaypointGateway {
+	if _, ok := gw.GetLabels()[label.TopologyNetwork.Name]; !ok && network != "" && (isWaypointGateway || isEastWestGateway) {
 		input.InfrastructureLabels[label.TopologyNetwork.Name] = d.injectConfig().Values.Struct().GetGlobal().GetNetwork()
 	}
 }
@@ -445,6 +620,9 @@ func extractInfrastructureMetadata(gwInfra *gatewayv1.GatewayInfrastructure, isL
 	}
 	if gwInfra != nil && !isLabel && gwInfra.Annotations != nil {
 		return translateInfraMeta(gwInfra.Annotations)
+	}
+	if !features.EnableGatewayAPICopyLabelsAnnotations {
+		return make(map[string]string)
 	}
 	if isLabel {
 		if gw.GetLabels() == nil {
@@ -524,6 +702,27 @@ func (d *DeploymentController) render(templateName string, mi TemplateInput) ([]
 		return nil, fmt.Errorf("no %q template defined", templateName)
 	}
 
+	var templateOverlays []map[string]string
+
+	classConfigs := d.configMaps.List(d.systemNamespace, klabels.SelectorFromValidatedSet(map[string]string{
+		gatewayClassDefaults: string(mi.Spec.GatewayClassName),
+	}))
+	if len(classConfigs) > 0 {
+		classConfig := controllers.OldestObject(classConfigs)
+		templateOverlays = append(templateOverlays, classConfig.Data)
+	}
+	params, err := fetchParameters(mi.Gateway)
+	if err != nil {
+		return nil, fmt.Errorf("invalid parameters: %v", err)
+	}
+	if params != nil {
+		cm := d.configMaps.Get(params.Name, params.Namespace)
+		if cm == nil {
+			return nil, fmt.Errorf("parametersRef targeting configmap %q, but configmap does not exist", params)
+		}
+		templateOverlays = append(templateOverlays, cm.Data)
+	}
+
 	labelToMatch := map[string]string{label.IoK8sNetworkingGatewayGatewayName.Name: mi.Name}
 	proxyConfig := d.env.GetProxyConfigOrDefault(mi.Namespace, labelToMatch, nil, cfg.MeshConfig)
 	input := derivedInput{
@@ -542,7 +741,129 @@ func (d *DeploymentController) render(templateName string, mi TemplateInput) ([]
 		return nil, err
 	}
 
-	return yml.SplitString(results), nil
+	rawOutput := yml.SplitString(results)
+	transformedOutput := make([]string, 0, len(rawOutput))
+	for _, output := range rawOutput {
+		to, err := applyOverlay(output, templateOverlays)
+		if err != nil {
+			return nil, err
+		}
+		if to != "" {
+			transformedOutput = append(transformedOutput, to)
+		}
+	}
+	return transformedOutput, nil
+}
+
+var supportedOverlays = sets.New(
+	"deployment",
+	"service",
+	"serviceAccount",
+	"horizontalPodAutoscaler",
+	"podDisruptionBudget",
+)
+
+var requiredOverlays = sets.New(
+	"horizontalPodAutoscaler",
+	"podDisruptionBudget",
+)
+
+func applyOverlay(object string, overlaysList []map[string]string) (string, error) {
+	var ik crd.IstioKind
+	if err := yaml.Unmarshal([]byte(object), &ik); err != nil {
+		return "", fmt.Errorf("failed to find kind: %v", err)
+	}
+	gv, err := schema.ParseGroupVersion(ik.TypeMeta.APIVersion)
+	if err != nil {
+		return "", fmt.Errorf("failed to find kind: %v", err)
+	}
+	kind := &schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: ik.TypeMeta.Kind}
+
+	var data any
+	var key string
+	switch kind.Kind {
+	case gvk.Deployment.Kind:
+		data = &appsv1.Deployment{}
+		key = "deployment"
+	case gvk.Service.Kind:
+		data = &corev1.Service{}
+		key = "service"
+	case gvk.ServiceAccount.Kind:
+		data = &corev1.ServiceAccount{}
+		key = "serviceAccount"
+	case gvk.HorizontalPodAutoscaler.Kind:
+		data = &autoscalingv2.HorizontalPodAutoscaler{}
+		key = "horizontalPodAutoscaler"
+	case gvk.PodDisruptionBudget.Kind:
+		data = &policyv1.PodDisruptionBudget{}
+		key = "podDisruptionBudget"
+	default:
+		return "", fmt.Errorf("unknown overlay kind %q", kind.Kind)
+	}
+	applied := false
+	for _, overlays := range overlaysList {
+		for k := range overlays {
+			if !supportedOverlays.Contains(k) {
+				return "", fmt.Errorf("unsupported overlay %q (supported: %v)", k, sets.SortedList(supportedOverlays))
+			}
+		}
+		overlay, f := overlays[key]
+		if !f {
+			continue
+		}
+		b, err := strategicMergePatchYAML([]byte(object), []byte(overlay), data)
+		if err != nil {
+			return "", fmt.Errorf("strategic merge patch failed: %v", err)
+		}
+		applied = true
+		object = string(b)
+	}
+	if !applied && requiredOverlays.Contains(key) {
+		return "", nil
+	}
+
+	var finalIK crd.IstioKind
+	if err := yaml.Unmarshal([]byte(object), &finalIK); err != nil {
+		return "", fmt.Errorf("failed to find final kind: %v", err)
+	}
+
+	a, b := ik.ObjectMeta, finalIK.ObjectMeta
+	if !(a.Name == b.Name &&
+		a.GenerateName == b.GenerateName &&
+		a.Namespace == b.Namespace &&
+		a.UID == b.UID &&
+		a.ResourceVersion == b.ResourceVersion &&
+		a.Generation == b.Generation &&
+		a.CreationTimestamp == b.CreationTimestamp &&
+		a.DeletionTimestamp == b.DeletionTimestamp &&
+		a.DeletionGracePeriodSeconds == b.DeletionGracePeriodSeconds &&
+		reflect.DeepEqual(a.OwnerReferences, b.OwnerReferences) &&
+		slices.Equal(a.Finalizers, b.Finalizers)) {
+		return "", fmt.Errorf("illegal metadata change")
+	}
+	// We could deep equal here but its a bit more tedious, so just never allow setting it
+	if len(a.ManagedFields) != 0 || len(b.ManagedFields) != 0 {
+		return "", fmt.Errorf("illegal metadata change")
+	}
+
+	return object, nil
+}
+
+// fetchParameters returns the infrastructure parameters for the Gateway. This is currently always a local configmap so we return the name only.
+// An error is returned if the parameter is invalid. This does not check the configmap exists, though.
+// If no parameter is specified, no name or error is returned.
+func fetchParameters(gw *gateway.Gateway) (*types.NamespacedName, error) {
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		pr := gw.Spec.Infrastructure.ParametersRef
+		if string(pr.Kind) == gvk.ConfigMap.Kind && string(pr.Group) == gvk.ConfigMap.Group {
+			return &types.NamespacedName{
+				Namespace: gw.Namespace,
+				Name:      pr.Name,
+			}, nil
+		}
+		return nil, fmt.Errorf("unknown infrastructure parameters type %v/%v", pr.Group, pr.Kind)
+	}
+	return nil, nil
 }
 
 func (d *DeploymentController) setGatewayControllerVersion(gws gateway.Gateway) error {
@@ -634,6 +955,7 @@ func (d *DeploymentController) canManage(gvr schema.GroupVersionResource, name, 
 
 type TemplateInput struct {
 	*gateway.Gateway
+	GatewayClass              string
 	DeploymentName            string
 	ServiceAccount            string
 	Ports                     []corev1.ServicePort
@@ -641,28 +963,32 @@ type TemplateInput struct {
 	ClusterID                 string
 	KubeVersion               int
 	Revision                  string
+	NativeSidecars            bool
 	ProxyUID                  int64
 	ProxyGID                  int64
 	CompliancePolicy          string
 	InfrastructureLabels      map[string]string
 	InfrastructureAnnotations map[string]string
 	GatewayNameLabel          string
+	IsEastWestGateway         bool
+	ControllerLabel           string
 }
 
-func extractServicePorts(gw gateway.Gateway) []corev1.ServicePort {
+func extractServicePorts(gw gateway.Gateway, listenerSets []gateway.Listener) []corev1.ServicePort {
 	tcp := strings.ToLower(string(protocol.TCP))
-	svcPorts := make([]corev1.ServicePort, 0, len(gw.Spec.Listeners)+1)
+	svcPorts := make([]corev1.ServicePort, 0, len(listenerSets)+len(gw.Spec.Listeners)+1)
 	svcPorts = append(svcPorts, corev1.ServicePort{
 		Name:        "status-port",
 		Port:        int32(15021),
 		AppProtocol: &tcp,
 	})
 	portNums := sets.New[int32]()
-	for i, l := range gw.Spec.Listeners {
-		if portNums.Contains(int32(l.Port)) {
+	allListeners := append(slices.Clone(gw.Spec.Listeners), listenerSets...)
+	for i, l := range allListeners {
+		if portNums.Contains(l.Port) {
 			continue
 		}
-		portNums.Insert(int32(l.Port))
+		portNums.Insert(l.Port)
 		name := sanitizeListenerNameForPort(string(l.Name))
 		if name == "" {
 			// Should not happen since name is required, but in case an invalid resource gets in...
@@ -671,7 +997,7 @@ func extractServicePorts(gw gateway.Gateway) []corev1.ServicePort {
 		appProtocol := strings.ToLower(string(l.Protocol))
 		svcPorts = append(svcPorts, corev1.ServicePort{
 			Name:        name,
-			Port:        int32(l.Port),
+			Port:        l.Port,
 			AppProtocol: &appProtocol,
 		})
 	}
@@ -711,3 +1037,41 @@ func (u UntypedWrapper[T]) Get(name, namespace string) controllers.Object {
 }
 
 var _ getter = UntypedWrapper[*corev1.Service]{}
+
+// strategicMergePatchYAML is a small fork of strategicpatch.StrategicMergePatch to allow YAML patches
+// This avoids expensive conversion from YAML to JSON
+func strategicMergePatchYAML(originalYAML []byte, patchYAML []byte, dataStruct any) ([]byte, error) {
+	schema, err := strategicpatch.NewPatchMetaFromStruct(dataStruct)
+	if err != nil {
+		return nil, err
+	}
+
+	originalMap, err := patchHandleUnmarshal(originalYAML)
+	if err != nil {
+		return nil, err
+	}
+	patchMap, err := patchHandleUnmarshal(patchYAML)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := strategicpatch.StrategicMergeMapPatchUsingLookupPatchMeta(originalMap, patchMap, schema)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(result)
+}
+
+func patchHandleUnmarshal(j []byte) (map[string]any, error) {
+	if j == nil {
+		j = []byte("{}")
+	}
+
+	m := map[string]any{}
+	err := yaml.Unmarshal(j, &m)
+	if err != nil {
+		return nil, mergepatch.ErrBadJSONDoc
+	}
+	return m, nil
+}

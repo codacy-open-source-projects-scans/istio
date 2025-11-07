@@ -144,10 +144,6 @@ local variables = import './variables.libsonnet';
           'Internal Errors',
           'pilot_total_xds_internal_errors'
         ),
-        self.query(
-          'Push Context Errors',
-          'pilot_xds_push_context_errors'
-        ),
       ],
 
       xdsConnections: [
@@ -165,7 +161,7 @@ local variables = import './variables.libsonnet';
         self.query(
           '{{le}}',
           |||
-            sum(rate(pilot_xds_push_time_bucket{}[1m])) by (le)
+            sum(rate(pilot_xds_push_time_bucket{}[$__rate_interval])) by (le)
           |||
         ) + q.withFormat('heatmap'),
 
@@ -173,7 +169,7 @@ local variables = import './variables.libsonnet';
         self.query(
           '{{le}}',
           |||
-            sum(rate(pilot_xds_config_size_bytes_bucket{}[1m])) by (le)
+            sum(rate(pilot_xds_config_size_bytes_bucket{}[$__rate_interval])) by (le)
           |||
         ) + q.withFormat('heatmap'),
 

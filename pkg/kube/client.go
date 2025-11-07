@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/httpstream"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeVersion "k8s.io/apimachinery/pkg/version"
@@ -63,9 +64,14 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
+	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayapiinferenceclient "sigs.k8s.io/gateway-api-inference-extension/client-go/clientset/versioned"
+	gatewayapiinferencefake "sigs.k8s.io/gateway-api-inference-extension/client-go/clientset/versioned/fake"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayapialpha3 "sigs.k8s.io/gateway-api/apis/v1alpha3"
 	gatewayapibeta "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayx "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 	gatewayapiclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayapifake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 
@@ -125,6 +131,9 @@ type Client interface {
 	// GatewayAPI returns the gateway-api kube client.
 	GatewayAPI() gatewayapiclient.Interface
 
+	// GatewayAPIInference returns the gateway-api kube client.
+	GatewayAPIInference() gatewayapiinferenceclient.Interface
+
 	// Informers returns an informer factory
 	Informers() informerfactory.InformerFactory
 
@@ -161,9 +170,6 @@ type CLIClient interface {
 	// Revision of the Istio control plane.
 	Revision() string
 
-	// EnvoyDo makes a http request to the Envoy in the specified pod.
-	EnvoyDo(ctx context.Context, podName, podNamespace, method, path string) ([]byte, error)
-
 	// EnvoyDoWithPort makes a http request to the Envoy in the specified pod and port.
 	EnvoyDoWithPort(ctx context.Context, podName, podNamespace, method, path string, port int) ([]byte, error)
 
@@ -193,6 +199,9 @@ type CLIClient interface {
 
 	// PodLogsFollow retrieves the logs for the given pod, following until the pod log stream is interrupted
 	PodLogsFollow(ctx context.Context, podName string, podNamespace string, container string) (string, error)
+
+	// ServicesForSelector finds services matching selector.
+	ServicesForSelector(ctx context.Context, namespace string, labelSelectors ...string) (*v1.ServiceList, error)
 
 	// NewPortForwarder creates a new PortForwarder configured for the given pod. If localPort=0, a port will be
 	// dynamically selected. If localAddress is empty, "localhost" is used.
@@ -239,11 +248,22 @@ func setupFakeClient[T fakeClient](fc T, group string, objects []runtime.Object)
 	tracker := fc.Tracker()
 	// We got a set of objects... but which client do they apply to? Filter based on the group
 	filterGroup := func(object runtime.Object) bool {
-		g := object.GetObjectKind().GroupVersionKind().Group
+		gk := object.GetObjectKind().GroupVersionKind()
+		g := gk.Group
+		if gk.Kind == "" {
+			gvks, _, _ := IstioScheme.ObjectKinds(object)
+			g = config.FromKubernetesGVK(gvks[0]).Group
+		}
 		if strings.Contains(g, "istio.io") {
 			return group == "istio"
 		}
+		if strings.Contains(g, inferencev1.GroupVersion.Group) {
+			return group == "inference"
+		}
 		if strings.Contains(g, "gateway.networking.k8s.io") {
+			return group == "gateway"
+		}
+		if strings.Contains(g, "gateway.networking.x-k8s.io") {
 			return group == "gateway"
 		}
 		return group == "kube"
@@ -293,6 +313,7 @@ func NewFakeClient(objects ...runtime.Object) CLIClient {
 	c.dynamic = dynamicfake.NewSimpleDynamicClient(s)
 	c.istio = setupFakeClient(istiofake.NewSimpleClientset(), "istio", objects)
 	c.gatewayapi = setupFakeClient(gatewayapifake.NewSimpleClientset(), "gateway", objects)
+	c.gatewayapiinference = setupFakeClient(gatewayapiinferencefake.NewSimpleClientset(), "inference", objects)
 	c.extSet = extfake.NewClientset()
 
 	// https://github.com/kubernetes/kubernetes/issues/95372
@@ -324,19 +345,20 @@ func NewFakeClient(objects ...runtime.Object) CLIClient {
 		ret = action.(clienttesting.CreateAction).GetObject()
 		meta, ok := ret.(metav1.Object)
 		if !ok {
-			return
+			return handled, ret, err
 		}
 
 		if meta.GetName() == "" && meta.GetGenerateName() != "" {
 			meta.SetName(names.SimpleNameGenerator.GenerateName(meta.GetGenerateName()))
 		}
 
-		return
+		return handled, ret, err
 	}
 	for _, fc := range []fakeClient{
 		c.kube.(*fake.Clientset),
 		c.istio.(*istiofake.Clientset),
 		c.gatewayapi.(*gatewayapifake.Clientset),
+		c.gatewayapiinference.(*gatewayapiinferencefake.Clientset),
 		c.dynamic.(*dynamicfake.FakeDynamicClient),
 		c.metadata.(*metadatafake.FakeMetadataClient),
 	} {
@@ -376,12 +398,13 @@ type client struct {
 
 	informerFactory informerfactory.InformerFactory
 
-	extSet     kubeExtClient.Interface
-	kube       kubernetes.Interface
-	dynamic    dynamic.Interface
-	metadata   metadata.Interface
-	istio      istioclient.Interface
-	gatewayapi gatewayapiclient.Interface
+	extSet              kubeExtClient.Interface
+	kube                kubernetes.Interface
+	dynamic             dynamic.Interface
+	metadata            metadata.Interface
+	istio               istioclient.Interface
+	gatewayapi          gatewayapiclient.Interface
+	gatewayapiinference gatewayapiinferenceclient.Interface
 
 	started atomic.Bool
 	// If enabled, will wait for cache syncs with extremely short delay. This should be used only for tests
@@ -460,19 +483,31 @@ func newClientInternal(clientFactory *clientFactory, opts ...ClientOption) (*cli
 		return nil, err
 	}
 
+	c.gatewayapiinference, err = gatewayapiinferenceclient.NewForConfig(c.config)
+	if err != nil {
+		return nil, err
+	}
+
 	c.extSet, err = kubeExtClient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
 
-	c.http = &http.Client{
-		Timeout: time.Second * 15,
+	c.http = &http.Client{}
+	if c.config != nil && c.config.Timeout != 0 {
+		c.http.Timeout = c.config.Timeout
+	} else {
+		c.http.Timeout = time.Second * 15
 	}
+
 	var clientWithTimeout kubernetes.Interface
 	clientWithTimeout = c.kube
 	restConfig := c.RESTConfig()
 	if restConfig != nil {
-		restConfig.Timeout = time.Second * 5
+		if restConfig.Timeout == 0 {
+			restConfig.Timeout = time.Second * 5
+		}
+
 		kubeClient, err := kubernetes.NewForConfig(restConfig)
 		if err == nil {
 			clientWithTimeout = kubeClient
@@ -531,6 +566,20 @@ func WithRevision(revision string) ClientOption {
 	}
 }
 
+// WithTimeout sets the timeout for the client.
+func WithTimeout(timeout time.Duration) ClientOption {
+	return func(c CLIClient) CLIClient {
+		client := c.(*client)
+		if client.config == nil {
+			client.config = &rest.Config{}
+		}
+
+		client.config.Timeout = timeout
+
+		return client
+	}
+}
+
 // NewClient creates a Kubernetes client from the given rest config.
 func NewClient(clientConfig clientcmd.ClientConfig, cluster cluster.ID) (Client, error) {
 	return newClientInternal(newClientFactory(clientConfig, false), WithCluster(cluster))
@@ -566,6 +615,10 @@ func (c *client) Istio() istioclient.Interface {
 
 func (c *client) GatewayAPI() gatewayapiclient.Interface {
 	return c.gatewayapi
+}
+
+func (c *client) GatewayAPIInference() gatewayapiinferenceclient.Interface {
+	return c.gatewayapiinference
 }
 
 func (c *client) Informers() informerfactory.InformerFactory {
@@ -682,7 +735,7 @@ func WaitForCacheSync(name string, stop <-chan struct{}, cacheSyncs ...cache.Inf
 	attempt := 0
 	defer func() {
 		if r {
-			log.WithLabels("name", name, "attempt", attempt, "time", time.Since(t0)).Debugf("sync complete")
+			log.WithLabels("name", name, "attempt", attempt, "time", time.Since(t0)).Infof("sync complete")
 		} else {
 			log.WithLabels("name", name, "attempt", attempt, "time", time.Since(t0)).Errorf("sync failed")
 		}
@@ -767,6 +820,21 @@ func (c *client) PodExecCommands(podName, podNamespace, container string, comman
 		return "", "", err
 	}
 
+	// Fallback executor is default, unless feature flag is explicitly disabled.
+	if !remoteCommandWebsockets.IsDisabled() {
+		// WebSocketExecutor must be "GET" method as described in RFC 6455 Sec. 4.1 (page 17).
+		websocketExec, err := remotecommand.NewWebSocketExecutor(c.config, "GET", req.URL().String())
+		if err != nil {
+			return "", "", err
+		}
+		exec, err = remotecommand.NewFallbackExecutor(websocketExec, exec, func(err error) bool {
+			return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+		})
+		if err != nil {
+			return "", "", err
+		}
+	}
+
 	var stdoutBuf, stderrBuf bytes.Buffer
 	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdin:  nil,
@@ -777,7 +845,7 @@ func (c *client) PodExecCommands(podName, podNamespace, container string, comman
 
 	stdout = stdoutBuf.String()
 	stderr = stderrBuf.String()
-	return
+	return stdout, stderr, err
 }
 
 func (c *client) PodExec(podName, podNamespace, container string, command string) (stdout, stderr string, err error) {
@@ -852,10 +920,6 @@ func (c *client) AllDiscoveryDo(ctx context.Context, istiodNamespace, path strin
 		return result, nil
 	}
 	return nil, nil
-}
-
-func (c *client) EnvoyDo(ctx context.Context, podName, podNamespace, method, path string) ([]byte, error) {
-	return c.portForwardRequest(ctx, podName, podNamespace, method, path, 15000)
 }
 
 func (c *client) EnvoyDoWithPort(ctx context.Context, podName, podNamespace, method, path string, port int) ([]byte, error) {
@@ -1022,6 +1086,12 @@ func (c *client) NewPortForwarder(podName, ns, localAddress string, localPort in
 
 func (c *client) PodsForSelector(ctx context.Context, namespace string, labelSelectors ...string) (*v1.PodList, error) {
 	return c.kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: strings.Join(labelSelectors, ","),
+	})
+}
+
+func (c *client) ServicesForSelector(ctx context.Context, namespace string, labelSelectors ...string) (*v1.ServiceList, error) {
+	return c.kube.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: strings.Join(labelSelectors, ","),
 	})
 }
@@ -1304,8 +1374,11 @@ func istioScheme() *runtime.Scheme {
 	utilruntime.Must(clienttelemetryalpha.AddToScheme(scheme))
 	utilruntime.Must(clientextensions.AddToScheme(scheme))
 	utilruntime.Must(gatewayapi.Install(scheme))
+	utilruntime.Must(gatewayapialpha3.Install(scheme))
 	utilruntime.Must(gatewayapibeta.Install(scheme))
 	utilruntime.Must(gatewayapiv1.Install(scheme))
+	utilruntime.Must(gatewayx.Install(scheme))
+	utilruntime.Must(inferencev1.Install(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	return scheme
 }

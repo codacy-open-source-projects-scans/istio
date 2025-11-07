@@ -38,14 +38,15 @@ type clusterCache struct {
 	clusterName string
 
 	// proxy related cache fields
-	proxyVersion    string         // will be matched by envoyfilter patches
-	locality        *core.Locality // identifies the locality the cluster is generated for
-	proxyClusterID  string         // identifies the kubernetes cluster a proxy is in
-	proxySidecar    bool           // identifies if this proxy is a Sidecar
-	hbone           bool
-	proxyView       model.ProxyView
-	metadataCerts   *metadataCerts // metadata certificates of proxy
-	endpointBuilder *endpoints.EndpointBuilder
+	proxyVersion            string         // will be matched by envoyfilter patches
+	locality                *core.Locality // identifies the locality the cluster is generated for
+	preserveHTTP1HeaderCase bool           // indicates whether the original case of HTTP/1.x headers should be preserved
+	proxyClusterID          string         // identifies the kubernetes cluster a proxy is in
+	proxySidecar            bool           // identifies if this proxy is a Sidecar
+	hbone                   bool
+	proxyView               model.ProxyView
+	metadataCerts           *metadataCerts // metadata certificates of proxy
+	endpointBuilder         *endpoints.EndpointBuilder
 
 	// service attributes
 	http2          bool // http2 identifies if the cluster is for an http2 service
@@ -126,6 +127,9 @@ func (t *clusterCache) Key() any {
 	}
 	h.Write(Separator)
 
+	h.WriteString(strconv.FormatBool(t.preserveHTTP1HeaderCase))
+	h.Write(Separator)
+
 	if t.endpointBuilder != nil {
 		t.endpointBuilder.WriteHash(h)
 	}
@@ -188,22 +192,23 @@ func buildClusterKey(service *model.Service, port *model.Port, cb *ClusterBuilde
 		)
 	}
 	return clusterCache{
-		clusterName:     clusterName,
-		proxyVersion:    cb.proxyVersion.String(),
-		locality:        cb.locality,
-		proxyClusterID:  cb.clusterID,
-		proxySidecar:    cb.sidecarProxy(),
-		proxyView:       cb.proxyView,
-		hbone:           cb.sendHbone,
-		http2:           port.Protocol.IsHTTP2(),
-		downstreamAuto:  cb.sidecarProxy() && port.Protocol.IsUnsupported(),
-		supportsIPv4:    cb.supportsIPv4,
-		service:         service,
-		destinationRule: dr,
-		envoyFilterKeys: efKeys,
-		metadataCerts:   cb.metadataCerts,
-		peerAuthVersion: cb.req.Push.AuthnPolicies.GetVersion(),
-		serviceAccounts: cb.req.Push.ServiceAccounts(service.Hostname, service.Attributes.Namespace),
-		endpointBuilder: eb,
+		clusterName:             clusterName,
+		proxyVersion:            cb.proxyVersion.String(),
+		locality:                cb.locality,
+		preserveHTTP1HeaderCase: shouldPreserveHeaderCase(cb.proxyMetadata, cb.req.Push),
+		proxyClusterID:          cb.clusterID,
+		proxySidecar:            cb.sidecarProxy(),
+		proxyView:               cb.proxyView,
+		hbone:                   cb.sendHbone,
+		http2:                   port.Protocol.IsHTTP2(),
+		downstreamAuto:          cb.sidecarProxy() && port.Protocol.IsUnsupported(),
+		supportsIPv4:            cb.supportsIPv4,
+		service:                 service,
+		destinationRule:         dr,
+		envoyFilterKeys:         efKeys,
+		metadataCerts:           cb.metadataCerts,
+		peerAuthVersion:         cb.req.Push.AuthnPolicies.GetVersion(),
+		serviceAccounts:         cb.req.Push.ServiceAccounts(service.Hostname, service.Attributes.Namespace),
+		endpointBuilder:         eb,
 	}
 }

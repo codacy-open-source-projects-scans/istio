@@ -22,47 +22,48 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/workloadapi"
 )
 
-// name format: <cluster>/<group>/<kind>/<namespace>/<name></section-name>
-func (a *index) generatePodUID(p *v1.Pod) string {
-	return a.ClusterID.String() + "//" + "Pod/" + p.Namespace + "/" + p.Name
+func generatePodUID(clusterID cluster.ID, p *v1.Pod) string {
+	return clusterID.String() + "//" + "Pod/" + p.Namespace + "/" + p.Name
 }
 
-// name format: <cluster>/<group>/<kind>/<namespace>/<name></section-name>
-// if the WorkloadEntry is inlined in the ServiceEntry, we may need section name. caller should use generateServiceEntryUID
-func (a *index) generateWorkloadEntryUID(wkEntryNamespace, wkEntryName string) string {
-	return a.ClusterID.String() + "/networking.istio.io/WorkloadEntry/" + wkEntryNamespace + "/" + wkEntryName
+func generateWorkloadEntryUID(clusterID cluster.ID, wkEntryNamespace, wkEntryName string) string {
+	return clusterID.String() + "/networking.istio.io/WorkloadEntry/" + wkEntryNamespace + "/" + wkEntryName
 }
 
-// name format: <cluster>/<group>/<kind>/<namespace>/<name></section-name>
-// section name should be the WE address, which needs to be stable across SE updates (it is assumed WE addresses are unique)
-func (a *index) generateServiceEntryUID(svcEntryNamespace, svcEntryName, addr string) string {
-	return a.ClusterID.String() + "/networking.istio.io/ServiceEntry/" + svcEntryNamespace + "/" + svcEntryName + "/" + addr
+// UID for split-horizon EDS workload that represents all the remote workloads of a service in another network.
+// gw and service should be namespaced names
+// svc should be a namespaced hostname, such as ns/name.ns.svc.cluster.local
+// gw should be in the form outputted by `NetworkGateway.ResourceName`
+func generateSplitHorizonWorkloadUID(networkID, gw, service string) string {
+	return networkID + "/SplitHorizonWorkload/" + gw + "/" + service
 }
 
-func workloadToAddressInfo(w *workloadapi.Workload) model.AddressInfo {
-	return model.AddressInfo{
-		Address: &workloadapi.Address{
-			Type: &workloadapi.Address_Workload{
-				Workload: w,
-			},
+func generateServiceEntryUID(clusterID cluster.ID, svcEntryNamespace, svcEntryName, addr string) string {
+	return clusterID.String() + "/networking.istio.io/ServiceEntry/" + svcEntryNamespace + "/" + svcEntryName + "/" + addr
+}
+
+func workloadToAddress(w *workloadapi.Workload) *workloadapi.Address {
+	return &workloadapi.Address{
+		Type: &workloadapi.Address_Workload{
+			Workload: w,
 		},
 	}
 }
 
 func modelWorkloadToAddressInfo(w model.WorkloadInfo) model.AddressInfo {
-	return workloadToAddressInfo(w.Workload)
+	return w.AsAddress
 }
 
-func serviceToAddressInfo(s *workloadapi.Service) model.AddressInfo {
-	return model.AddressInfo{
-		Address: &workloadapi.Address{
-			Type: &workloadapi.Address_Service{
-				Service: s,
-			},
+func serviceToAddress(s *workloadapi.Service) *workloadapi.Address {
+	return &workloadapi.Address{
+		Type: &workloadapi.Address_Service{
+			Service: s,
 		},
 	}
 }
@@ -72,36 +73,31 @@ func mustByteIPToString(b []byte) string {
 	return ip.String()
 }
 
-func byteIPToAddr(b []byte) netip.Addr {
-	ip, _ := netip.AddrFromSlice(b) // Address only comes from objects we create, so it must be valid
-	return ip
-}
-
-func (a *index) toNetworkAddress(vip string) (*workloadapi.NetworkAddress, error) {
+func toNetworkAddress(ctx krt.HandlerContext, vip string, networkGetter func(krt.HandlerContext) network.ID) (*workloadapi.NetworkAddress, error) {
 	ip, err := netip.ParseAddr(vip)
 	if err != nil {
 		return nil, fmt.Errorf("parse %v: %v", vip, err)
 	}
 	return &workloadapi.NetworkAddress{
-		Network: a.Network(vip, make(labels.Instance, 0)).String(),
+		Network: networkGetter(ctx).String(),
 		Address: ip.AsSlice(),
 	}, nil
 }
 
-func (a *index) toNetworkAddressFromIP(ip netip.Addr) *workloadapi.NetworkAddress {
+func toNetworkAddressFromIP(ip netip.Addr, netw network.ID) *workloadapi.NetworkAddress {
 	return &workloadapi.NetworkAddress{
-		Network: a.Network(ip.String(), make(labels.Instance, 0)).String(),
+		Network: netw.String(),
 		Address: ip.AsSlice(),
 	}
 }
 
-func (a *index) toNetworkAddressFromCidr(vip string) (*workloadapi.NetworkAddress, error) {
+func toNetworkAddressFromCidr(vip string, nw network.ID) (*workloadapi.NetworkAddress, error) {
 	ip, err := parseCidrOrIP(vip)
 	if err != nil {
 		return nil, err
 	}
 	return &workloadapi.NetworkAddress{
-		Network: a.Network(vip, make(labels.Instance, 0)).String(),
+		Network: nw.String(),
 		Address: ip.AsSlice(),
 	}, nil
 }
@@ -182,17 +178,17 @@ func namespacedHostname(namespace, hostname string) string {
 }
 
 func networkAddressFromWorkload(wl model.WorkloadInfo) []networkAddress {
-	networkAddrs := make([]networkAddress, 0, len(wl.Addresses))
-	for _, addr := range wl.Addresses {
+	networkAddrs := make([]networkAddress, 0, len(wl.Workload.Addresses))
+	for _, addr := range wl.Workload.Addresses {
 		// mustByteIPToString is ok since this is from our IP constructed
-		networkAddrs = append(networkAddrs, networkAddress{network: wl.Network, ip: mustByteIPToString(addr)})
+		networkAddrs = append(networkAddrs, networkAddress{network: wl.Workload.Network, ip: mustByteIPToString(addr)})
 	}
 	return networkAddrs
 }
 
 func networkAddressFromService(s model.ServiceInfo) []networkAddress {
-	networkAddrs := make([]networkAddress, 0, len(s.Addresses))
-	for _, addr := range s.Addresses {
+	networkAddrs := make([]networkAddress, 0, len(s.Service.Addresses))
+	for _, addr := range s.Service.Addresses {
 		// mustByteIPToString is ok since this is from our IP constructed
 		networkAddrs = append(networkAddrs, networkAddress{network: addr.Network, ip: mustByteIPToString(addr.Address)})
 	}

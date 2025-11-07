@@ -11,7 +11,7 @@
         "thread": "%t"
       }
 {{- else }}
-        "text_format": "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n %g:%#\t%v\tthread=%t"
+      "text_format": "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n %g:%#\t%v\tthread=%t"
 {{- end }}
     }
   },
@@ -38,16 +38,16 @@
     "metadata": {{ .meta_json_str }}
   },
   "layered_runtime": {
-      "layers": [
-          {
-            "name": "global config",
-            "static_layer": {{ .runtime_flags }}
-          },
-          {
-              "name": "admin",
-              "admin_layer": {}
-          }
-      ]
+    "layers": [
+      {
+        "name": "global config",
+        "static_layer": {{ .runtime_flags }}
+      },
+      {
+        "name": "admin",
+        "admin_layer": {}
+      }
+    ]
   },
   "bootstrap_extensions": [
     {{- if .metadata_discovery }}
@@ -73,10 +73,15 @@
       }
     }
   ],
+  {{- if .stats_flush_interval }}
+  "stats_flush_interval": "{{ .stats_flush_interval }}",
+  {{- end }}
+  {{- if .stats_eviction_interval }}
+  "stats_eviction_interval": "{{ .stats_eviction_interval }}",
+  {{- end }}
   "stats_config": {
     "use_all_default_tags": false,
     "stats_tags": [
-      {{- if .delimited_stats_tags_enabled }}
       {
         "tag_name": "cluster_name",
         "regex": "^cluster(\\.(.+);)"
@@ -85,16 +90,6 @@
         "tag_name": "http_conn_manager_prefix",
         "regex": "^http\\.(((?:[_.[:digit:]\\w]*|[_\\[\\]aAbBcCdDeEfF[:digit:]\\w\\:]*));\\.)"
       },
-      {{- else }}
-      {
-        "tag_name": "cluster_name",
-        "regex": "^cluster\\.((.+?(\\..+?\\.svc\\.cluster\\.local)?)\\.)"
-      },
-      {
-        "tag_name": "http_conn_manager_prefix",
-        "regex": "^http\\.(((?:[_.[:digit:]]*|[_\\[\\]aAbBcCdDeEfF[:digit:]]*))\\.)"
-      },
-      {{- end }}
       {
         "tag_name": "thread_name",
         "regex": "^server(\\.(.+))\\.watchdog"
@@ -308,7 +303,7 @@
               "endpoint": {
                 "address":{
                   "pipe": {
-                    "path": "./var/run/secrets/workload-spiffe-uds/socket"
+                    "path": "./var/run/secrets/workload-spiffe-uds/{{ .workload_identity_socket_file }}"
                   }
                 }
               }
@@ -316,6 +311,37 @@
           }]
         }
       },
+      {{- if .custom_file_path }}
+      {
+        "name": "sds-files-grpc",
+        "alt_stat_name": "sds-files-grpc;",
+        "type": "STATIC",
+        "typed_extension_protocol_options": {
+          "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+           "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+           "explicit_http_config": {
+            "http2_protocol_options": {}
+           }
+          }
+        },
+        "connect_timeout": "1s",
+        "lb_policy": "ROUND_ROBIN",
+        "load_assignment": {
+          "cluster_name": "sds-files-grpc",
+          "endpoints": [{
+            "lb_endpoints": [{
+              "endpoint": {
+                "address":{
+                  "pipe": {
+                    "path": "{{ .custom_file_path }}"
+                  }
+                }
+              }
+            }]
+          }]
+        }
+      },
+      {{- end }}
       {
         "name": "xds-grpc",
         "alt_stat_name": "xds-grpc;",
@@ -550,10 +576,8 @@
             "port_value": {{ .envoy_prometheus_port }}
           }
         },
-        {{- if .bypass_overload_manager}}
         "ignore_global_conn_limit": true,
         "bypass_overload_manager": true,
-        {{ end}}
         {{- if .dual_stack }}
         "additionalAddresses": [
           {
@@ -652,10 +676,8 @@
              "port_value": {{ .envoy_status_port }}
            }
         },
-        {{- if .bypass_overload_manager}}
         "ignore_global_conn_limit": true,
         "bypass_overload_manager": true,
-        {{ end}}
         {{- if .dual_stack }}
         "additionalAddresses": [
           {
@@ -669,6 +691,17 @@
           }
         ],
         {{- end}}
+        {{- if .envoy_status_port_enable_proxy_protocol }}
+        "listener_filters": [
+          {
+            "name": "envoy.listener.proxy_protocol",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol",
+              "allow_requests_without_proxy_protocol": true,
+            }
+          }
+        ],
+        {{- end }}
         "filter_chains": [
           {
             "filters": [
@@ -711,6 +744,17 @@
         ]
       }
     ]
+  },
+  "overload_manager": {
+    "resource_monitors": [
+      {
+        "name": "envoy.resource_monitors.global_downstream_max_connections",
+        "typed_config": {
+          "@type": "type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig",
+          "max_active_downstream_connections": 2147483647
+        }
+      }
+    ]
   }
   {{- if .zipkin }}
   ,
@@ -751,29 +795,6 @@
       }
     }
   }
-  {{- else if .openCensusAgent }}
-  ,
-  "tracing": {
-    "http": {
-      "name": "envoy.tracers.opencensus",
-      "typed_config": {
-        "@type": "type.googleapis.com/envoy.config.trace.v3.OpenCensusConfig",
-        "ocagent_exporter_enabled": true,
-        "ocagent_address": "{{ .openCensusAgent }}",
-        "incoming_trace_context": {{ .openCensusAgentContexts }},
-        "outgoing_trace_context": {{ .openCensusAgentContexts }},
-        "trace_config": {
-          "constant_sampler": {
-            "decision": "ALWAYS_PARENT"
-          },
-          "max_number_of_annotations": 200,
-          "max_number_of_attributes": 200,
-          "max_number_of_message_events": 200,
-          "max_number_of_links": 200
-        }
-      }
-    }
-  }
   {{ end }}
   {{ if or .envoy_metrics_service_address .statsd }}
   ,
@@ -808,12 +829,10 @@
     {{ end }}
   ]
   {{ end }}
-  {{ if or .outlier_log_path .load_stats_config_json_str .deferred_cluster_creation}}
+  {{ if or .outlier_log_path .load_stats_config_json_str}}
   ,
   "cluster_manager": {
-    {{- if .deferred_cluster_creation}}
     "enable_deferred_cluster_creation": true,
-    {{- end}}
     {{- if .outlier_log_path}}
     "outlier_detection": {
       "event_log_path": "{{ .outlier_log_path }}"
@@ -827,10 +846,8 @@
     {{- end }}
   }
   {{- end }}
-  {{ if .deferred_stats_creation }}
   ,
   "deferred_stat_options": {
     "enable_deferred_creation_stats": true
   }
-  {{ end }}
 }

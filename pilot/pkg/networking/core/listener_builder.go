@@ -24,8 +24,10 @@ import (
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/apimachinery/pkg/types"
 
 	extensions "istio.io/api/extensions/v1alpha1"
+	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
@@ -61,7 +63,7 @@ type ListenerBuilder struct {
 	virtualOutboundListener *listener.Listener
 	virtualInboundListener  *listener.Listener
 
-	envoyFilterWrapper *model.EnvoyFilterWrapper
+	envoyFilterWrapper *model.MergedEnvoyFilterWrapper
 
 	// authnBuilder provides access to authn (mTLS) configuration for the given proxy.
 	authnBuilder *authn.Builder
@@ -86,6 +88,13 @@ func NewListenerBuilder(node *model.Proxy, push *model.PushContext) *ListenerBui
 	builder.authzBuilder = authz.NewBuilder(authz.Local, push, node, node.Type == model.Waypoint)
 	builder.authzCustomBuilder = authz.NewBuilder(authz.Custom, push, node, node.Type == model.Waypoint)
 	return builder
+}
+
+func maxConnectionsToAcceptPerSocketEvent() *wrappers.UInt32Value {
+	if features.MaxConnectionsToAcceptPerSocketEvent > 0 {
+		return &wrappers.UInt32Value{Value: uint32(features.MaxConnectionsToAcceptPerSocketEvent)}
+	}
+	return nil
 }
 
 func (lb *ListenerBuilder) appendSidecarInboundListeners() *ListenerBuilder {
@@ -127,12 +136,13 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 	actualWildcards, _ := getWildcardsAndLocalHost(lb.node.GetIPMode())
 	// add an extra listener that binds to the port that is the recipient of the iptables redirect
 	ipTablesListener := &listener.Listener{
-		Name:             model.VirtualOutboundListenerName,
-		Address:          util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
-		Transparent:      isTransparentProxy,
-		UseOriginalDst:   proto.BoolTrue,
-		FilterChains:     filterChains,
-		TrafficDirection: core.TrafficDirection_OUTBOUND,
+		Name:                                 model.VirtualOutboundListenerName,
+		Address:                              util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
+		Transparent:                          isTransparentProxy,
+		UseOriginalDst:                       proto.BoolTrue,
+		FilterChains:                         filterChains,
+		TrafficDirection:                     core.TrafficDirection_OUTBOUND,
+		MaxConnectionsToAcceptPerSocketEvent: maxConnectionsToAcceptPerSocketEvent(),
 	}
 	// add extra addresses for the listener
 	if features.EnableDualStack && len(actualWildcards) > 1 {
@@ -310,8 +320,21 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	} else {
 		connectionManager.CodecType = hcm.HttpConnectionManager_AUTO
 	}
+
+	ph := lb.node.Metadata.ProxyConfigOrDefault(lb.push.Mesh.GetDefaultConfig()).GetProxyHeaders()
+
+	// Preserve HTTP/1.x traffic header case
+	if shouldPreserveHeaderCase(lb.node.Metadata, lb.push) {
+		// This value only affects HTTP/1.x traffic
+		if connectionManager.HttpProtocolOptions == nil {
+			connectionManager.HttpProtocolOptions = &core.Http1ProtocolOptions{}
+		}
+		connectionManager.HttpProtocolOptions.HeaderKeyFormat = preserveCaseFormatterConfig.HeaderKeyFormat
+	}
+
 	connectionManager.AccessLog = []*accesslog.AccessLog{}
 	connectionManager.StatPrefix = httpOpts.statPrefix
+	connectionManager.AppendXForwardedPort = ph.GetXForwardedPort().GetEnabled().GetValue()
 
 	// Setup normalization
 	connectionManager.PathWithEscapedSlashesAction = hcm.HttpConnectionManager_KEEP_UNCHANGED
@@ -388,6 +411,12 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 		// TODO: these feel like the wrong place to insert, but this retains backwards compatibility with the original implementation
 		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_STATS)
 		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
+		// Add ExtProc per listener only if the Gateway has any inferencePool attached to it
+		if kubeGwName, ok := lb.node.Labels[label.IoK8sNetworkingGatewayGatewayName.Name]; ok {
+			if lb.push.GatewayAPIController.HasInferencePool(types.NamespacedName{Name: kubeGwName, Namespace: lb.node.GetNamespace()}) {
+				filters = append(filters, xdsfilters.InferencePoolExtProc)
+			}
+		}
 	}
 
 	if httpOpts.protocol == protocol.GRPCWeb {
@@ -414,6 +443,14 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	if features.EnablePersistentSessionFilter.Load() && httpOpts.class != istionetworking.ListenerClassSidecarInbound {
 		filters = append(filters, xdsfilters.EmptySessionFilter)
 	}
+
+	// Create DFP filter for wildcard hosts
+	if httpOpts.policySvc != nil && httpOpts.policySvc.Hostname.IsWildCarded() && httpOpts.class == istionetworking.ListenerClassSidecarInbound {
+		dfpCacheName := model.BuildDNSCacheName(httpOpts.policySvc.Hostname)
+		filters = append(filters, xdsfilters.BuildWaypointInboundDFPFilter(dfpCacheName))
+	}
+
+	// Router filter must be last
 	filters = append(filters, xdsfilters.BuildRouterFilter(xdsfilters.RouterFilterContext{
 		SuppressDebugHeaders: httpOpts.suppressEnvoyDebugHeaders,
 	}))
@@ -421,9 +458,11 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	connectionManager.HttpFilters = filters
 	connectionManager.RequestIdExtension = requestidextension.BuildUUIDRequestIDExtension(reqIDExtensionCtx)
 
-	// If UseRemoteAddress is set, we must set the internal address config in preparation for envoy
-	// internal addresses defaulting to empty set. Currently, the internal addresses defaulted to
-	// all private IPs but this will change in the future.
+	// If UseRemoteAddress is set, we must set the internal address config to preserve internal headers.
+	// As of Envoy 1.33, the default internalAddressConfig is set to an empty set. In previous versions
+	// the default was all private IPs. To preserve internal headers when useRemoteAddress is set, we must
+	// explicitly set MeshNetworks to configure Envoy's internal_address_config.
+	// MeshNetwork configuration docs can be found here: https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshNetworks
 	if (features.EnableHCMInternalNetworks || httpOpts.useRemoteAddress) && lb.push.Networks != nil {
 		connectionManager.InternalAddressConfig = util.MeshNetworksToEnvoyInternalAddressConfig(lb.push.Networks)
 	}

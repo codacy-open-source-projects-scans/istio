@@ -39,9 +39,9 @@ type PodCache struct {
 	// this allows us to retrieve the latest status by pod IP.
 	// This should only contain RUNNING or PENDING pods with an allocated IP.
 	podsByIP map[string]sets.Set[types.NamespacedName]
-	// IPByPods is a reverse map of podsByIP. This exists to allow us to prune stale entries in the
+	// ipByPods is a reverse map of podsByIP. This exists to allow us to prune stale entries in the
 	// pod cache if a pod changes IP.
-	IPByPods map[types.NamespacedName]string
+	ipByPods map[types.NamespacedName]string
 
 	// needResync is map of IP to endpoint namespace/name. This is used to requeue endpoint
 	// events when pod event comes. This typically happens when pod is not available
@@ -57,7 +57,7 @@ func newPodCache(c *Controller, pods kclient.Client[*v1.Pod], queueEndpointEvent
 		pods:               pods,
 		c:                  c,
 		podsByIP:           make(map[string]sets.Set[types.NamespacedName]),
-		IPByPods:           make(map[types.NamespacedName]string),
+		ipByPods:           make(map[types.NamespacedName]string),
 		needResync:         make(map[string]sets.Set[types.NamespacedName]),
 		queueEndpointEvent: queueEndpointEvent,
 	}
@@ -149,7 +149,14 @@ func (pc *PodCache) onEvent(old, pod *v1.Pod, ev model.Event) error {
 	// PodIP will be empty when pod is just created, but before the IP is assigned
 	// via UpdateStatus.
 	if len(ip) == 0 {
-		return nil
+		// However, in the case of an Eviction, the event that marks the pod as Failed may *also* have removed the IP.
+		// If the pod *used to* have an IP, then we need to actually delete it.
+		ip = pc.getIPByPod(config.NamespacedName(pod))
+		if len(ip) == 0 {
+			log.Debugf("Pod %s has no IP", config.NamespacedName(pod).String())
+			return nil
+		}
+		log.Debugf("Pod %s has no IP, but was in the cache (%s), continue so we can delete it", config.NamespacedName(pod).String(), ip)
 	}
 
 	key := config.NamespacedName(pod)
@@ -180,18 +187,25 @@ func (pc *PodCache) onEvent(old, pod *v1.Pod, ev model.Event) error {
 			return nil
 		}
 	}
-	pc.notifyWorkloadHandlers(pod, ev)
+	pc.notifyWorkloadHandlers(pod, ev, ip)
 	return nil
 }
 
 // notifyWorkloadHandlers fire workloadInstance handlers for pod
-func (pc *PodCache) notifyWorkloadHandlers(pod *v1.Pod, ev model.Event) {
+func (pc *PodCache) notifyWorkloadHandlers(pod *v1.Pod, ev model.Event, ip string) {
 	// if no workload handler registered, skip building WorkloadInstance
 	if len(pc.c.handlers.GetWorkloadHandlers()) == 0 {
 		return
 	}
 	// fire instance handles for workload
-	ep := pc.c.NewEndpointBuilder(pod).buildIstioEndpoint(pod.Status.PodIP, 0, "", model.AlwaysDiscoverable, model.Healthy)
+	ep := pc.c.NewEndpointBuilder(pod).buildIstioEndpoint(
+		ip,
+		0,
+		"",
+		model.AlwaysDiscoverable,
+		model.Healthy,
+		features.GlobalSendUnhealthyEndpoints.Load(),
+	)
 	// If pod is dual stack, handle all IPs
 	if features.EnableDualStack && len(pod.Status.PodIPs) > 1 {
 		ep.Addresses = slices.Map(pod.Status.PodIPs, func(e v1.PodIP) string {
@@ -230,7 +244,7 @@ func (pc *PodCache) deleteIP(ip string, podKey types.NamespacedName) bool {
 	defer pc.Unlock()
 	if pc.podsByIP[ip].Contains(podKey) {
 		sets.DeleteCleanupLast(pc.podsByIP, ip, podKey)
-		delete(pc.IPByPods, podKey)
+		delete(pc.ipByPods, podKey)
 		return true
 	}
 	return false
@@ -246,12 +260,12 @@ func (pc *PodCache) addPod(pod *v1.Pod, ip string, key types.NamespacedName, lab
 		}
 		return
 	}
-	if current, f := pc.IPByPods[key]; f {
+	if current, f := pc.ipByPods[key]; f {
 		// The pod already exists, but with another IP Address. We need to clean up that
 		sets.DeleteCleanupLast(pc.podsByIP, current, key)
 	}
 	sets.InsertOrNew(pc.podsByIP, ip, key)
-	pc.IPByPods[key] = ip
+	pc.ipByPods[key] = ip
 
 	if endpointsToUpdate, f := pc.needResync[ip]; f {
 		delete(pc.needResync, ip)
@@ -302,6 +316,13 @@ func (pc *PodCache) getPodKeys(addr string) []types.NamespacedName {
 	return pc.podsByIP[addr].UnsortedList()
 }
 
+// getIPByPod returns the pod IP or empty string if pod not found.
+func (pc *PodCache) getIPByPod(key types.NamespacedName) string {
+	pc.RLock()
+	defer pc.RUnlock()
+	return pc.ipByPods[key]
+}
+
 // getPodByIp returns the pod or nil if pod not found or an error occurred
 func (pc *PodCache) getPodsByIP(addr string) []*v1.Pod {
 	keys := pc.getPodKeys(addr)
@@ -327,36 +348,39 @@ func (pc *PodCache) getPodByKey(key types.NamespacedName) *v1.Pod {
 
 // getPodByKey returns the pod of the proxy
 func (pc *PodCache) getPodByProxy(proxy *model.Proxy) *v1.Pod {
-	var pod *v1.Pod
 	key := podKeyByProxy(proxy)
 	if key.Name != "" {
-		pod = pc.getPodByKey(key)
+		pod := pc.getPodByKey(key)
 		if pod != nil {
 			return pod
 		}
 	}
 
-	// only need to fetch the corresponding pod through the first IP, although there are multiple IP scenarios,
-	// because multiple ips belong to the same pod
-	proxyIP := proxy.IPAddresses[0]
-	// just in case the proxy ID is bad formatted
-	pods := pc.getPodsByIP(proxyIP)
-	switch len(pods) {
-	case 0:
-		return nil
-	case 1:
-		return pods[0]
-	default:
-		// This should only happen with hostNetwork pods, which cannot be proxy clients...
-		log.Errorf("unexpected: found multiple pods for proxy %v (%v)", proxy.ID, proxyIP)
-		// Try to handle it gracefully
-		for _, p := range pods {
-			// At least filter out wrong namespaces...
-			if proxy.ConfigNamespace != p.Namespace {
-				continue
+	if features.EnableProxyFindPodByIP {
+		// only need to fetch the corresponding pod through the first IP, although there are multiple IP scenarios,
+		// because multiple ips belong to the same pod
+		proxyIP := proxy.IPAddresses[0]
+		// just in case the proxy ID is bad formatted
+		pods := pc.getPodsByIP(proxyIP)
+		switch len(pods) {
+		case 0:
+			return nil
+		case 1:
+			return pods[0]
+		default:
+			// This should only happen with hostNetwork pods, which cannot be proxy clients...
+			log.Errorf("unexpected: found multiple pods for proxy %v (%v)", proxy.ID, proxyIP)
+			// Try to handle it gracefully
+			for _, p := range pods {
+				// At least filter out wrong namespaces...
+				if proxy.ConfigNamespace != p.Namespace {
+					continue
+				}
+				return p
 			}
-			return p
+			return nil
 		}
-		return nil
 	}
+
+	return nil
 }

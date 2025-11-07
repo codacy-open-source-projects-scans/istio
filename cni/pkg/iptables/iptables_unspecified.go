@@ -1,5 +1,4 @@
 //go:build !linux
-// +build !linux
 
 // Copyright Istio Authors
 //
@@ -18,20 +17,22 @@ package iptables
 
 import (
 	"errors"
+
+	"istio.io/istio/cni/pkg/config"
 )
 
-func AddInpodMarkIPRule(cfg *Config) error {
+func AddInpodMarkIPRule(cfg *config.AmbientConfig) error {
 	return errors.New("not implemented on this platform")
 }
 
-func DelInpodMarkIPRule(cfg *Config) error {
+func DelInpodMarkIPRule(cfg *config.AmbientConfig) error {
 	return errors.New("not implemented on this platform")
 }
 
-func AddLoopbackRoutes(cfg *Config) error {
+func AddLoopbackRoutes(cfg *config.AmbientConfig) error {
 	return errors.New("not implemented on this platform")
 }
 
-func DelLoopbackRoutes(cfg *Config) error {
+func DelLoopbackRoutes(cfg *config.AmbientConfig) error {
 	return errors.New("not implemented on this platform")
 }

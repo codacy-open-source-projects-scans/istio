@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -36,10 +35,7 @@ const (
 func testRegistrySetup(ctx resource.Context) (err error) {
 	var config registryredirector.Config
 
-	isKind, err := IsKindCluster()
-	if err != nil {
-		return
-	}
+	isKind := ctx.Clusters().IsKindCluster()
 
 	// By default, for any platform, the test will pull the test image from public "gcr.io" registry.
 	// For "Kind" environment, it will pull the images from the "kind-registry".
@@ -54,7 +50,7 @@ func testRegistrySetup(ctx resource.Context) (err error) {
 
 	registry, err = registryredirector.New(ctx, config)
 	if err != nil {
-		return
+		return err
 	}
 
 	return nil

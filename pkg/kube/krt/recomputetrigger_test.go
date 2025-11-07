@@ -26,17 +26,18 @@ import (
 )
 
 func TestRecomputeTrigger(t *testing.T) {
+	opts := testOptions(t)
 	rt := krt.NewRecomputeTrigger(false)
 	col1 := krt.NewStatic(ptr.Of("foo"), true).AsCollection()
 	response := atomic.NewString("foo")
 	col2 := krt.NewCollection(col1, func(ctx krt.HandlerContext, i string) *string {
 		rt.MarkDependant(ctx)
 		return ptr.Of(response.Load())
-	}, krt.WithStop(test.NewStop(t)))
+	}, opts.WithName("col2")...)
 
-	assert.Equal(t, col2.Synced().HasSynced(), false)
+	assert.Equal(t, col2.HasSynced(), false)
 	rt.MarkSynced()
-	assert.Equal(t, col2.Synced().WaitUntilSynced(test.NewStop(t)), true)
+	assert.Equal(t, col2.WaitUntilSynced(test.NewStop(t)), true)
 
 	tt := assert.NewTracker[string](t)
 	col2.Register(TrackerHandler[string](tt))

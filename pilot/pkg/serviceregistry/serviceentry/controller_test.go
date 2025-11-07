@@ -34,6 +34,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/maps"
@@ -102,7 +103,7 @@ func initServiceDiscoveryWithoutEvents(t test.Failer) (model.ConfigStore, *Contr
 		}
 	}()
 
-	meshcfg := mesh.NewFixedWatcher(mesh.DefaultMeshConfig())
+	meshcfg := meshwatcher.NewTestWatcher(mesh.DefaultMeshConfig())
 	serviceController := NewController(configController, fx, meshcfg)
 	return configController, serviceController
 }
@@ -118,7 +119,7 @@ func initServiceDiscoveryWithOpts(t test.Failer, workloadOnly bool, opts ...Opti
 	delegate := model.NewEndpointIndexUpdater(endpoints)
 	xdsUpdater := xdsfake.NewWithDelegate(delegate)
 
-	meshcfg := mesh.NewFixedWatcher(mesh.DefaultMeshConfig())
+	meshcfg := meshwatcher.NewTestWatcher(mesh.DefaultMeshConfig())
 	istioStore := configController
 	var controller *Controller
 	if !workloadOnly {
@@ -874,7 +875,6 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		expectProxyInstances(t, sd, instances, []string{"9.9.9.9"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
-			Event{Type: "proxy", ID: "9.9.9.9"},
 			Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 2},
 		)
 	})
@@ -2185,7 +2185,7 @@ func Test_legacyAutoAllocateIP_values(t *testing.T) {
 	}
 	gotServices := autoAllocateIPs(inServices)
 
-	// We dont expect the following pattern of IPs.
+	// We don't expect the following pattern of IPs.
 	// 240.240.0.0
 	// 240.240.0.255
 	// 240.240.1.0

@@ -26,9 +26,11 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	overridehost "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/override_host/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gstruct"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -45,6 +47,7 @@ import (
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
@@ -299,6 +302,71 @@ func TestConnectionPoolSettings(t *testing.T) {
 	}
 }
 
+func TestBuildClustersForInferencePoolServices(t *testing.T) {
+	cases := []struct {
+		testName             string
+		clusterName          string
+		proxyType            model.NodeType
+		InferencePoolService bool
+	}{
+		// Add testcase for inbound clusters as well?
+		{
+			testName:             "InferencePool service should have override_host load_balancing policy",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: true,
+		},
+		{
+			testName:             "Regular service should NOT have override_host load_balancing policy",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: false,
+		},
+		// TODO(liorlieberman) change this once we make it work for sidecars as well
+		{
+			testName:             "Sidecar proxy should not have config",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.SidecarProxy,
+			InferencePoolService: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			g := NewWithT(t)
+			clusters := buildTestClusters(clusterTest{
+				t:                    t,
+				serviceHostname:      "*.example.org",
+				nodeType:             tc.proxyType,
+				mesh:                 testMesh(),
+				istioVersion:         model.MaxIstioVersion,
+				inferencePoolCluster: tc.InferencePoolService,
+			})
+			c := xdstest.ExtractCluster("outbound|8080||*.example.org", clusters)
+			if !tc.InferencePoolService || tc.InferencePoolService && tc.proxyType != model.Router {
+				if c.GetLoadBalancingPolicy() != nil && c.GetLoadBalancingPolicy().GetPolicies() != nil {
+					g.Expect(c.GetLoadBalancingPolicy().GetPolicies()).To(Not(ContainElement(
+						MatchFields(IgnoreExtras, Fields{
+							"TypedExtensionConfig": MatchFields(IgnoreExtras, Fields{
+								"Name": Equal("envoy.load_balancing_policies.override_host"),
+							}),
+						}),
+					)))
+				}
+			} else if tc.InferencePoolService {
+				g.Expect(c.LoadBalancingPolicy).NotTo(BeNil())
+				g.Expect(c.LoadBalancingPolicy.Policies).NotTo(BeEmpty())
+				overrideHostPolicy := new(overridehost.OverrideHost)
+				if err := c.LoadBalancingPolicy.Policies[0].GetTypedExtensionConfig().GetTypedConfig().UnmarshalTo(overrideHostPolicy); err != nil {
+					t.Errorf("couldn't unmarshal overrideHost proto: %v \n", err)
+				}
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()).NotTo(BeEmpty())
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()[0].GetMetadata().GetKey()).To(Equal("envoy.lb"))
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()[0].GetMetadata().GetPath()[0].GetKey()).To(Equal("x-gateway-destination-endpoint"))
+			}
+		})
+	}
+}
+
 func TestCommonHttpProtocolOptions(t *testing.T) {
 	cases := []struct {
 		clusterName           string
@@ -405,6 +473,8 @@ type clusterTest struct {
 	meta         *model.NodeMetadata
 	istioVersion *model.IstioVersion
 	proxyIps     []string
+
+	inferencePoolCluster bool
 }
 
 func (c clusterTest) fillDefaults() clusterTest {
@@ -443,7 +513,12 @@ func buildTestClusters(c clusterTest) []*cluster.Cluster {
 		MeshExternal: c.externalService,
 		Attributes: model.ServiceAttributes{
 			Namespace: TestServiceNamespace,
+			Labels:    map[string]string{},
 		},
+	}
+
+	if c.inferencePoolCluster {
+		service.Attributes.Labels[constants.InternalServiceSemantics] = "inferencepool"
 	}
 
 	instances := []*model.ServiceInstance{
@@ -1276,25 +1351,16 @@ func TestStatNamePattern(t *testing.T) {
 		InboundClusterStatName:  "LocalService_%SERVICE%",
 		OutboundClusterStatName: "%SERVICE%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
 	}
-	enableDelimitedStatsTagValues := []bool{true, false}
 
-	for _, enableDelimitedStatsTagValue := range enableDelimitedStatsTagValues {
-		test.SetForTest(t, &features.EnableDelimitedStatsTagRegex, enableDelimitedStatsTagValue)
-		clusters := buildTestClusters(clusterTest{
-			t: t, serviceHostname: "*.example.org", serviceResolution: model.DNSLB, nodeType: model.SidecarProxy,
-			locality: &core.Locality{}, mesh: statConfigMesh,
-			destRule: &networking.DestinationRule{
-				Host: "*.example.org",
-			},
-		})
-		if enableDelimitedStatsTagValue {
-			g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080;"))
-			g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org;"))
-		} else {
-			g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080"))
-			g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org"))
-		}
-	}
+	clusters := buildTestClusters(clusterTest{
+		t: t, serviceHostname: "*.example.org", serviceResolution: model.DNSLB, nodeType: model.SidecarProxy,
+		locality: &core.Locality{}, mesh: statConfigMesh,
+		destRule: &networking.DestinationRule{
+			Host: "*.example.org",
+		},
+	})
+	g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080;"))
+	g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org;"))
 }
 
 func TestDuplicateClusters(t *testing.T) {
@@ -1904,7 +1970,7 @@ func TestBuildInboundClustersPortLevelCircuitBreakerThresholds(t *testing.T) {
 				MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
 				MaxConnections:     &wrappers.UInt32Value{Value: 100},
 				MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
-				TrackRemaining:     true,
+				TrackRemaining:     false,
 			},
 		},
 		{
@@ -1937,7 +2003,7 @@ func TestBuildInboundClustersPortLevelCircuitBreakerThresholds(t *testing.T) {
 				MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
 				MaxConnections:     &wrappers.UInt32Value{Value: 1000},
 				MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
-				TrackRemaining:     true,
+				TrackRemaining:     false,
 			},
 		},
 	}
@@ -2463,7 +2529,7 @@ func TestApplyLoadBalancer(t *testing.T) {
 
 	for _, tt := range testcases {
 		t.Run(tt.name, func(t *testing.T) {
-			test.SetAtomicBoolForTest(t, features.SendUnhealthyEndpoints, tt.sendUnhealthyEndpoints)
+			test.SetAtomicBoolForTest(t, features.GlobalSendUnhealthyEndpoints, tt.sendUnhealthyEndpoints)
 			c := &cluster.Cluster{
 				ClusterDiscoveryType: &cluster.Cluster_Type{Type: tt.discoveryType},
 				LoadAssignment:       &endpoint.ClusterLoadAssignment{},
@@ -2478,14 +2544,14 @@ func TestApplyLoadBalancer(t *testing.T) {
 				test.SetForTest(t, &features.EnableRedisFilter, true)
 			}
 
-			applyLoadBalancer(c, tt.lbSettings, tt.port, proxy.Locality, nil, &meshconfig.MeshConfig{})
+			applyLoadBalancer(nil, c, tt.lbSettings, tt.port, proxy.Locality, nil, &meshconfig.MeshConfig{})
 
 			if c.LbPolicy != tt.expectedLbPolicy {
 				t.Errorf("cluster LbPolicy %s != expected %s", c.LbPolicy, tt.expectedLbPolicy)
 			}
 
 			if tt.sendUnhealthyEndpoints && c.CommonLbConfig.HealthyPanicThreshold.GetValue() != 0 {
-				t.Errorf("panic threshold should be disabled when sendHealthyEndpoints is enabeld")
+				t.Errorf("panic threshold should be disabled when sendHealthyEndpoints is enabled")
 			}
 
 			if tt.expectedLocalityWeightedConfig && c.CommonLbConfig.GetLocalityWeightedLbConfig() == nil {
@@ -3111,52 +3177,6 @@ func TestTelemetryMetadata(t *testing.T) {
 	}
 }
 
-func TestVerifyCertAtClient(t *testing.T) {
-	testCases := []struct {
-		name               string
-		policy             *networking.TrafficPolicy
-		expectedCARootPath string
-	}{
-		{
-			name: "Check that certs are verfied against the OS CA certificate bundle",
-			policy: &networking.TrafficPolicy{
-				ConnectionPool: &networking.ConnectionPoolSettings{
-					Http: &networking.ConnectionPoolSettings_HTTPSettings{
-						MaxRetries: 10,
-					},
-				},
-				Tls: &networking.ClientTLSSettings{
-					CaCertificates: "",
-				},
-			},
-			expectedCARootPath: "system",
-		},
-		{
-			name: "Check that CaCertificates has priority over OS CA certificate bundle",
-			policy: &networking.TrafficPolicy{
-				ConnectionPool: &networking.ConnectionPoolSettings{
-					Http: &networking.ConnectionPoolSettings_HTTPSettings{
-						MaxRetries: 10,
-					},
-				},
-				Tls: &networking.ClientTLSSettings{
-					CaCertificates: "file-root:certPath",
-				},
-			},
-			expectedCARootPath: "file-root:certPath",
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			selectTrafficPolicyComponents(testCase.policy)
-			if testCase.policy.Tls.CaCertificates != testCase.expectedCARootPath {
-				t.Errorf("%v got %v when expecting %v", testCase.name, testCase.policy.Tls.CaCertificates, testCase.expectedCARootPath)
-			}
-		})
-	}
-}
-
 func TestBuildDeltaClusters(t *testing.T) {
 	testService1 := &model.Service{
 		Hostname: host.Name("test.com"),
@@ -3624,7 +3644,7 @@ func TestBuildDeltaClusters(t *testing.T) {
 				proxy.PrevSidecarScope.SetDestinationRulesForTesting(tc.prevConfigs)
 			}
 			clusters, removed, delta := cg.DeltaClusters(proxy, tc.configUpdated,
-				&model.WatchedResource{ResourceNames: tc.watchedResourceNames})
+				&model.WatchedResource{ResourceNames: sets.New(tc.watchedResourceNames...)})
 			if delta != tc.usedDelta {
 				t.Errorf("un expected delta, want %v got %v", tc.usedDelta, delta)
 			}

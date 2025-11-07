@@ -29,6 +29,7 @@ import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"k8s.io/apimachinery/pkg/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/credentials"
@@ -38,10 +39,13 @@ import (
 	networkutil "istio.io/istio/pilot/pkg/util/network"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/maps"
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
@@ -93,6 +97,9 @@ func NewEnvironment() *Environment {
 	}
 }
 
+// Watcher is a type alias to keep the embedded type name stable.
+type Watcher = meshwatcher.WatcherCollection
+
 // Environment provides an aggregate environmental API for Pilot
 type Environment struct {
 	// Discovery interface for listing services and instances.
@@ -102,7 +109,7 @@ type Environment struct {
 	ConfigStore
 
 	// Watcher is the watcher for the mesh config (to be merged into the config store)
-	mesh.Watcher
+	Watcher
 
 	// NetworksWatcher (loaded from a config map) provides information about the
 	// set of networks inside a mesh and how to route to endpoints in each
@@ -218,7 +225,7 @@ func (e *Environment) Init() {
 
 func (e *Environment) InitNetworksManager(updater XDSUpdater) (err error) {
 	e.NetworkManager, err = NewNetworkManager(e, updater)
-	return
+	return err
 }
 
 func (e *Environment) ClusterLocal() ClusterLocalProvider {
@@ -550,6 +557,17 @@ func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
 	}
 }
 
+func (node *Proxy) ShouldUpdateServiceTargets(updates sets.Set[ConfigKey]) bool {
+	// we only care for services which can actually select this proxy
+	for config := range updates {
+		if config.Kind == kind.ServiceEntry && config.Namespace == node.Metadata.Namespace {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (node *Proxy) SetServiceTargets(serviceDiscovery ServiceDiscovery) {
 	instances := serviceDiscovery.GetProxyServiceTargets(node)
 
@@ -625,7 +643,7 @@ func (node *Proxy) GetIPMode() IPMode {
 }
 
 // SetIPMode set node's ip mode
-// Note: Donot use this function directly in most cases, use DiscoverIPMode instead.
+// Note: Do not use this function directly in most cases, use DiscoverIPMode instead.
 func (node *Proxy) SetIPMode(mode IPMode) {
 	node.ipMode = mode
 }
@@ -979,7 +997,7 @@ func (node *Proxy) Clusters() []string {
 	defer node.RUnlock()
 	wr := node.WatchedResources[v3.EndpointType]
 	if wr != nil {
-		return wr.ResourceNames
+		return wr.ResourceNames.UnsortedList()
 	}
 	return nil
 }
@@ -988,7 +1006,7 @@ func (node *Proxy) NewWatchedResource(typeURL string, names []string) {
 	node.Lock()
 	defer node.Unlock()
 
-	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: names}
+	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: sets.New(names...)}
 	// For all EDS requests that we have already responded with in the same stream let us
 	// force the response. It is important to respond to those requests for Envoy to finish
 	// warming of those resources(Clusters).
@@ -1045,15 +1063,21 @@ func (node *Proxy) DeleteWatchedResource(typeURL string) {
 	delete(node.WatchedResources, typeURL)
 }
 
+type InferenceGatewayContext interface {
+	// HasInferencePool returns whether or not a given gateway has a reference to an InferencePool
+	HasInferencePool(types.NamespacedName) bool
+}
+
 type GatewayController interface {
 	ConfigStoreController
+	InferenceGatewayContext
 	// Reconcile updates the internal state of the gateway controller for a given input. This should be
 	// called before any List/Get calls if the state has changed
-	Reconcile(ctx *PushContext) error
+	Reconcile(ctx *PushContext)
 	// SecretAllowed determines if a SDS credential is accessible to a given namespace.
 	// For example, for resourceName of `kubernetes-gateway://ns-name/secret-name` and namespace of `ingress-ns`,
 	// this would return true only if there was a policy allowing `ingress-ns` to access Secrets in the `ns-name` namespace.
-	SecretAllowed(resourceName string, namespace string) bool
+	SecretAllowed(ourKind config.GroupVersionKind, resourceName string, namespace string) bool
 }
 
 // OutboundListenerClass is a helper to turn a NodeType for outbound to a ListenerClass.

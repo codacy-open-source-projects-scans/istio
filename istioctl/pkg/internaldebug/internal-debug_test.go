@@ -24,7 +24,9 @@ import (
 
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/anypb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/resource"
@@ -42,7 +44,8 @@ import (
 )
 
 type execTestCase struct {
-	args     []string
+	args []string
+	// revision should default to "default" if not set
 	revision string
 	noIstiod bool
 
@@ -58,7 +61,7 @@ func TestInternalDebug(t *testing.T) {
 		{ // case 0, no args
 			args:           []string{},
 			noIstiod:       true,
-			expectedOutput: "Error: debug type is required\n",
+			expectedOutput: "Error: debug type is required, you can specify --list flag to list supported debug types\n",
 			wantException:  true,
 		},
 		{ // case 1, no istiod
@@ -81,6 +84,9 @@ func TestInternalDebug(t *testing.T) {
 	})
 
 	for i, c := range cases {
+		if c.revision == "" {
+			c.revision = "default"
+		}
 		t.Run(fmt.Sprintf("case %d %s", i, strings.Join(c.args, " ")), func(t *testing.T) {
 			ctx := cli.NewFakeContext(&cli.NewFakeContextOption{
 				IstioNamespace: "istio-system",
@@ -104,6 +110,320 @@ func TestInternalDebug(t *testing.T) {
 				assert.NoError(t, err)
 			}
 			verifyExecTestOutput(t, DebugCommand(ctx), c)
+		})
+	}
+}
+
+func TestInternalDebugWithMultiIstiod(t *testing.T) {
+	t.Cleanup(func() {
+		multixds.GetXdsResponse = xds.GetXdsResponse
+	})
+
+	getXdsResponseCall := 0
+	cases := []struct {
+		name           string
+		testcase       execTestCase
+		getXdsResponse func(_ *discovery.DiscoveryRequest, _ string, _ string,
+			_ clioptions.CentralControlPlaneOptions, _ []grpc.DialOption) (*discovery.DiscoveryResponse, error)
+		ExceptGetXdsResponseCall int
+	}{
+		{
+			name: "proxyID not found",
+			testcase: execTestCase{
+				args:           []string{"config_dump?proxyID=sleep-77ccf74cb-m6jcb"},
+				expectedOutput: "Proxy not connected to this Pilot instance. It may be connected to another instance.\n",
+			},
+			getXdsResponse: func(_ *discovery.DiscoveryRequest, _ string, _ string, _ clioptions.CentralControlPlaneOptions, _ []grpc.DialOption,
+			) (*discovery.DiscoveryResponse, error) {
+				getXdsResponseCall++
+				return &discovery.DiscoveryResponse{
+					Resources: []*anypb.Any{
+						{
+							Value: []byte("Proxy not connected to this Pilot instance. It may be connected to another instance."),
+						},
+					},
+				}, nil
+			},
+			ExceptGetXdsResponseCall: 2,
+		},
+		{
+			name: "proxyID found when first call",
+			testcase: execTestCase{
+				args:           []string{"config_dump?proxyID=sleep-77ccf74cb-m6jcb"},
+				expectedOutput: "fake config_dump for sleep-77ccf74cb-m6jcb\n",
+			},
+			getXdsResponse: func(_ *discovery.DiscoveryRequest, _ string, _ string, _ clioptions.CentralControlPlaneOptions, _ []grpc.DialOption,
+			) (*discovery.DiscoveryResponse, error) {
+				getXdsResponseCall++
+				return &discovery.DiscoveryResponse{
+					Resources: []*anypb.Any{
+						{
+							Value: []byte("fake config_dump for sleep-77ccf74cb-m6jcb"),
+						},
+					},
+				}, nil
+			},
+			ExceptGetXdsResponseCall: 1,
+		},
+		{
+			name: "proxyID found when second call",
+			testcase: execTestCase{
+				args:           []string{"config_dump?proxyID=sleep-77ccf74cb-m6jcb"},
+				expectedOutput: "fake config_dump for sleep-77ccf74cb-m6jcb in second call\n",
+			},
+			getXdsResponse: func(_ *discovery.DiscoveryRequest, _ string, _ string, _ clioptions.CentralControlPlaneOptions, _ []grpc.DialOption,
+			) (*discovery.DiscoveryResponse, error) {
+				getXdsResponseCall++
+				if getXdsResponseCall == 1 {
+					return &discovery.DiscoveryResponse{
+						Resources: []*anypb.Any{
+							{
+								Value: []byte("Proxy not connected to this Pilot instance. It may be connected to another instance."),
+							},
+						},
+					}, nil
+				}
+				return &discovery.DiscoveryResponse{
+					Resources: []*anypb.Any{
+						{
+							Value: []byte("fake config_dump for sleep-77ccf74cb-m6jcb in second call"),
+						},
+					},
+				}, nil
+			},
+			ExceptGetXdsResponseCall: 2,
+		},
+	}
+
+	for _, c := range cases {
+		if c.testcase.revision == "" {
+			c.testcase.revision = "default"
+		}
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				getXdsResponseCall = 0
+			}()
+			multixds.GetXdsResponse = c.getXdsResponse
+
+			ctx := cli.NewFakeContext(&cli.NewFakeContextOption{
+				IstioNamespace: "istio-system",
+			})
+			client, err := ctx.CLIClientWithRevision(c.testcase.revision)
+			require.NoError(t, err)
+
+			_, err = client.Kube().CoreV1().Pods("istio-system").Create(context.TODO(), &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "istiod-test-1",
+					Namespace: "istio-system",
+					Labels: map[string]string{
+						"app":                 "istiod",
+						label.IoIstioRev.Name: c.testcase.revision,
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			_, err = client.Kube().CoreV1().Pods("istio-system").Create(context.TODO(), &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "istiod-test-2",
+					Namespace: "istio-system",
+					Labels: map[string]string{
+						"app":                 "istiod",
+						label.IoIstioRev.Name: c.testcase.revision,
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			verifyExecTestOutput(t, DebugCommand(ctx), c.testcase)
+			require.Equal(t, c.ExceptGetXdsResponseCall, getXdsResponseCall)
+		})
+	}
+}
+
+func TestPrintAll(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    map[string]*discovery.DiscoveryResponse
+		expected string
+	}{
+		{
+			name: "valid JSON struct",
+			input: map[string]*discovery.DiscoveryResponse{
+				"user": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`{"name": "Alice", "age": 30}`)},
+					},
+				},
+			},
+			expected: `{
+  "user": {
+    "name": "Alice",
+    "age": 30
+  }
+}
+`,
+		},
+		{
+			name: "valid JSON slice",
+			input: map[string]*discovery.DiscoveryResponse{
+				"hobbies": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`["reading", "coding"]`)},
+					},
+				},
+			},
+			expected: `{
+  "hobbies": [
+    "reading",
+    "coding"
+  ]
+}
+`,
+		},
+		{
+			name: "invalid JSON string",
+			input: map[string]*discovery.DiscoveryResponse{
+				"invalid": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`invalid json data`)},
+					},
+				},
+			},
+			expected: `{
+  "invalid": "invalid json data"
+}
+`,
+		},
+		{
+			name: "empty key",
+			input: map[string]*discovery.DiscoveryResponse{
+				"": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`empty key`)},
+					},
+				},
+			},
+			expected: `{
+  "": "empty key"
+}
+`,
+		},
+		{
+			name: "empty value",
+			input: map[string]*discovery.DiscoveryResponse{
+				"empty": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`{}`)},
+					},
+				},
+			},
+			expected: `{
+  "empty": {}
+}
+`,
+		},
+		{
+			name: "the value is nil",
+			input: map[string]*discovery.DiscoveryResponse{
+				"nilValue": {
+					Resources: []*anypb.Any{
+						{Value: nil},
+					},
+				},
+			},
+			expected: `{
+  "nilValue": ""
+}
+`,
+		},
+		{
+			name: "special characters",
+			input: map[string]*discovery.DiscoveryResponse{
+				"special": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`"Hello \"World\"!"`)},
+					},
+				},
+			},
+			expected: `{
+  "special": "Hello \"World\"!"
+}
+`,
+		},
+		{
+			name: "binary data",
+			input: map[string]*discovery.DiscoveryResponse{
+				"binary": {
+					Resources: []*anypb.Any{
+						{Value: []byte{0x00, 0x01, 0x02}},
+					},
+				},
+			},
+			expected: `{
+  "binary": "\u0000\u0001\u0002"
+}
+`,
+		},
+		{
+			name: "valid nested structures",
+			input: map[string]*discovery.DiscoveryResponse{
+				"nested": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`{"user": {"name": "Bob", "tags": ["dev", "ops"]}}`)},
+					},
+				},
+			},
+			expected: `{
+  "nested": {
+    "user": {
+      "name": "Bob",
+      "tags": [
+        "dev",
+        "ops"
+      ]
+    }
+  }
+}
+`,
+		},
+		{
+			name: "invalid nested structures, missing a \" at the end",
+			input: map[string]*discovery.DiscoveryResponse{
+				"nested": {
+					Resources: []*anypb.Any{
+						{Value: []byte(`{"user": {"name": "Bob", "tags": ["dev", "ops]}}`)},
+					},
+				},
+			},
+			expected: `{
+  "nested": "{\"user\": {\"name\": \"Bob\", \"tags\": [\"dev\", \"ops]}}"
+}
+`,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			dw := &DebugWriter{
+				Writer:                 &buf,
+				InternalDebugAllIstiod: true,
+			}
+
+			if err := dw.PrintAll(tt.input); err != nil {
+				t.Fatalf("PrintAll() returned error: %v", err)
+			}
+			got := buf.String()
+			if got != tt.expected {
+				t.Errorf("Output mismatch.\nWant:\n%s\nGot:\n%s", tt.expected, got)
+			}
 		})
 	}
 }

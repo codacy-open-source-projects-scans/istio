@@ -39,6 +39,8 @@ type informer[I controllers.ComparableObject] struct {
 	eventHandlers *handlers[I]
 	augmentation  func(a any) any
 	synced        chan struct{}
+	baseSyncer    Syncer
+	metadata      Metadata
 }
 
 // nolint: unused // (not true, its to implement an interface)
@@ -51,6 +53,7 @@ func (i *informer[I]) augment(a any) any {
 
 var _ internalCollection[controllers.Object] = &informer[controllers.Object]{}
 
+// nolint: unused // (not true, its to implement an interface)
 func (i *informer[I]) _internalHandler() {}
 
 func (i *informer[I]) Synced() Syncer {
@@ -60,10 +63,19 @@ func (i *informer[I]) Synced() Syncer {
 	}
 }
 
+func (i *informer[I]) HasSynced() bool {
+	return i.baseSyncer.HasSynced()
+}
+
+func (i *informer[I]) WaitUntilSynced(stop <-chan struct{}) bool {
+	return i.baseSyncer.WaitUntilSynced(stop)
+}
+
 // nolint: unused // (not true, its to implement an interface)
 func (i *informer[I]) dump() CollectionDump {
 	return CollectionDump{
 		Outputs: eraseMap(slices.GroupUnique(i.inf.List(metav1.NamespaceAll, klabels.Everything()), getTypedKey)),
+		Synced:  i.HasSynced(),
 	}
 }
 
@@ -93,30 +105,63 @@ func (i *informer[I]) GetKey(k string) *I {
 	return nil
 }
 
-func (i *informer[I]) Register(f func(o Event[I])) Syncer {
+func (i *informer[I]) Metadata() Metadata {
+	return i.metadata
+}
+
+func (i *informer[I]) Register(f func(o Event[I])) HandlerRegistration {
 	return registerHandlerAsBatched[I](i, f)
 }
 
-func (i *informer[I]) RegisterBatch(f func(o []Event[I], initialSync bool), runExistingState bool) Syncer {
+func (i *informer[I]) RegisterBatch(f func(o []Event[I]), runExistingState bool) HandlerRegistration {
 	// Note: runExistingState is NOT respected here.
 	// Informer doesn't expose a way to do that. However, due to the runtime model of informers, this isn't a dealbreaker;
 	// the handlers are all called async, so we don't end up with the same deadlocks we would have in the other collection types.
 	// While this is quite kludgy, this is an internal interface so its not too bad.
 	synced := i.inf.AddEventHandler(informerEventHandler[I](func(o Event[I], initialSync bool) {
-		f([]Event[I]{o}, initialSync)
+		f([]Event[I]{o})
 	}))
-	base := i.Synced()
+	base := i.baseSyncer
 	handler := pollSyncer{
 		name: fmt.Sprintf("%v handler", i.name()),
 		f:    synced.HasSynced,
 	}
-	return multiSyncer{syncers: []Syncer{base, handler}}
+	sync := multiSyncer{syncers: []Syncer{base, handler}}
+	return informerHandlerRegistration{
+		Syncer: sync,
+		remove: func() {
+			i.inf.ShutdownHandler(synced)
+		},
+	}
+}
+
+type informerHandlerRegistration struct {
+	Syncer
+	remove func()
+}
+
+func (i informerHandlerRegistration) UnregisterHandler() {
+	i.remove()
 }
 
 // nolint: unused // (not true)
-func (i *informer[I]) index(extract func(o I) []string) kclient.RawIndexer {
-	idx := i.inf.Index(extract)
-	return idx
+type informerIndex[I any] struct {
+	idx kclient.RawIndexer
+}
+
+// nolint: unused // (not true)
+func (ii *informerIndex[I]) Lookup(key string) []I {
+	return slices.Map(ii.idx.Lookup(key), func(i any) I {
+		return i.(I)
+	})
+}
+
+// nolint: unused // (not true)
+func (i *informer[I]) index(name string, extract func(o I) []string) indexer[I] {
+	idx := i.inf.Index(name, extract)
+	return &informerIndex[I]{
+		idx: idx,
+	}
 }
 
 func informerEventHandler[I controllers.ComparableObject](handler func(o Event[I], initialSync bool)) cache.ResourceEventHandler {
@@ -161,6 +206,14 @@ func WrapClient[I controllers.ComparableObject](c kclient.Informer[I], opts ...C
 		eventHandlers:  &handlers[I]{},
 		augmentation:   o.augmentation,
 		synced:         make(chan struct{}),
+	}
+	h.baseSyncer = channelSyncer{
+		name:   h.collectionName,
+		synced: h.synced,
+	}
+
+	if o.metadata != nil {
+		h.metadata = o.metadata
 	}
 
 	go func() {

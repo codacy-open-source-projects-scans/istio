@@ -29,12 +29,13 @@ import (
 	"istio.io/istio/pilot/pkg/server"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pkg/cluster"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/tests/util/leak"
 )
 
 const (
@@ -42,8 +43,10 @@ const (
 	DomainSuffix        = "fake_domain"
 )
 
-func newMockserviceController() *aggregate.Controller {
-	return aggregate.NewController(aggregate.Options{})
+func newMockserviceController(configCluster cluster.ID) *aggregate.Controller {
+	return aggregate.NewController(aggregate.Options{
+		ConfigClusterID: configCluster,
+	})
 }
 
 func createMultiClusterSecret(k8s kube.Client, sname, cname string) error {
@@ -81,7 +84,7 @@ func verifyControllers(t *testing.T, m *Multicluster, expectedControllerCount in
 }
 
 func initController(client kube.CLIClient, ns string, stop <-chan struct{}) *multicluster.Controller {
-	sc := multicluster.NewController(client, ns, "cluster-1", mesh.NewFixedWatcher(nil))
+	sc := multicluster.NewController(client, ns, "cluster-1", meshwatcher.NewTestWatcher(nil))
 	sc.ClientBuilder = func(kubeConfig []byte, c cluster.ID, configOverrides ...func(*rest.Config)) (kube.Client, error) {
 		return kube.NewFakeClient(), nil
 	}
@@ -90,17 +93,20 @@ func initController(client kube.CLIClient, ns string, stop <-chan struct{}) *mul
 }
 
 func Test_KubeSecretController(t *testing.T) {
-	mockserviceController := newMockserviceController()
+	clusterID := cluster.ID("cluster-1")
+	mockserviceController := newMockserviceController(clusterID)
 	clientset := kube.NewFakeClient()
 	stop := test.NewStop(t)
 	s := server.New()
 	mcc := initController(clientset, testSecretNameSpace, stop)
-	mc := NewMulticluster("pilot-abc-123", clientset.Kube(), testSecretNameSpace, Options{
-		ClusterID:             "cluster-1",
-		DomainSuffix:          DomainSuffix,
-		MeshWatcher:           mesh.NewFixedWatcher(&meshconfig.MeshConfig{}),
+	mc := NewMulticluster("pilot-abc-123", Options{
+		ClusterID:    clusterID,
+		DomainSuffix: DomainSuffix,
+		MeshWatcher:  meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{}),
+		// Added to better simulate a real environment and keep the goroutine leak test honest
+		MeshNetworksWatcher:   meshwatcher.NewFixedNetworksWatcher(nil),
 		MeshServiceController: mockserviceController,
-	}, nil, nil, nil, "default", false, nil, s, mcc)
+	}, nil, nil, "default", false, nil, s, mcc)
 	assert.NoError(t, mcc.Run(stop))
 	go mockserviceController.Run(stop)
 	clientset.RunAndWait(stop)
@@ -108,42 +114,60 @@ func Test_KubeSecretController(t *testing.T) {
 	_ = s.Start(stop)
 
 	verifyControllers(t, mc, 1, "create local controller")
+	t.Run("multicluster secret added", func(t *testing.T) {
+		// Verify that we only leaked the expected number of goroutines.
+		// 1. MeshNetworks event handler for the remote cluster
+		// 2. MeshConfig event handler for the remote cluster
+		// Unfortunately, the test versions of these singletons
+		// use static collections which don't have the same event
+		// handler semantics as the production code. So just spawn
+		// two goroutines to simulate the leak.
+		stop = test.NewStop(t)
+		leak.Check(t, leak.WithAllowedLeaks(2))
+		// TODO: Remove if we ever make static collections concurrent
+		go func() {
+			<-stop
+		}()
+		go func() {
+			<-stop
+		}()
+		// Create the multicluster secret. Sleep to allow created remote
+		// controller to start and callback add function to be called.
+		err := createMultiClusterSecret(clientset, "test-secret-1", "test-remote-cluster-1")
+		if err != nil {
+			t.Fatalf("Unexpected error on secret create: %v", err)
+		}
 
-	// Create the multicluster secret. Sleep to allow created remote
-	// controller to start and callback add function to be called.
-	err := createMultiClusterSecret(clientset, "test-secret-1", "test-remote-cluster-1")
-	if err != nil {
-		t.Fatalf("Unexpected error on secret create: %v", err)
-	}
+		// Test - Verify that the remote controller has been added.
+		verifyControllers(t, mc, 2, "create remote controller")
 
-	// Test - Verify that the remote controller has been added.
-	verifyControllers(t, mc, 2, "create remote controller")
+		// Delete the mulicluster secret.
+		err = deleteMultiClusterSecret(clientset, "test-secret-1")
+		if err != nil {
+			t.Fatalf("Unexpected error on secret delete: %v", err)
+		}
 
-	// Delete the mulicluster secret.
-	err = deleteMultiClusterSecret(clientset, "test-secret-1")
-	if err != nil {
-		t.Fatalf("Unexpected error on secret delete: %v", err)
-	}
-
-	// Test - Verify that the remote controller has been removed.
-	verifyControllers(t, mc, 1, "delete remote controller")
+		// Test - Verify that the remote controller has been removed.
+		verifyControllers(t, mc, 1, "delete remote controller")
+	})
 }
 
 func Test_KubeSecretController_ExternalIstiod_MultipleClusters(t *testing.T) {
 	test.SetForTest(t, &features.ExternalIstiod, true)
 	test.SetForTest(t, &features.InjectionWebhookConfigName, "")
-	mockserviceController := newMockserviceController()
+	clusterID := cluster.ID("cluster-1")
+	mockserviceController := newMockserviceController(clusterID)
 	clientset := kube.NewFakeClient()
 	stop := test.NewStop(t)
 	s := server.New()
 	certWatcher := keycertbundle.NewWatcher()
 	mcc := initController(clientset, testSecretNameSpace, stop)
-	mc := NewMulticluster("pilot-abc-123", clientset.Kube(), testSecretNameSpace, Options{
-		ClusterID:             "cluster-1",
+	mc := NewMulticluster("pilot-abc-123", Options{
+		ClusterID:             clusterID,
 		DomainSuffix:          DomainSuffix,
-		MeshWatcher:           mesh.NewFixedWatcher(&meshconfig.MeshConfig{}),
+		MeshWatcher:           meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{}),
 		MeshServiceController: mockserviceController,
-	}, nil, nil, certWatcher, "default", false, nil, s, mcc)
+	}, nil, certWatcher, "default", false, nil, s, mcc)
 	assert.NoError(t, mcc.Run(stop))
 	go mockserviceController.Run(stop)
 	clientset.RunAndWait(stop)

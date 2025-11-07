@@ -36,6 +36,7 @@ import (
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -95,34 +96,39 @@ func (n *informerClient[T]) Start(stopCh <-chan struct{}) {
 type internalIndex struct {
 	key     string
 	indexer cache.Indexer
+	filter  func(t any) bool
 }
 
-func (i internalIndex) Lookup(key string) []interface{} {
+func (i internalIndex) Lookup(key string) []any {
 	res, err := i.indexer.ByIndex(i.key, key)
 	if err != nil {
 		// This should only happen if the index key (i.key, not key) does not exist which should be impossible.
 		log.Fatalf("index lookup failed: %v", err)
+	}
+	if i.filter != nil {
+		return slices.FilterInPlace(res, i.filter)
 	}
 	return res
 }
 
 var _ RawIndexer = internalIndex{}
 
-func (n *informerClient[T]) Index(extract func(o T) []string) RawIndexer {
-	// We just need some unique key, any will do
-	key := fmt.Sprintf("%p", extract)
-	if err := n.informer.AddIndexers(map[string]cache.IndexFunc{
-		key: func(obj interface{}) ([]string, error) {
-			t := controllers.Extract[T](obj)
-			return extract(t), nil
-		},
-	}); err != nil {
-		// Should only happen on key conflict or on stop
-		log.Warnf("failed to add indexer: %v", err)
+func (n *informerClient[T]) Index(name string, extract func(o T) []string) RawIndexer {
+	if _, ok := n.informer.GetIndexer().GetIndexers()[name]; !ok {
+		if err := n.informer.AddIndexers(map[string]cache.IndexFunc{
+			name: func(obj any) ([]string, error) {
+				t := controllers.Extract[T](obj)
+				return extract(t), nil
+			},
+		}); err != nil {
+			// Should only happen on key conflict or on stop
+			log.Warnf("failed to add indexer: %v", err)
+		}
 	}
 	ret := internalIndex{
-		key:     key,
+		key:     name,
 		indexer: n.informer.GetIndexer(),
+		filter:  n.filter,
 	}
 	return ret
 }
@@ -174,6 +180,16 @@ func (n *informerClient[T]) ShutdownHandlers() {
 	for _, c := range n.registeredHandlers {
 		_ = n.informer.RemoveEventHandler(c.registration)
 	}
+	n.registeredHandlers = nil
+}
+
+func (n *informerClient[T]) ShutdownHandler(registration cache.ResourceEventHandlerRegistration) {
+	n.handlerMu.Lock()
+	defer n.handlerMu.Unlock()
+	n.registeredHandlers = slices.FilterInPlace(n.registeredHandlers, func(h handlerRegistration) bool {
+		return h.registration != registration
+	})
+	_ = n.informer.RemoveEventHandler(registration)
 }
 
 type neverReady struct{}
@@ -279,6 +295,22 @@ func NewFiltered[T controllers.ComparableObject](c kube.Client, filter Filter) C
 	return &fullClient[T]{
 		writeClient: writeClient[T]{client: c},
 		Informer:    newInformerClient[T](gvr, inf, filter),
+	}
+}
+
+// NewFilteredDelayed returns a "delayed" client for the given GVR that is writeable.
+// It is the caller's responsibility to not write to the client if the type is not available; the "Delay" is not impacting
+// the write flow. The reason for this is typically the writes are for status, which is in response to the object existing,
+// which implies the GVR exists.
+func NewFilteredDelayed[T controllers.ComparableObject](
+	c kube.Client,
+	gvr schema.GroupVersionResource,
+	filter Filter,
+) Client[T] {
+	inf := NewDelayedInformer[T](c, gvr, kubetypes.StandardInformer, filter)
+	return &fullClient[T]{
+		writeClient: writeClient[T]{client: c},
+		Informer:    inf,
 	}
 }
 

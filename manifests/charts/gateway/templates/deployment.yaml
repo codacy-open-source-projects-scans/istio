@@ -11,8 +11,8 @@ metadata:
     {{- .Values.annotations | toYaml | nindent 4 }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
-  {{- with .Values.replicaCount }}
-  replicas: {{ . }}
+  {{- if and (hasKey .Values "replicaCount") (ne .Values.replicaCount nil) }}
+  replicas: {{ .Values.replicaCount }}
   {{- end }}
   {{- end }}
   {{- with .Values.strategy }}
@@ -41,6 +41,9 @@ spec:
         {{ $key | quote }}: {{ $val | quote }}
         {{- end }}
         {{- end }}
+        {{- with .Values.networkGateway }}
+        topology.istio.io/network: "{{.}}"
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -60,6 +63,10 @@ spec:
       volumes:
         {{ toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: istio-proxy
           # "auto" will be populated at runtime by the mutating webhook. See https://istio.io/latest/docs/setup/additional-setup/sidecar-injection/#customizing-injection
@@ -77,7 +84,7 @@ spec:
             allowPrivilegeEscalation: false
             privileged: false
             readOnlyRootFilesystem: true
-            {{- if not (eq .Values.platform "openshift") }}
+            {{- if not (eq (.Values.platform | default "") "openshift") }}
             runAsUser: 1337
             runAsGroup: 1337
             {{- end }}
@@ -91,6 +98,9 @@ spec:
           {{- range $key, $val := .Values.env }}
           - name: {{ $key }}
             value: {{ $val | quote }}
+          {{- end }}
+          {{- with .Values.envVarFrom }}
+          {{- toYaml . | nindent 10 }}
           {{- end }}
           ports:
           - containerPort: 15090
@@ -106,6 +116,13 @@ spec:
           readinessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.additionalContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

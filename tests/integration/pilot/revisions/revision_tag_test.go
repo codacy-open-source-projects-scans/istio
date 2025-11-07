@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -109,7 +108,7 @@ func TestRevisionTags(t *testing.T) {
 						t.Fatalf("invalid namespace label %s", tc.nsLabel)
 					}
 					if err := revTagNs.SetLabel(nsLabelParts[0], nsLabelParts[1]); err != nil {
-						t.Fatalf("couldn't set label %q on namespace %s: %w",
+						t.Fatalf("couldn't set label %q on namespace %s: %v",
 							tc.nsLabel, revTagNs.Name(), err)
 					}
 

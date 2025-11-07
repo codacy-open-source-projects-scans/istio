@@ -27,9 +27,11 @@ import (
 	"istio.io/istio/pkg/activenotifier"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/namespace"
 	"istio.io/istio/pkg/queue"
 	"istio.io/istio/pkg/test"
@@ -44,7 +46,7 @@ type FakeControllerOptions struct {
 	Client            kubelib.Client
 	CRDs              []schema.GroupVersionResource
 	NetworksWatcher   mesh.NetworksWatcher
-	MeshWatcher       mesh.Watcher
+	MeshWatcher       meshwatcher.WatcherCollection
 	ServiceHandler    model.ServiceHandler
 	ClusterID         cluster.ID
 	WatchedNamespaces string
@@ -77,8 +79,11 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 	if opts.Client == nil {
 		opts.Client = kubelib.NewFakeClient()
 	}
+	if opts.ClusterID == "" {
+		opts.ClusterID = opts.Client.ClusterID()
+	}
 	if opts.MeshWatcher == nil {
-		opts.MeshWatcher = mesh.NewFixedWatcher(&meshconfig.MeshConfig{TrustDomain: "cluster.local"})
+		opts.MeshWatcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "cluster.local"})
 	}
 	cleanupStop := false
 	stop := opts.Stop
@@ -94,7 +99,14 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 	)
 	kubelib.SetObjectFilter(opts.Client, f)
 
-	meshServiceController := aggregate.NewController(aggregate.Options{MeshHolder: opts.MeshWatcher})
+	var configCluster cluster.ID
+	if opts.ConfigCluster {
+		configCluster = opts.ClusterID
+	}
+	meshServiceController := aggregate.NewController(aggregate.Options{
+		MeshHolder:      opts.MeshWatcher,
+		ConfigClusterID: configCluster,
+	})
 
 	options := Options{
 		DomainSuffix:          domainSuffix,
@@ -107,6 +119,7 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 		ConfigCluster:         opts.ConfigCluster,
 		SystemNamespace:       opts.SystemNamespace,
 		StatusWritingEnabled:  activenotifier.New(false),
+		KrtDebugger:           new(krt.DebugHandler),
 	}
 	c := NewController(opts.Client, options)
 	meshServiceController.AddRegistry(c)

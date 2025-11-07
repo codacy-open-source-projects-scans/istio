@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/go-multierror"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	mcs "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
+	"istio.io/api/annotation"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config"
@@ -103,16 +105,21 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 		esc.updateEndpointSlice(ep)
 	}
 
-	hostnames := esc.c.hostNamesForNamespacedName(namespacedName)
-	// Trigger EDS push for all hostnames.
-	esc.pushEDS(hostnames, namespacedName.Namespace)
-
 	// Now check if we need to do a full push for the service.
 	// If the service is headless, we need to do a full push if service exposes TCP ports
 	// to create IP based listeners. For pure HTTP headless services, we only need to push NDS.
 	name := serviceNameForEndpointSlice(esLabels)
 	namespace := ep.GetNamespace()
 	svc := esc.c.services.Get(name, namespace)
+	if svc != nil && !serviceNeedsPush(svc) {
+		return
+	}
+
+	hostnames := esc.c.hostNamesForNamespacedName(namespacedName)
+	log.Debugf("triggering EDS push for %s in namespace %s", hostnames, namespacedName.Namespace)
+	// Trigger EDS push for all hostnames.
+	esc.pushEDS(hostnames, namespacedName.Namespace)
+
 	if svc == nil || svc.Spec.ClusterIP != corev1.ClusterIPNone || svc.Spec.Type == corev1.ServiceTypeExternalName {
 		return
 	}
@@ -120,11 +127,6 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 	configsUpdated := sets.New[model.ConfigKey]()
 	supportsOnlyHTTP := true
 	for _, modelSvc := range esc.c.servicesForNamespacedName(config.NamespacedName(svc)) {
-		// skip push if it is not exported
-		if modelSvc.Attributes.ExportTo.Contains(visibility.None) {
-			continue
-		}
-
 		for _, p := range modelSvc.Ports {
 			if !p.Protocol.IsHTTP() {
 				supportsOnlyHTTP = false
@@ -141,15 +143,25 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 	}
 
 	if len(configsUpdated) > 0 {
-		// For headless services, trigger a full push to regenerate listeners per endpoint.
-		// Otherwise we only need to push NDS, but still need to set Full as true but we skip
-		// all other xDS except NDS during the push.
 		esc.c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
 			Full:           true,
 			ConfigsUpdated: configsUpdated,
 			Reason:         model.NewReasonStats(model.HeadlessEndpointUpdate),
 		})
 	}
+}
+
+func serviceNeedsPush(svc *corev1.Service) bool {
+	if svc.Annotations[annotation.NetworkingExportTo.Name] != "" {
+		namespaces := strings.Split(svc.Annotations[annotation.NetworkingExportTo.Name], ",")
+		for _, ns := range namespaces {
+			ns = strings.TrimSpace(ns)
+			if ns == string(visibility.None) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // GetProxyServiceTargets returns service instances co-located with a given proxy
@@ -232,10 +244,17 @@ func endpointHealthStatus(svc *model.Service, e v1.Endpoint) model.HealthStatus 
 		return model.Healthy
 	}
 
+	// An endpoint is draining only if it was previously ready (serving == true) and persistent sessions is enabled
 	if svc != nil && svc.SupportsDrainingEndpoints() &&
 		(e.Conditions.Serving == nil || *e.Conditions.Serving) &&
 		(e.Conditions.Terminating == nil || *e.Conditions.Terminating) {
 		return model.Draining
+	}
+
+	// If it is shutting down, mark it as terminating. This occurs regardless of whether it was previously healthy or not.
+	if svc != nil &&
+		(e.Conditions.Terminating == nil || *e.Conditions.Terminating) {
+		return model.Terminating
 	}
 
 	return model.UnHealthy
@@ -268,7 +287,7 @@ func (esc *endpointSliceController) updateEndpointCacheForSlice(hostName host.Na
 
 			var overrideAddresses []string
 			// If not expect a pod, it means this is not an endpointslice not managed by kubernetes.
-			// We donot add all pod ips to the istio endpoint.
+			// We do not add all pod ips to the istio endpoint.
 			if features.EnableDualStack && expectedPod && svcCore != nil && len(pod.Status.PodIPs) > 1 && len(svcCore.Spec.ClusterIPs) > 1 {
 				if epSlice.AddressType == v1.AddressTypeIPv6 {
 					// For endpointslice with targetRef and the pod has dual stack ip.
@@ -293,7 +312,7 @@ func (esc *endpointSliceController) updateEndpointCacheForSlice(hostName host.Na
 					portName = *port.Name
 				}
 
-				istioEndpoint := builder.buildIstioEndpoint(a, portNum, portName, discoverabilityPolicy, healthStatus)
+				istioEndpoint := builder.buildIstioEndpoint(a, portNum, portName, discoverabilityPolicy, healthStatus, svc.SupportsUnhealthyEndpoints())
 				if len(overrideAddresses) > 1 {
 					istioEndpoint.Addresses = overrideAddresses
 				}

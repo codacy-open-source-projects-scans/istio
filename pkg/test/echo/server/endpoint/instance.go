@@ -35,6 +35,7 @@ type Config struct {
 	Cluster       string
 	TLSCert       string
 	TLSKey        string
+	TLSCACert     string
 	UDSServer     string
 	Dialer        common.Dialer
 	Port          *common.Port
@@ -58,6 +59,8 @@ func New(cfg Config) (Instance, error) {
 		switch cfg.Port.Protocol {
 		case protocol.HBONE:
 			return newHBONE(cfg), nil
+		case protocol.DoubleHBONE:
+			return newDoubleHBONE(cfg), nil
 		case protocol.HTTP, protocol.HTTPS:
 			return newHTTP(cfg), nil
 		case protocol.HTTP2, protocol.GRPC:

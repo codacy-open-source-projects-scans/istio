@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/kube/krt"
@@ -33,6 +34,7 @@ import (
 type serviceEDS struct {
 	ServiceKey       string
 	WaypointInstance []*workloadapi.Workload
+	UseWaypoint      bool
 }
 
 func (w serviceEDS) ResourceName() string {
@@ -48,16 +50,22 @@ func (w serviceEDS) ResourceName() string {
 func RegisterEdsShim(
 	xdsUpdater model.XDSUpdater,
 	Workloads krt.Collection[model.WorkloadInfo],
+	Namespaces krt.Collection[model.NamespaceInfo],
 	WorkloadsByServiceKey krt.Index[string, model.WorkloadInfo],
 	Services krt.Collection[model.ServiceInfo],
 	ServicesByAddress krt.Index[networkAddress, model.ServiceInfo],
-	opts KrtOptions,
+	opts krt.OptionsBuilder,
 ) {
+	// Helps us avoid race conditions in tests.
+	// Also, this flag shouldn't change once initialized, so this
+	// has slightly better cache locality.
+	multiNetworkEnabled := features.EnableAmbientMultiNetwork
 	ServiceEds := krt.NewCollection(
 		Services,
 		func(ctx krt.HandlerContext, svc model.ServiceInfo) *serviceEDS {
-			if !svc.Waypoint.IngressUseWaypoint {
-				// Currently, we only need this for ingres -> waypoint usage
+			useWaypoint := ingressUseWaypoint(svc, krt.FetchOne(ctx, Namespaces, krt.FilterKey(svc.Service.Namespace)))
+			if !useWaypoint && (!multiNetworkEnabled || svc.Scope != model.Global) {
+				// Currently, we only need this for ingress/east west gateway -> waypoint usage
 				// If we extend this to sidecars, etc we can drop this.
 				return nil
 			}
@@ -86,7 +94,8 @@ func RegisterEdsShim(
 			}
 			workloads := krt.Fetch(ctx, Workloads, krt.FilterIndex(WorkloadsByServiceKey, waypointServiceKey))
 			return &serviceEDS{
-				ServiceKey: svc.ResourceName(),
+				ServiceKey:  svc.ResourceName(),
+				UseWaypoint: useWaypoint,
 				WaypointInstance: slices.Map(workloads, func(e model.WorkloadInfo) *workloadapi.Workload {
 					return e.Workload
 				}),
@@ -110,8 +119,10 @@ func (a *index) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
 	}
 	for _, s := range svcs {
 		wp := s.Service.GetWaypoint()
+		useWaypoint := ingressUseWaypoint(s, a.namespaces.GetKey(s.Service.Namespace))
 		wi := model.ServiceWaypointInfo{
-			Service: s.Service,
+			Service:            s.Service,
+			IngressUseWaypoint: useWaypoint,
 		}
 		if wp == nil {
 			continue
@@ -132,9 +143,19 @@ func (a *index) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
 				// No waypoint found.
 				continue
 			}
-			wi.WaypointHostname = waypoints[0].Hostname
+			wi.WaypointHostname = waypoints[0].Service.Hostname
 		}
 		res = append(res, wi)
 	}
 	return res
+}
+
+func ingressUseWaypoint(s model.ServiceInfo, ns *model.NamespaceInfo) bool {
+	if s.Waypoint.IngressLabelPresent {
+		return s.Waypoint.IngressUseWaypoint
+	}
+	if ns != nil {
+		return ns.IngressUseWaypoint
+	}
+	return false
 }

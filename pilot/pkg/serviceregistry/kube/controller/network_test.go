@@ -32,7 +32,7 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
@@ -46,7 +46,7 @@ import (
 
 func TestNetworkUpdateTriggers(t *testing.T) {
 	test.SetForTest(t, &features.MultiNetworkGatewayAPI, true)
-	meshNetworks := mesh.NewFixedNetworksWatcher(nil)
+	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
 	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
 		ClusterID:       constants.DefaultClusterName,
 		NetworksWatcher: meshNetworks,
@@ -168,14 +168,14 @@ func addOrUpdateGatewayResource(t *testing.T, c *FakeController, customPort int)
 		},
 		Spec: v1beta1.GatewaySpec{
 			GatewayClassName: "istio",
-			Addresses: []v1beta1.GatewayAddress{
+			Addresses: []v1beta1.GatewaySpecAddress{
 				{Type: &ipType, Value: "1.2.3.4"},
 				{Type: &hostnameType, Value: "some hostname"},
 			},
 			Listeners: []v1beta1.Listener{
 				{
 					Name: "detected-by-options",
-					TLS: &v1beta1.GatewayTLSConfig{
+					TLS: &v1beta1.ListenerTLSConfig{
 						Mode: &passthroughMode,
 						Options: map[v1beta1.AnnotationKey]v1beta1.AnnotationValue{
 							constants.ListenerModeOption: constants.ListenerModeAutoPassthrough,
@@ -185,7 +185,7 @@ func addOrUpdateGatewayResource(t *testing.T, c *FakeController, customPort int)
 				},
 				{
 					Name: "detected-by-number",
-					TLS:  &v1beta1.GatewayTLSConfig{Mode: &passthroughMode},
+					TLS:  &v1beta1.ListenerTLSConfig{Mode: &passthroughMode},
 					Port: 15443,
 				},
 			},
@@ -198,7 +198,7 @@ func removeGatewayResource(t *testing.T, c *FakeController) {
 	clienttest.Wrap(t, kclient.New[*v1beta1.Gateway](c.client)).Delete("eastwest-gwapi", "istio-system")
 }
 
-func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher mesh.NetworksWatcher) {
+func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher meshwatcher.TestNetworksWatcher) {
 	clienttest.Wrap(t, c.services).Create(&corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "istio-meshnetworks-gw", Namespace: "istio-system"},
 		Spec: corev1.ServiceSpec{
@@ -257,9 +257,11 @@ func TestAmbientSystemNamespaceNetworkChange(t *testing.T) {
 	testNS := "test"
 	systemNS := "istio-system"
 
+	networksWatcher := meshwatcher.NewFixedNetworksWatcher(nil)
 	s, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{
 		SystemNamespace: systemNS,
-		NetworksWatcher: mesh.NewFixedNetworksWatcher(nil),
+		NetworksWatcher: networksWatcher,
+		ConfigCluster:   true,
 	})
 
 	tracker := assert.NewTracker[string](t)
@@ -350,7 +352,7 @@ func TestAmbientSystemNamespaceNetworkChange(t *testing.T) {
 		})
 		createOrUpdateNamespace(t, s, systemNS, "nw3")
 		tracker.WaitOrdered(systemNS)
-		addMeshNetworksFromRegistryGateway(t, s, s.meshNetworksWatcher)
+		addMeshNetworksFromRegistryGateway(t, s, networksWatcher)
 		expectNetwork(t, s, "nw3")
 	})
 }
@@ -361,25 +363,12 @@ func TestAmbientSync(t *testing.T) {
 	stop := test.NewStop(t)
 	s, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
 		SystemNamespace: systemNS,
-		NetworksWatcher: mesh.NewFixedNetworksWatcher(nil),
+		NetworksWatcher: meshwatcher.NewFixedNetworksWatcher(nil),
 		SkipRun:         true,
 		CRDs:            []schema.GroupVersionResource{gvr.KubernetesGateway},
 		ConfigCluster:   true,
 	})
-	done := make(chan struct{})
-	// We want to test that ambient is not marked synced until the Kube controller is synced, since it depends on it for network
-	// information.
-	// To simulate this, we intentionally slow down the syncing process (which is hard to make slow with the fake client).
-	s.queue.Push(func() error {
-		time.Sleep(time.Millisecond * 20)
-		close(done)
-		return nil
-	})
 	go s.Run(stop)
-	// We should start as not synced
-	assert.Equal(t, s.ambientIndex.HasSynced(), false)
-	<-done
-	// Once the queue is done, eventually we should sync.
 	assert.EventuallyEqual(t, s.ambientIndex.HasSynced, true)
 
 	gtw := clienttest.NewWriter[*v1beta1.Gateway](t, s.client)
@@ -397,7 +386,7 @@ func TestAmbientSync(t *testing.T) {
 		},
 		Spec: v1beta1.GatewaySpec{
 			GatewayClassName: "istio-remote",
-			Addresses: []v1beta1.GatewayAddress{
+			Addresses: []v1beta1.GatewaySpecAddress{
 				{
 					Type:  ptr.Of(v1beta1.IPAddressType),
 					Value: "172.18.1.45",
@@ -408,12 +397,20 @@ func TestAmbientSync(t *testing.T) {
 					Name:     "cross-network",
 					Port:     15008,
 					Protocol: v1beta1.ProtocolType("HBONE"),
-					TLS: &v1beta1.GatewayTLSConfig{
+					TLS: &v1beta1.ListenerTLSConfig{
 						Mode: ptr.Of(v1beta1.TLSModeType("Passthrough")),
 						Options: map[v1beta1.AnnotationKey]v1beta1.AnnotationValue{
 							"gateway.istio.io/listener-protocol": "auto-passthrough",
 						},
 					},
+				},
+			},
+		},
+		Status: v1beta1.GatewayStatus{
+			Addresses: []k8sv1.GatewayStatusAddress{
+				{
+					Type:  ptr.Of(v1beta1.IPAddressType),
+					Value: "172.18.1.45",
 				},
 			},
 		},

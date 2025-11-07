@@ -21,10 +21,9 @@ import (
 	"io"
 	"reflect"
 
-	"github.com/hashicorp/go-multierror"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubeyaml "k8s.io/apimachinery/pkg/util/yaml"
-	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collections"
@@ -39,17 +38,6 @@ func FromJSON(s resource.Schema, js string) (config.Spec, error) {
 		return nil, err
 	}
 	if err = config.ApplyJSON(c, js); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func FromJSONStrict(s resource.Schema, js string) (config.Spec, error) {
-	c, err := s.NewInstance()
-	if err != nil {
-		return nil, err
-	}
-	if err = config.ApplyJSONStrict(c, js); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -72,33 +60,6 @@ func StatusJSONFromMap(schema resource.Schema, jsonMap *json.RawMessage) (config
 		return nil, err
 	}
 	return status, nil
-}
-
-// FromYAML converts a canonical YAML to a proto message
-func FromYAML(s resource.Schema, yml string) (config.Spec, error) {
-	c, err := s.NewInstance()
-	if err != nil {
-		return nil, err
-	}
-	if err = config.ApplyYAML(c, yml); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-// FromJSONMap converts from a generic map to a proto message using canonical JSON encoding
-// JSON encoding is specified here: https://developers.google.com/protocol-buffers/docs/proto3#json
-func FromJSONMap(s resource.Schema, data any) (config.Spec, error) {
-	// Marshal to YAML bytes
-	str, err := yaml.Marshal(data)
-	if err != nil {
-		return nil, err
-	}
-	out, err := FromYAML(s, string(str))
-	if err != nil {
-		return nil, multierror.Prefix(err, fmt.Sprintf("YAML decoding error: %v", string(str)))
-	}
-	return out, nil
 }
 
 type ConversionFunc = func(s resource.Schema, js string) (config.Spec, error)
@@ -158,7 +119,13 @@ func ConvertConfig(cfg config.Config) (IstioObject, error) {
 	}
 	namespace := cfg.Namespace
 	if namespace == "" {
-		namespace = metav1.NamespaceDefault
+		clusterScoped := false
+		if s, ok := collections.All.FindByGroupVersionAliasesKind(cfg.GroupVersionKind); ok {
+			clusterScoped = s.IsClusterScoped()
+		}
+		if !clusterScoped {
+			namespace = metav1.NamespaceDefault
+		}
 	}
 	return &IstioKind{
 		TypeMeta: metav1.TypeMeta{
@@ -172,6 +139,8 @@ func ConvertConfig(cfg config.Config) (IstioObject, error) {
 			Labels:            cfg.Labels,
 			Annotations:       cfg.Annotations,
 			CreationTimestamp: metav1.NewTime(cfg.CreationTimestamp),
+			UID:               types.UID(cfg.UID),
+			Generation:        cfg.Generation,
 		},
 		Spec:   spec,
 		Status: status,

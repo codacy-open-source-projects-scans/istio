@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package bootstrap
 
 import (
@@ -34,6 +35,7 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/compressor/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/resource_monitors/downstream_connections/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/google/go-cmp/cmp"
@@ -43,9 +45,9 @@ import (
 
 	"istio.io/api/annotation"
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/bootstrap/platform"
+	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/util/protomarshal"
@@ -78,21 +80,20 @@ var (
 // REFRESH_GOLDEN=true go test ./pkg/bootstrap/...
 func TestGolden(t *testing.T) {
 	cases := []struct {
-		base                          string
-		envVars                       map[string]string
-		annotations                   map[string]string
-		sdsUDSPath                    string
-		sdsTokenPath                  string
-		expectLightstepAccessToken    bool
-		stats                         stats
-		checkLocality                 bool
-		stsPort                       int
-		platformMeta                  map[string]string
-		setup                         func()
-		teardown                      func()
-		check                         func(got *bootstrap.Bootstrap, t *testing.T)
-		compliancePolicy              string
-		enableDefferedClusterCreation bool
+		base                       string
+		envVars                    map[string]string
+		annotations                map[string]string
+		sdsUDSPath                 string
+		sdsTokenPath               string
+		expectLightstepAccessToken bool
+		stats                      stats
+		checkLocality              bool
+		stsPort                    int
+		platformMeta               map[string]string
+		setup                      func()
+		teardown                   func()
+		check                      func(got *bootstrap.Bootstrap, t *testing.T)
+		compliancePolicy           string
 	}{
 		{
 			base: "xdsproxy",
@@ -109,13 +110,13 @@ func TestGolden(t *testing.T) {
 			base: "default",
 		},
 		{
-			base: "explicit_internal_address",
+			base: "ambient",
+			envVars: map[string]string{
+				"ISTIO_META_ENABLE_HBONE": "true", // This is our indication that this proxy is in an ambient installation
+			},
 		},
 		{
-			base: "legacy_stats_tags_regex",
-			envVars: map[string]string{
-				"ENABLE_DELIMITED_STATS_TAG_REGEX": "false",
-			},
+			base: "explicit_internal_address",
 		},
 		{
 			base: "running",
@@ -167,18 +168,11 @@ func TestGolden(t *testing.T) {
 			base: "metrics_no_statsd",
 		},
 		{
-			base: "tracing_opencensusagent",
-		},
-		{
 			base: "tracing_none",
 		},
 		{
 			// Specify zipkin/statsd address, similar with the default config in v1 tests
 			base: "all",
-		},
-		{
-			base:                          "deferred_cluster_creation",
-			enableDefferedClusterCreation: true,
 		},
 		{
 			base: "stats_inclusion",
@@ -232,13 +226,37 @@ func TestGolden(t *testing.T) {
 				"sidecar.istio.io/statsCompression": "unknown",
 			},
 		},
+		{
+			base: "stats_flush_interval",
+			annotations: map[string]string{
+				"sidecar.istio.io/statsFlushInterval": "10s",
+			},
+		},
+		{
+			base: "stats_eviction_interval",
+			annotations: map[string]string{
+				"sidecar.istio.io/statsEvictionInterval": "10s",
+			},
+		},
+		{
+			base: "invalid_stats_eviction_interval",
+			annotations: map[string]string{
+				"sidecar.istio.io/statsEvictionInterval": "11s",
+			},
+		},
+		{
+			base: "stats_interval",
+			annotations: map[string]string{
+				"sidecar.istio.io/statsFlushInterval":    "10s",
+				"sidecar.istio.io/statsEvictionInterval": "20s",
+			},
+		},
 	}
 
 	test.SetForTest(t, &version.Info.Version, "binary-1.0")
 
 	for _, c := range cases {
 		t.Run("Bootstrap-"+c.base, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableDeferredClusterCreation, c.enableDefferedClusterCreation)
 			out := t.TempDir()
 			if c.setup != nil {
 				c.setup()
@@ -280,10 +298,11 @@ func TestGolden(t *testing.T) {
 				PilotSubjectAltName: []string{
 					"spiffe://cluster.local/ns/istio-system/sa/istio-pilot-service-account",
 				},
-				OutlierLogPath:      "/dev/stdout",
-				annotationFilePath:  annoFile.Name(),
-				EnvoyPrometheusPort: 15090,
-				EnvoyStatusPort:     15021,
+				OutlierLogPath:             "/dev/stdout",
+				annotationFilePath:         annoFile.Name(),
+				EnvoyPrometheusPort:        15090,
+				EnvoyStatusPort:            15021,
+				WorkloadIdentitySocketFile: "test.sock",
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -349,7 +368,7 @@ func TestGolden(t *testing.T) {
 				t.Fatalf("invalid generated file %s: %v", c.base, err)
 			}
 
-			checkStatsMatcher(t, realM, goldenM, c.stats)
+			checkStatsMatcher(t, realM, goldenM, c.stats, node.Metadata)
 			checkStatsTags(t, goldenM)
 
 			if c.check != nil {
@@ -596,11 +615,14 @@ func checkClusterNameTag(t *testing.T, regex string) {
 	}
 }
 
-func checkStatsMatcher(t *testing.T, got, want *bootstrap.Bootstrap, stats stats) {
+func checkStatsMatcher(t *testing.T, got, want *bootstrap.Bootstrap, stats stats, meta *model.BootstrapNodeMetadata) {
 	gsm := got.GetStatsConfig().GetStatsMatcher()
-
+	variablePrefixes := ""
+	if meta.EnableHBONE {
+		variablePrefixes = "workload_discovery,"
+	}
 	if stats.prefixes == "" {
-		stats.prefixes = v2Prefixes + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
+		stats.prefixes = v2Prefixes + variablePrefixes + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	} else {
 		stats.prefixes = v2Prefixes + stats.prefixes + "," + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	}

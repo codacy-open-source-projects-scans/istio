@@ -29,7 +29,8 @@ var (
 	FilterGatewayClusterConfig = env.Register("PILOT_FILTER_GATEWAY_CLUSTER_CONFIG", false,
 		"If enabled, Pilot will send only clusters that referenced in gateway virtual services attached to gateway").Get()
 
-	SendUnhealthyEndpoints = atomic.NewBool(env.Register(
+	// GlobalSendUnhealthyEndpoints contains the raw setting on GlobalSendUnhealthyEndpoints. This should be checked per-service
+	GlobalSendUnhealthyEndpoints = atomic.NewBool(env.Register(
 		"PILOT_SEND_UNHEALTHY_ENDPOINTS",
 		false,
 		"If enabled, Pilot will include unhealthy endpoints in EDS pushes and even if they are sent Envoy does not use them for load balancing."+
@@ -133,6 +134,9 @@ var (
 		"If this is set to true, support for Kubernetes gateway-api (github.com/kubernetes-sigs/gateway-api) will "+
 			" be enabled. In addition to this being enabled, the gateway-api CRDs need to be installed.").Get()
 
+	EnableGatewayAPICopyLabelsAnnotations = env.Register("PILOT_ENABLE_GATEWAY_API_COPY_LABELS_ANNOTATIONS", true,
+		"If this is set to false, istiod will not copy any attributes from the Gateway resource onto its related Deployment resources.").Get()
+
 	EnableAlphaGatewayAPIName = "PILOT_ENABLE_ALPHA_GATEWAY_API"
 	EnableAlphaGatewayAPI     = env.Register(EnableAlphaGatewayAPIName, false,
 		"If this is set to true, support for alpha APIs in the Kubernetes gateway-api (github.com/kubernetes-sigs/gateway-api) will "+
@@ -174,26 +178,12 @@ var (
 	EnableDualStack = env.RegisterBoolVar("ISTIO_DUAL_STACK", false,
 		"If true, Istio will enable the Dual Stack feature.").Get()
 
-	// This is used in injection templates, it is not unused.
-	EnableNativeSidecars = env.Register("ENABLE_NATIVE_SIDECARS", false,
-		"If set, used Kubernetes native Sidecar container support. Requires SidecarContainer feature flag.")
-
 	Enable100ContinueHeaders = env.Register("ENABLE_100_CONTINUE_HEADERS", true,
 		"If enabled, istiod will proxy 100-continue headers as is").Get()
-
-	EnableDeferredClusterCreation = env.Register("ENABLE_DEFERRED_CLUSTER_CREATION", true,
-		"If enabled, Istio will create clusters only when there are requests. This will save memory and CPU cycles"+
-			" in cases where there are lots of inactive clusters and > 1 worker thread").Get()
-
-	EnableDeferredStatsCreation = env.Register("ENABLE_DEFERRED_STATS_CREATION", true,
-		"If enabled, Istio will lazily initialize a subset of the stats").Get()
 
 	EnableLocalityWeightedLbConfig = env.Register("ENABLE_LOCALITY_WEIGHTED_LB_CONFIG", false,
 		"If enabled, always set LocalityWeightedLbConfig for a cluster, "+
 			" otherwise only apply it when locality lb is specified by DestinationRule for a service").Get()
-
-	BypassOverloadManagerForStaticListeners = env.Register("BYPASS_OVERLOAD_MANAGER_FOR_STATIC_LISTENERS", true,
-		"If enabled, overload manager will not be applied to static listeners").Get()
 
 	EnableEnhancedDestinationRuleMerge = env.Register("ENABLE_ENHANCED_DESTINATIONRULE_MERGE", true,
 		"If enabled, Istio merge destinationrules considering their exportTo fields,"+
@@ -201,4 +191,21 @@ var (
 
 	UnifiedSidecarScoping = env.Register("PILOT_UNIFIED_SIDECAR_SCOPE", true,
 		"If true, unified SidecarScope creation will be used. This is only intended as a temporary feature flag for backwards compatibility.").Get()
+
+	CACertConfigMapName = env.Register("PILOT_CA_CERT_CONFIGMAP", "istio-ca-root-cert",
+		"The name of the ConfigMap that stores the Root CA Certificate that is used by istiod").Get()
+
+	CRLConfigMapName = env.Register("PILOT_CRL_CONFIGMAP", "istio-ca-crl",
+		"The name of the ConfigMap that stores the Certificate Revocation List (CRL) for a plugged-in CA").Get()
+
+	EnvoyStatusPortEnableProxyProtocol = env.Register("ENVOY_STATUS_PORT_ENABLE_PROXY_PROTOCOL", false,
+		"If enabled, Envoy will support requests with proxy protocol on its status port").Get()
+
+	EnableGatewayAPIInferenceExtension = env.Register("ENABLE_GATEWAY_API_INFERENCE_EXTENSION", false,
+		"If true, support gateway inference extension routing apis").Get()
+
+	EnableWildcardHostServiceEntriesForTLS = env.Register("ENABLE_WILDCARD_HOST_SERVICE_ENTRIES_FOR_TLS", false,
+		"If enabled, ServiceEntries with wildcard hosts and dynamic dns resolution will be allowed for TLS traffic. "+
+			"This is a security risk, susceptible to SNI spoofing, and should be used with caution. "+
+			"Only consider using this feature if the client is trusted and you understand the risks.").Get()
 )

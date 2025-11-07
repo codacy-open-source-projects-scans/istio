@@ -36,8 +36,9 @@ import (
 
 // Various locks used throughout the code
 const (
-	NamespaceController     = "istio-namespace-controller-election"
-	ServiceExportController = "istio-serviceexport-controller-election"
+	NamespaceController          = "istio-namespace-controller-election"
+	ClusterTrustBundleController = "istio-clustertrustbundle-controller-election"
+	ServiceExportController      = "istio-serviceexport-controller-election"
 	// This holds the legacy name to not conflict with older control plane deployments which are just
 	// doing the ingress syncing.
 	IngressController = "istio-leader"
@@ -55,6 +56,7 @@ const (
 	// * This type is per-revision, so it is higher cost. Leases are cheaper
 	// * Other types use "prioritized leader election", which isn't implemented for Lease
 	GatewayDeploymentController = "istio-gateway-deployment"
+	InferencePoolController     = "istio-gateway-inferencepool"
 	NodeUntaintController       = "istio-node-untaint"
 	IPAutoallocateController    = "istio-ip-autoallocate"
 )
@@ -162,14 +164,19 @@ func (l *LeaderElection) create() (*k8sleaderelection.LeaderElector, error) {
 			Key:      key,
 		},
 	}
-	if l.perRevision {
+	if l.perRevision || l.useLeaseLock {
+		leaseKey := key
+		if l.perRevision {
+			// Per revision does not need takeover
+			// See below, where we disable KeyComparison as well
+			leaseKey = ""
+		}
 		lock = &k8sresourcelock.LeaseLock{
 			LeaseMeta: metav1.ObjectMeta{Namespace: l.namespace, Name: l.electionID},
 			Client:    l.client.CoordinationV1(),
-			// Note: Key is NOT used. This is not implemented in the library for Lease nor needed, since this is already per-revision.
-			// See below, where we disable KeyComparison
 			LockConfig: k8sresourcelock.ResourceLockConfig{
 				Identity: l.name,
+				Key:      leaseKey,
 			},
 		}
 	}
@@ -187,10 +194,7 @@ func (l *LeaderElection) create() (*k8sleaderelection.LeaderElector, error) {
 	}
 	if !l.perRevision {
 		// Function to use to decide whether this leader should steal the existing lock.
-		// This is disable when perRevision is used, as this enables the Lease. Lease doesn't have a holderKey field to place our key
-		// as holderKey is an Istio specific fork.
-		// While its possible to make it work with Lease as well (via an annotation to store it), we don't ever need prioritized
-		// for these per-revision ones anyways, since the prioritization is about preferring one revision over others.
+		// For perRevision, we don't ever need prioritized, since the prioritization is about preferring one revision over others.
 		config.KeyComparison = func(leaderKey string) bool {
 			return LocationPrioritizedComparison(leaderKey, l)
 		}

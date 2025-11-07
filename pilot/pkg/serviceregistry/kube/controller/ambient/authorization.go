@@ -25,6 +25,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi/security"
@@ -245,6 +246,7 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 
 	action := security.Action_DENY
 	var rules []*security.Rules
+	var groups []*security.Group
 
 	if mode == v1beta1.PeerAuthentication_MutualTLS_STRICT {
 		rules = append(rules, &security.Rules{
@@ -265,18 +267,37 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 	// Note that this doesn't actually attach the policy to any workload; it just makes it available
 	// to ztunnel in case a workload needs it.
 	foundNonStrictPortmTLS := false
-	for port, mtls := range pa.PortLevelMtls {
+	for port, mtls := range maps.SeqStable(pa.PortLevelMtls) {
 		switch portMtlsMode := mtls.GetMode(); {
 		case portMtlsMode == v1beta1.PeerAuthentication_MutualTLS_STRICT:
-			rules = append(rules, &security.Rules{
-				Matches: []*security.Match{
+			// If either:
+			// 1. The workload-level policy is STRICT
+			// 2. The workload level policy is nil/unset and the namespace-level policy is STRICT
+			// 3. The workload level policy is nil/unset and the namespace-level policy is nil/unset and the mesh-level policy is STRICT
+			// then we don't need to add a rule for this STRICT port since it will be enforced by the parent policy
+			if isMtlsModeStrict(pa.GetMtls()) || // #1
+				(isMtlsModeUnset(pa.GetMtls()) && // First condition for #2 and #3
+					(nsCfg != nil && isMtlsModeStrict(nsCfg.Spec.Mtls)) || // #2
+					// #3
+					((nsCfg == nil || isMtlsModeUnset(nsCfg.Spec.Mtls)) && rootCfg != nil && isMtlsModeStrict(rootCfg.Spec.Mtls))) {
+				log.Debugf("skipping port %d/%s for PeerAuthentication %s/%s for ambient since the parent mTLS mode is %s",
+					port, portMtlsMode, cfg.Namespace, cfg.Name, mode)
+				continue
+			}
+			// Groups are OR'd so we need to create one for each STRICT workload port
+			groups = append(groups, &security.Group{
+				Rules: []*security.Rules{
 					{
-						NotPrincipals: []*security.StringMatch{
+						Matches: []*security.Match{
 							{
-								MatchType: &security.StringMatch_Presence{},
+								NotPrincipals: []*security.StringMatch{
+									{
+										MatchType: &security.StringMatch_Presence{},
+									},
+								},
+								DestinationPorts: []uint32{port},
 							},
 						},
-						DestinationPorts: []uint32{port},
 					},
 				},
 			})
@@ -284,7 +305,7 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 			// Check top-level mode
 			if mode == v1beta1.PeerAuthentication_MutualTLS_PERMISSIVE || mode == v1beta1.PeerAuthentication_MutualTLS_DISABLE {
 				// we don't care; log and continue
-				log.Debugf("skipping port %s/%s for PeerAuthentication %s/%s for ambient since the parent mTLS mode is %s",
+				log.Debugf("skipping port %d/%s for PeerAuthentication %s/%s for ambient since the parent mTLS mode is %s",
 					port, portMtlsMode, cfg.Namespace, cfg.Name, mode)
 				continue
 			}
@@ -293,7 +314,7 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 				(nsCfg == nil && rootCfg != nil && !isMtlsModeStrict(rootCfg.Spec.Mtls)) ||
 				(nsCfg == nil && rootCfg == nil)) {
 				// we don't care; log and continue
-				log.Debugf("skipping port %s/%s for PeerAuthentication %s/%s for ambient since it's not STRICT and the effective policy is not STRICT",
+				log.Debugf("skipping port %d/%s for PeerAuthentication %s/%s for ambient since it's not STRICT and the effective policy is not STRICT",
 					port, portMtlsMode, cfg.Namespace, cfg.Name)
 				continue
 			}
@@ -309,7 +330,7 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 				},
 			})
 		default:
-			log.Debugf("skipping port %s for PeerAuthentication %s/%s for ambient since it is %s", port, cfg.Namespace, cfg.Name, portMtlsMode)
+			log.Debugf("skipping port %d for PeerAuthentication %s/%s for ambient since it is %s", port, cfg.Namespace, cfg.Name, portMtlsMode)
 			continue
 		}
 	}
@@ -319,21 +340,9 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 		return nil
 	}
 
-	if len(rules) == 0 {
-		// we never added any rules; return
+	if len(rules) == 0 && len(groups) == 0 {
+		// we never added any rules or groups; return
 		return nil
-	}
-
-	opol := &security.Authorization{
-		Name: model.GetAmbientPolicyConfigName(model.ConfigKey{
-			Name:      cfg.Name,
-			Kind:      kind.PeerAuthentication,
-			Namespace: cfg.Namespace,
-		}),
-		Namespace: cfg.Namespace,
-		Scope:     scope,
-		Action:    action,
-		Groups:    []*security.Group{{Rules: rules}},
 	}
 
 	// We only need to merge if the effective policy is STRICT, the workload policy's mode is unstrict, and we have a non-strict port level policy
@@ -346,9 +355,10 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 	}
 
 	// If the effective policy (namespace or mesh) is STRICT and we have a non-strict port level policy,
-	// we need to merge that strictness into the workload policy so that the static strict policy
+	// we need to merge that strictness into the workload policy so that the static strict policy can be elided
+	// from the workload's policy list.
 	if shouldMergeStrict && foundNonStrictPortmTLS {
-		opol.Groups[0].Rules = append(opol.Groups[0].Rules, &security.Rules{
+		rules = append(rules, &security.Rules{
 			Matches: []*security.Match{
 				{
 					NotPrincipals: []*security.StringMatch{
@@ -359,6 +369,24 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 				},
 			},
 		})
+	}
+
+	if len(rules) > 0 {
+		groups = append(groups, &security.Group{
+			Rules: rules,
+		})
+	}
+
+	opol := &security.Authorization{
+		Name: model.GetAmbientPolicyConfigName(model.ConfigKey{
+			Name:      cfg.Name,
+			Kind:      kind.PeerAuthentication,
+			Namespace: cfg.Namespace,
+		}),
+		Namespace: cfg.Namespace,
+		Scope:     scope,
+		Action:    action,
+		Groups:    groups,
 	}
 
 	return opol
@@ -405,7 +433,7 @@ func convertAuthorizationPolicy(rootns string, obj *securityclient.Authorization
 	rulesWithL7 := sets.New[string]()
 
 	for _, rule := range pol.Rules {
-		rules, foundL7 := handleRule(action, rule)
+		rules, foundL7 := handleRule(action, rule, obj.Namespace)
 		if rules != nil {
 			rg := &security.Group{
 				Rules: rules,
@@ -480,7 +508,7 @@ func httpSources(s *v1beta1.Source) []string {
 	return foundUnsupportedSources
 }
 
-func handleRule(action security.Action, rule *v1beta1.Rule) ([]*security.Rules, []string) {
+func handleRule(action security.Action, rule *v1beta1.Rule, ruleNamespace string) ([]*security.Rules, []string) {
 	l7RuleFound := false
 	httpMatch := sets.New[string]()
 	toMatches := []*security.Match{}
@@ -506,12 +534,14 @@ func handleRule(action security.Action, rule *v1beta1.Rule) ([]*security.Rules, 
 			httpMatch.InsertAll(problems...)
 		}
 		match := &security.Match{
-			SourceIps:     stringToIP(op.IpBlocks),
-			NotSourceIps:  stringToIP(op.NotIpBlocks),
-			Namespaces:    stringToMatch(op.Namespaces),
-			NotNamespaces: stringToMatch(op.NotNamespaces),
-			Principals:    stringToMatch(op.Principals),
-			NotPrincipals: stringToMatch(op.NotPrincipals),
+			SourceIps:          stringToIP(op.IpBlocks),
+			NotSourceIps:       stringToIP(op.NotIpBlocks),
+			Namespaces:         stringToMatch(op.Namespaces),
+			NotNamespaces:      stringToMatch(op.NotNamespaces),
+			ServiceAccounts:    stringToServiceAccountMatch(op.ServiceAccounts, ruleNamespace),
+			NotServiceAccounts: stringToServiceAccountMatch(op.NotServiceAccounts, ruleNamespace),
+			Principals:         stringToMatch(op.Principals),
+			NotPrincipals:      stringToMatch(op.NotPrincipals),
 		}
 		fromMatches = append(fromMatches, match)
 	}
@@ -592,6 +622,25 @@ func stringToMatch(rules []string) []*security.StringMatch {
 			}}
 		}
 		res = append(res, sm)
+	}
+	return res
+}
+
+func stringToServiceAccountMatch(rules []string, ruleNamespace string) []*security.ServiceAccountMatch {
+	res := make([]*security.ServiceAccountMatch, 0, len(rules))
+	for _, v := range rules {
+		ns, sa, ok := strings.Cut(v, "/")
+		if ok {
+			res = append(res, &security.ServiceAccountMatch{
+				Namespace:      ns,
+				ServiceAccount: sa,
+			})
+		} else {
+			res = append(res, &security.ServiceAccountMatch{
+				Namespace:      ruleNamespace,
+				ServiceAccount: v,
+			})
+		}
 	}
 	return res
 }

@@ -32,7 +32,6 @@ import (
 	"istio.io/api/envoy/extensions/stats"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	tpb "istio.io/api/telemetry/v1alpha1"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config/schema/gvk"
@@ -93,6 +92,7 @@ type loggingKey struct {
 	telemetryKey
 	Class    networking.ListenerClass
 	Protocol networking.ListenerProtocol
+	Version  string
 }
 
 // metricsKey defines a key into the computedMetricsFilters cache.
@@ -129,11 +129,9 @@ func getTelemetries(env *Environment) *Telemetries {
 }
 
 type metricsConfig struct {
-	ClientMetrics            metricConfig
-	ServerMetrics            metricConfig
-	ReportingInterval        *durationpb.Duration
-	RotationInterval         *durationpb.Duration
-	GracefulDeletionInterval *durationpb.Duration
+	ClientMetrics     metricConfig
+	ServerMetrics     metricConfig
+	ReportingInterval *durationpb.Duration
 }
 
 type metricConfig struct {
@@ -248,6 +246,7 @@ func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class netwo
 	key := loggingKey{
 		telemetryKey: ct.telemetryKey,
 		Class:        class,
+		Version:      proxy.GetIstioVersion(),
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -278,6 +277,11 @@ func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class netwo
 		cfg.AccessLog = al
 		cfgs = append(cfgs, cfg)
 	}
+
+	// Sort the access logs by provider name for deterministic ordering
+	sort.Slice(cfgs, func(i, j int) bool {
+		return cfgs[i].Provider.Name < cfgs[j].Provider.Name
+	})
 
 	t.computedLoggingConfig[key] = cfgs
 	return cfgs
@@ -446,7 +450,7 @@ func (t *Telemetries) applicableTelemetries(proxy *Proxy, svc *Service) computed
 		Tracing:      ts,
 	}
 
-	matcher := PolicyMatcherForProxy(proxy).WithService(svc)
+	matcher := PolicyMatcherForProxy(proxy).WithService(svc).WithRootNamespace(t.RootNamespace)
 	for _, telemetry := range t.NamespaceToTelemetries[namespace] {
 		spec := telemetry.Spec
 		// Namespace wide policy; already handled above
@@ -525,9 +529,6 @@ func (t *Telemetries) telemetryFilters(proxy *Proxy, class networking.ListenerCl
 		allKeys.Insert(k)
 	}
 
-	rotationInterval := getInterval(features.MetricRotationInterval, defaultMetricRotationInterval)
-	gracefulDeletionInterval := getInterval(features.MetricGracefulDeletionInterval, defaultMetricGracefulDeletionInterval)
-
 	m := make([]telemetryFilterConfig, 0, allKeys.Len())
 	for _, k := range sets.SortedList(allKeys) {
 		p := t.fetchProvider(k)
@@ -536,9 +537,6 @@ func (t *Telemetries) telemetryFilters(proxy *Proxy, class networking.ListenerCl
 		}
 		loggingCfg, logging := tml[k]
 		mertricCfg, metrics := tmm[k]
-
-		mertricCfg.RotationInterval = rotationInterval
-		mertricCfg.GracefulDeletionInterval = gracefulDeletionInterval
 
 		cfg := telemetryFilterConfig{
 			Provider:      p,
@@ -564,13 +562,6 @@ func (t *Telemetries) telemetryFilters(proxy *Proxy, class networking.ListenerCl
 	t.computedMetricsFilters[key] = res
 	return res
 }
-
-// default value for metric rotation interval and graceful deletion interval,
-// more details can be found in here: https://github.com/istio/proxy/blob/master/source/extensions/filters/http/istio_stats/config.proto#L116
-var (
-	defaultMetricRotationInterval         = 0 * time.Second
-	defaultMetricGracefulDeletionInterval = 5 * time.Minute
-)
 
 // getInterval return nil to reduce the size of the config, when equal to the default.
 func getInterval(input, defaultValue time.Duration) *durationpb.Duration {
@@ -915,7 +906,7 @@ func getMatches(match *tpb.MetricSelector) []string {
 // telemetryFilterHandled contains the number of providers we handle below.
 // This is to ensure this stays in sync as new handlers are added
 // STOP. DO NOT UPDATE THIS WITHOUT UPDATING buildHTTPTelemetryFilter and buildTCPTelemetryFilter.
-const telemetryFilterHandled = 14
+const telemetryFilterHandled = 15
 
 func buildHTTPTelemetryFilter(class networking.ListenerClass, metricsCfg []telemetryFilterConfig) []*hcm.HttpFilter {
 	res := make([]*hcm.HttpFilter, 0, len(metricsCfg))
@@ -985,8 +976,6 @@ func generateStatsConfig(class networking.ListenerClass, filterConfig telemetryF
 	cfg := stats.PluginConfig{
 		DisableHostHeaderFallback: disableHostHeaderFallback(class),
 		TcpReportingDuration:      filterConfig.ReportingInterval,
-		RotationInterval:          filterConfig.RotationInterval,
-		GracefulDeletionInterval:  filterConfig.GracefulDeletionInterval,
 	}
 	if isWaypoint {
 		cfg.Reporter = stats.Reporter_SERVER_GATEWAY

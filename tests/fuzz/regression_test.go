@@ -137,8 +137,6 @@ func TestFuzzers(t *testing.T) {
 		{"FuzzHostMatcher", FuzzHostMatcher},
 		{"FuzzMetadataListMatcher", FuzzMetadataListMatcher},
 		{"FuzzGrpcGenGenerate", FuzzGrpcGenGenerate},
-		{"FuzzConvertIngressVirtualService", FuzzConvertIngressVirtualService},
-		{"FuzzConvertIngressV1alpha3", FuzzConvertIngressV1alpha3},
 		{"FuzzAggregateController", FuzzAggregateController},
 		{"FuzzKubeCRD", FuzzKubeCRD},
 		{"FuzzWE", FuzzWE},
@@ -153,7 +151,7 @@ func TestFuzzers(t *testing.T) {
 	}
 	for _, tt := range cases {
 		if testedFuzzers.InsertContains(tt.name) {
-			t.Fatalf("dupliate fuzzer test %v", tt.name)
+			t.Fatalf("duplicate fuzzer test %v", tt.name)
 		}
 		t.Run(tt.name, func(t *testing.T) {
 			runRegressionTest(t, tt.name, tt.fuzzer)

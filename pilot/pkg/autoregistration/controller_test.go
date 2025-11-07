@@ -41,6 +41,7 @@ import (
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/keepalive"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/test"
@@ -429,7 +430,7 @@ func TestWorkloadEntryFromGroup(t *testing.T) {
 		},
 	}
 	proxy := fakeProxy("10.0.0.1", group, "nw1", "sa")
-	proxy.Labels[model.LocalityLabel] = "rgn2/zone2/subzone2"
+	proxy.Labels[pm.LocalityLabel] = "rgn2/zone2/subzone2"
 	proxy.XdsNode = fakeNode("rgn2", "zone2", "subzone2")
 
 	wantLabels := map[string]string{
@@ -755,7 +756,7 @@ func checkEntry(
 	cfg := store.Get(gvk.WorkloadEntry, name, wg.Namespace)
 	if cfg == nil {
 		err = multierror.Append(fmt.Errorf("expected WorkloadEntry %s/%s to exist", wg.Namespace, name))
-		return
+		return err
 	}
 	tmpl := wg.Spec.(*v1alpha3.WorkloadGroup)
 	we := cfg.Spec.(*v1alpha3.WorkloadEntry)
@@ -816,7 +817,7 @@ func checkEntry(
 			err = multierror.Append(err, fmt.Errorf("labels missing on WorkloadEntry: %s=%s from proxy meta", k, v))
 		}
 	}
-	return
+	return err
 }
 
 func checkEntryOrFail(
@@ -884,7 +885,7 @@ func checkEntryHealth(store model.ConfigStoreController, proxy *model.Proxy, hea
 	cfg := store.Get(gvk.WorkloadEntry, name, proxy.Metadata.Namespace)
 	if cfg == nil || cfg.Status == nil {
 		err = multierror.Append(fmt.Errorf("expected workloadEntry %s/%s to exist", name, proxy.Metadata.Namespace))
-		return
+		return err
 	}
 	stat := cfg.Status.(*v1alpha1.IstioStatus)
 	found := false
@@ -909,7 +910,7 @@ func checkEntryHealth(store model.ConfigStoreController, proxy *model.Proxy, hea
 				name, proxy.Metadata.Namespace))
 		}
 	}
-	return
+	return err
 }
 
 func checkHealthOrFail(t test.Failer, store model.ConfigStoreController, proxy *model.Proxy, healthy bool) {

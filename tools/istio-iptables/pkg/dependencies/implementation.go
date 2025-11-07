@@ -59,6 +59,8 @@ type RealDependencies struct {
 	// context (the node, an agent container) into a pod to do iptables stuff,
 	// as it's faster and reduces contention for legacy iptables versions that use file-based locking.
 	UsePodScopedXtablesLock bool
+
+	ForceIptablesBinary string
 }
 
 const iptablesVersionPattern = `v([0-9]+(\.[0-9]+)+)`
@@ -103,15 +105,18 @@ func (v IptablesVersion) IsWriteCmd(cmd constants.IptablesCmd) bool {
 // Constants for iptables commands
 // These should not be used directly/assumed to be present, but should be contextually detected
 const (
-	iptablesBin         = "iptables"
-	iptablesNftBin      = "iptables-nft"
-	iptablesLegacyBin   = "iptables-legacy"
-	ip6tablesBin        = "ip6tables"
-	ip6tablesNftBin     = "ip6tables-nft"
-	ip6tablesLegacyBin  = "ip6tables-legacy"
-	iptablesRestoreBin  = "iptables-restore"
-	ip6tablesRestoreBin = "ip6tables-restore"
+	iptablesBin        = "iptables"
+	iptablesNftBin     = "iptables-nft"
+	iptablesLegacyBin  = "iptables-legacy"
+	ip6tablesBin       = "ip6tables"
+	ip6tablesNftBin    = "ip6tables-nft"
+	ip6tablesLegacyBin = "ip6tables-legacy"
+	legacy             = "legacy"
+	nft                = "nft"
 )
+
+// adding this function redirect to enable unit testing for DetectIptablesVersion
+var shouldUseBinaryForContext = shouldUseBinaryForCurrentContext
 
 // It is not sufficient to check for the presence of one binary or the other in $PATH -
 // we must choose a binary that is
@@ -128,11 +133,10 @@ const (
 // We are using our local binaries to update host rules, and we must pick the right match.
 //
 // Basic selection logic is as follows:
-// 1. see if we have `nft` binary set in our $PATH
-// 2. see if we have existing rules in `nft` in our netns
-// 3. If so, use `nft` binary set
-// 4. Otherwise, see if we have `legacy` binary set, and use that.
-// 5. Otherwise, see if we have `iptables` binary set, and use that (detecting whether it's nft or legacy).
+// 1. Check if we have `iptables-legacy` binary in our $PATH and if it has any existing rules in the netns
+// 2. If so, use `legacy` binary immediately
+// 3. Otherwise, check if we have `iptables-nft` binary in our $PATH and if so, use `nft` binary set
+// 4. Otherwise, see if we have `iptables` binary set, and use that.
 func (r *RealDependencies) DetectIptablesVersion(ipV6 bool) (IptablesVersion, error) {
 	// Begin detecting
 	//
@@ -148,33 +152,61 @@ func (r *RealDependencies) DetectIptablesVersion(ipV6 bool) (IptablesVersion, er
 		plainBin = iptablesBin
 	}
 
+	// the user has specifically chosen an iptables
+	// version so use that binary or fail
+	if r.ForceIptablesBinary != "" {
+		switch r.ForceIptablesBinary {
+		case legacy:
+			legVer, err := shouldUseBinaryForContext(legacyBin)
+			if err != nil {
+				log.Errorf("did not find iptables binary, error was %v: %+v", err, legVer)
+				return IptablesVersion{}, err
+			}
+			return legVer, nil
+		case nft:
+			nftVer, err := shouldUseBinaryForContext(nftBin)
+			if err != nil {
+				log.Errorf("did not find iptables binary, error was %v: %+v", err, nftVer)
+				return IptablesVersion{}, err
+			}
+			return nftVer, nil
+		default:
+			log.Errorf("iptables binary unsupported: %s, supported values are 'legacy' or 'nft'", r.ForceIptablesBinary)
+			return IptablesVersion{}, fmt.Errorf("iptables binary %q unsupported", r.ForceIptablesBinary)
+		}
+	}
+
 	// 1. What binaries we have
 	// 2. What binary we should use, based on existing rules defined in our current context.
-	// does the nft binary set exist, and are nft rules present?
-	nftVer, err := shouldUseBinaryForCurrentContext(nftBin)
-	if err == nil && nftVer.ExistingRules {
-		// if so, immediately use it.
-		return nftVer, nil
-	}
-	// not critical, may find another.
-	log.Debugf("did not find (or cannot use) iptables binary, error was %w: %+v", err, nftVer)
-
-	// Check again
+	//
 	// does the legacy binary set exist, and are legacy rules present?
-	legVer, err := shouldUseBinaryForCurrentContext(legacyBin)
+	legVer, err := shouldUseBinaryForContext(legacyBin)
 	if err == nil && legVer.ExistingRules {
 		// if so, immediately use it
 		return legVer, nil
 	}
 	// not critical, may find another.
-	log.Debugf("did not find (or cannot use) iptables binary, error was %w: %+v", err, legVer)
+	log.Debugf("did not find (or cannot use) iptables binary, error was %v: %+v", err, legVer)
+
+	// Check again
+	// does the nft binary set exist and seem usable?
+	// (at this point we don't need to check for existing rules,
+	// since we know legacy doesn't have any, and `nft` is usable, prefer `nft`)
+	nftVer, err := shouldUseBinaryForContext(nftBin)
+	if err == nil {
+		// if so, immediately use it.
+		return nftVer, nil
+	}
+	// not critical, may find another.
+	log.Debugf("did not find (or cannot use) iptables binary, error was %v: %+v", err, nftVer)
 
 	// regular non-suffixed binary set is our last resort.
 	//
-	// If it's there, and rules do not already exist for a specific variant,
-	// we should use the default non-suffixed binary.
-	// If it's NOT there, just propagate the error, we can't do anything, no iptables here
-	return shouldUseBinaryForCurrentContext(plainBin)
+	// If the aliased/non-suffixed binary is available and appears to work where the others did not,
+	// just use it. In practice this should *never* happen, as the non-suffixed binary is invariably
+	// softlinked to one or the other binary.
+	// Either way, this is our last option, so just propagate the error if it fails, we can't do anything either way.
+	return shouldUseBinaryForContext(plainBin)
 }
 
 // TODO BML verify this won't choke on "-save" binaries having slightly diff. version string prefixes
@@ -222,32 +254,11 @@ func transformToXTablesErrorMessage(stderr string, err error) string {
 // Run runs a command
 func (r *RealDependencies) Run(
 	logger *log.Scope,
-	cmd constants.IptablesCmd,
-	iptVer *IptablesVersion,
-	stdin io.ReadSeeker,
-	args ...string,
-) error {
-	return r.executeXTables(logger, cmd, iptVer, false, stdin, args...)
-}
-
-// Run runs a command and returns stdout
-func (r *RealDependencies) RunWithOutput(
-	logger *log.Scope,
+	quietLogging bool,
 	cmd constants.IptablesCmd,
 	iptVer *IptablesVersion,
 	stdin io.ReadSeeker,
 	args ...string,
 ) (*bytes.Buffer, error) {
-	return r.executeXTablesWithOutput(logger, cmd, iptVer, false, stdin, args...)
-}
-
-// RunQuietlyAndIgnore runs a command quietly and ignores errors
-func (r *RealDependencies) RunQuietlyAndIgnore(
-	logger *log.Scope,
-	cmd constants.IptablesCmd,
-	iptVer *IptablesVersion,
-	stdin io.ReadSeeker,
-	args ...string,
-) {
-	_ = r.executeXTables(logger, cmd, iptVer, true, stdin, args...)
+	return r.executeXTables(logger, cmd, iptVer, quietLogging, stdin, args...)
 }

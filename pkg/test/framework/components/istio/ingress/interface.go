@@ -46,6 +46,9 @@ type Instance interface {
 	// DiscoveryAddresses returns the external XDS (15012) address on the ingress gateway (or the NodePort address,
 	// when in an environment that doesn't support LoadBalancer).
 	DiscoveryAddresses() []netip.AddrPort
+	// HTTPAddresses returns the external HBONE (15008) address of the ingress gateway ((or the NodePort address,
+	// when in an environment that doesn't support LoadBalancer).
+	HBONEAddresses() ([]string, []int)
 	// AddressesForPort returns the external address of the ingress gateway (or the NodePort address,
 	// when in an environment that doesn't support LoadBalancer) for the given port.
 	AddressesForPort(port int) ([]string, []int)
@@ -56,6 +59,9 @@ type Instance interface {
 
 	// Cluster the ingress is deployed to
 	Cluster() cluster.Cluster
+
+	// ServiceName of the ingress
+	ServiceName() string
 
 	// Namespace of the ingress
 	Namespace() string

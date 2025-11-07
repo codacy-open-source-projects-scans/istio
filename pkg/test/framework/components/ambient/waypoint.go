@@ -28,6 +28,7 @@ import (
 	istioKube "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/components/namespace"
@@ -42,10 +43,11 @@ var _ io.Closer = &kubeComponent{}
 type kubeComponent struct {
 	id resource.ID
 
-	ns       namespace.Instance
-	inbound  istioKube.PortForwarder
-	outbound istioKube.PortForwarder
-	pod      v1.Pod
+	ns          namespace.Instance
+	inbound     istioKube.PortForwarder
+	outbound    istioKube.PortForwarder
+	pod         v1.Pod
+	clusterName string
 }
 
 func (k kubeComponent) Namespace() namespace.Instance {
@@ -78,26 +80,45 @@ func (k kubeComponent) Close() error {
 	return nil
 }
 
+func (k kubeComponent) ClusterName() string {
+	return k.clusterName
+}
+
 // WaypointProxy describes a waypoint proxy deployment
 type WaypointProxy interface {
 	Namespace() namespace.Instance
 	Inbound() string
 	Outbound() string
 	PodIP() string
+	ClusterName() string
 }
 
-// NewWaypointProxy creates a new WaypointProxy.
-func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, name string) (WaypointProxy, error) {
+type Waypoints []WaypointProxy
+
+// ForCluster returns a list of instances that match the cluster name
+func (i Waypoints) ForCluster(name string) Waypoints {
+	out := make(Waypoints, 0, len(i))
+	for _, c := range i {
+		if c.ClusterName() == name {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func NewWaypointProxyForCluster(ctx resource.Context, ns namespace.Instance, name string, cls cluster.Cluster) (WaypointProxy, error) {
 	server := &kubeComponent{
-		ns: ns,
+		ns:          ns,
+		clusterName: cls.Name(),
 	}
 	server.id = ctx.TrackResource(server)
 	if err := crd.DeployGatewayAPI(ctx); err != nil {
 		return nil, err
 	}
 
-	// TODO support multicluster
-	ik, err := istioctl.New(ctx, istioctl.Config{})
+	ik, err := istioctl.New(ctx, istioctl.Config{
+		Cluster: cls,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +137,6 @@ func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, name string) 
 		return nil, err
 	}
 
-	cls := ctx.Clusters().Default()
 	// Find the Waypoint pod and service, and start forwarding a local port.
 	fetchFn := testKube.NewSinglePodFetch(cls, ns.Name(), fmt.Sprintf("%s=%s", label.IoK8sNetworkingGatewayGatewayName.Name, name))
 	pods, err := testKube.WaitUntilPodsAreReady(fetchFn)
@@ -146,8 +166,86 @@ func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, name string) 
 	return server, nil
 }
 
+// NewWaypointProxy creates a new WaypointProxy.
+func NewWaypointProxy(ctx resource.Context, ns namespace.Instance, name string) (Waypoints, error) {
+	var servers Waypoints
+	if err := crd.DeployGatewayAPI(ctx); err != nil {
+		return nil, err
+	}
+
+	// TODO return a component per cluster for more targeted tests
+
+	for _, cls := range ctx.AllClusters() {
+		ik, err := istioctl.New(ctx, istioctl.Config{
+			Cluster: cls,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// TODO: detect from UseWaypointProxy in echo.Config
+		_, _, err = ik.Invoke([]string{
+			"waypoint",
+			"apply",
+			"--namespace",
+			ns.Name(),
+			"--name",
+			name,
+			"--for",
+			constants.AllTraffic,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, cls := range ctx.AllClusters() {
+		server := &kubeComponent{
+			ns:          ns,
+			clusterName: cls.Name(),
+		}
+		server.id = ctx.TrackResource(server)
+		// Find the Waypoint pod and service, and start forwarding a local port.
+		fetchFn := testKube.NewSinglePodFetch(cls, ns.Name(), fmt.Sprintf("%s=%s", label.IoK8sNetworkingGatewayGatewayName.Name, name))
+		pods, err := testKube.WaitUntilPodsAreReady(fetchFn)
+		if err != nil {
+			return nil, err
+		}
+		pod := pods[0]
+		inbound, err := cls.NewPortForwarder(pod.Name, pod.Namespace, "", 0, 15008)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := inbound.Start(); err != nil {
+			return nil, err
+		}
+		outbound, err := cls.NewPortForwarder(pod.Name, pod.Namespace, "", 0, 15001)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := outbound.Start(); err != nil {
+			return nil, err
+		}
+		server.inbound = inbound
+		server.outbound = outbound
+		server.pod = pod
+		servers = append(servers, server)
+	}
+	return servers, nil
+}
+
+func NewWaypointProxyOrFailForCluster(t framework.TestContext, ns namespace.Instance, name string, cls cluster.Cluster) WaypointProxy {
+	t.Helper()
+	s, err := NewWaypointProxyForCluster(t, ns, name, cls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // NewWaypointProxyOrFail calls NewWaypointProxy and fails if an error occurs.
-func NewWaypointProxyOrFail(t framework.TestContext, ns namespace.Instance, name string) WaypointProxy {
+func NewWaypointProxyOrFail(t framework.TestContext, ns namespace.Instance, name string) Waypoints {
 	t.Helper()
 	s, err := NewWaypointProxy(t, ns, name)
 	if err != nil {
@@ -195,6 +293,49 @@ func SetWaypointForService(t framework.TestContext, ns namespace.Instance, servi
 		t.Cleanup(func() {
 			if err := doLabel(oldLabels); err != nil {
 				scopes.Framework.Errorf("failed resetting waypoint for %s/%s; this will likely break other tests", ns.Name(), service)
+			}
+		})
+
+	}
+}
+
+// SetWaypointForNamespace enrolls the whole namespace to use the specified waypoint.
+func SetWaypointForNamespace(t framework.TestContext, ns namespace.Instance, waypoint string) {
+	t.Helper()
+
+	for _, c := range t.AllClusters() {
+		oldNs, err := c.Kube().CoreV1().Namespaces().Get(t.Context(), ns.Name(), metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("error getting namespace %s: %w", ns.Name(), err)
+		}
+		oldLabels := oldNs.ObjectMeta.GetLabels()
+		if oldLabels == nil {
+			oldLabels = make(map[string]string, 1)
+		}
+		newLabels := maps.Clone(oldLabels)
+		if waypoint != "" {
+			newLabels[label.IoIstioUseWaypoint.Name] = waypoint
+		} else {
+			delete(newLabels, label.IoIstioUseWaypoint.Name)
+		}
+
+		doLabel := func(labels map[string]string) error {
+			// At least try to update the latest version
+			n, err := c.Kube().CoreV1().Namespaces().Get(t.Context(), ns.Name(), metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			n.ObjectMeta.SetLabels(labels)
+			_, err = c.Kube().CoreV1().Namespaces().Update(t.Context(), n, metav1.UpdateOptions{})
+			return err
+		}
+
+		if err = doLabel(newLabels); err != nil {
+			t.Fatalf("error updating namespace %s: %w", ns.Name(), err)
+		}
+		t.Cleanup(func() {
+			if err := doLabel(oldLabels); err != nil {
+				scopes.Framework.Errorf("failed resetting waypoint for %s; this will likely break other tests", ns.Name())
 			}
 		})
 

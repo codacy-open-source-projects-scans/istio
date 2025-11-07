@@ -16,18 +16,24 @@ import (
 	"istio.io/istio/pkg/kube/informerfactory"
 	ktypes "istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/typemap"
 
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
+	k8sioapiautoscalingv2 "k8s.io/api/autoscaling/v2"
 	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
+	k8sioapicertificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	k8sioapicoordinationv1 "k8s.io/api/coordination/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
+	k8sioapipolicyv1 "k8s.io/api/policy/v1"
 	k8sioapiextensionsapiserverpkgapisapiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	sigsk8siogatewayapiinferenceextensionapiv1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	sigsk8siogatewayapiapisv1 "sigs.k8s.io/gateway-api/apis/v1"
 	sigsk8siogatewayapiapisv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	sigsk8siogatewayapiapisv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	sigsk8siogatewayapiapisxv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	apiistioioapiextensionsv1alpha1 "istio.io/client-go/pkg/apis/extensions/v1alpha1"
 	apiistioioapinetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
@@ -38,11 +44,22 @@ import (
 )
 
 func GetWriteClient[T runtime.Object](c ClientGetter, namespace string) ktypes.WriteAPI[T] {
+	reg := typemap.Get[TypeRegistration[T]](registerTypes)
+	if reg != nil {
+		w := (*reg).Write(c, namespace)
+		if w != nil {
+			return w
+		}
+	}
 	switch any(ptr.Empty[T]()).(type) {
 	case *apiistioioapisecurityv1.AuthorizationPolicy:
 		return c.Istio().SecurityV1().AuthorizationPolicies(namespace).(ktypes.WriteAPI[T])
+	case *sigsk8siogatewayapiapisv1.BackendTLSPolicy:
+		return c.GatewayAPI().GatewayV1().BackendTLSPolicies(namespace).(ktypes.WriteAPI[T])
 	case *k8sioapicertificatesv1.CertificateSigningRequest:
 		return c.Kube().CertificatesV1().CertificateSigningRequests().(ktypes.WriteAPI[T])
+	case *k8sioapicertificatesv1beta1.ClusterTrustBundle:
+		return c.Kube().CertificatesV1beta1().ClusterTrustBundles().(ktypes.WriteAPI[T])
 	case *k8sioapicorev1.ConfigMap:
 		return c.Kube().CoreV1().ConfigMaps(namespace).(ktypes.WriteAPI[T])
 	case *k8sioapiextensionsapiserverpkgapisapiextensionsv1.CustomResourceDefinition:
@@ -67,6 +84,10 @@ func GetWriteClient[T runtime.Object](c ClientGetter, namespace string) ktypes.W
 		return c.GatewayAPI().GatewayV1beta1().GatewayClasses().(ktypes.WriteAPI[T])
 	case *sigsk8siogatewayapiapisv1beta1.HTTPRoute:
 		return c.GatewayAPI().GatewayV1beta1().HTTPRoutes(namespace).(ktypes.WriteAPI[T])
+	case *k8sioapiautoscalingv2.HorizontalPodAutoscaler:
+		return c.Kube().AutoscalingV2().HorizontalPodAutoscalers(namespace).(ktypes.WriteAPI[T])
+	case *sigsk8siogatewayapiinferenceextensionapiv1.InferencePool:
+		return c.GatewayAPIInference().InferenceV1().InferencePools(namespace).(ktypes.WriteAPI[T])
 	case *k8sioapinetworkingv1.Ingress:
 		return c.Kube().NetworkingV1().Ingresses(namespace).(ktypes.WriteAPI[T])
 	case *k8sioapinetworkingv1.IngressClass:
@@ -85,6 +106,8 @@ func GetWriteClient[T runtime.Object](c ClientGetter, namespace string) ktypes.W
 		return c.Istio().SecurityV1().PeerAuthentications(namespace).(ktypes.WriteAPI[T])
 	case *k8sioapicorev1.Pod:
 		return c.Kube().CoreV1().Pods(namespace).(ktypes.WriteAPI[T])
+	case *k8sioapipolicyv1.PodDisruptionBudget:
+		return c.Kube().PolicyV1().PodDisruptionBudgets(namespace).(ktypes.WriteAPI[T])
 	case *apiistioioapinetworkingv1beta1.ProxyConfig:
 		return c.Istio().NetworkingV1beta1().ProxyConfigs(namespace).(ktypes.WriteAPI[T])
 	case *sigsk8siogatewayapiapisv1beta1.ReferenceGrant:
@@ -121,6 +144,10 @@ func GetWriteClient[T runtime.Object](c ClientGetter, namespace string) ktypes.W
 		return c.Istio().NetworkingV1().WorkloadEntries(namespace).(ktypes.WriteAPI[T])
 	case *apiistioioapinetworkingv1.WorkloadGroup:
 		return c.Istio().NetworkingV1().WorkloadGroups(namespace).(ktypes.WriteAPI[T])
+	case *sigsk8siogatewayapiapisxv1alpha1.XBackendTrafficPolicy:
+		return c.GatewayAPI().ExperimentalV1alpha1().XBackendTrafficPolicies(namespace).(ktypes.WriteAPI[T])
+	case *sigsk8siogatewayapiapisxv1alpha1.XListenerSet:
+		return c.GatewayAPI().ExperimentalV1alpha1().XListenerSets(namespace).(ktypes.WriteAPI[T])
 	default:
 		panic(fmt.Sprintf("Unknown type %T", ptr.Empty[T]()))
 	}
@@ -130,8 +157,12 @@ func GetClient[T, TL runtime.Object](c ClientGetter, namespace string) ktypes.Re
 	switch any(ptr.Empty[T]()).(type) {
 	case *apiistioioapisecurityv1.AuthorizationPolicy:
 		return c.Istio().SecurityV1().AuthorizationPolicies(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *sigsk8siogatewayapiapisv1.BackendTLSPolicy:
+		return c.GatewayAPI().GatewayV1().BackendTLSPolicies(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapicertificatesv1.CertificateSigningRequest:
 		return c.Kube().CertificatesV1().CertificateSigningRequests().(ktypes.ReadWriteAPI[T, TL])
+	case *k8sioapicertificatesv1beta1.ClusterTrustBundle:
+		return c.Kube().CertificatesV1beta1().ClusterTrustBundles().(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapicorev1.ConfigMap:
 		return c.Kube().CoreV1().ConfigMaps(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapiextensionsapiserverpkgapisapiextensionsv1.CustomResourceDefinition:
@@ -156,6 +187,10 @@ func GetClient[T, TL runtime.Object](c ClientGetter, namespace string) ktypes.Re
 		return c.GatewayAPI().GatewayV1beta1().GatewayClasses().(ktypes.ReadWriteAPI[T, TL])
 	case *sigsk8siogatewayapiapisv1beta1.HTTPRoute:
 		return c.GatewayAPI().GatewayV1beta1().HTTPRoutes(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *k8sioapiautoscalingv2.HorizontalPodAutoscaler:
+		return c.Kube().AutoscalingV2().HorizontalPodAutoscalers(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *sigsk8siogatewayapiinferenceextensionapiv1.InferencePool:
+		return c.GatewayAPIInference().InferenceV1().InferencePools(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapinetworkingv1.Ingress:
 		return c.Kube().NetworkingV1().Ingresses(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapinetworkingv1.IngressClass:
@@ -174,6 +209,8 @@ func GetClient[T, TL runtime.Object](c ClientGetter, namespace string) ktypes.Re
 		return c.Istio().SecurityV1().PeerAuthentications(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *k8sioapicorev1.Pod:
 		return c.Kube().CoreV1().Pods(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *k8sioapipolicyv1.PodDisruptionBudget:
+		return c.Kube().PolicyV1().PodDisruptionBudgets(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *apiistioioapinetworkingv1beta1.ProxyConfig:
 		return c.Istio().NetworkingV1beta1().ProxyConfigs(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *sigsk8siogatewayapiapisv1beta1.ReferenceGrant:
@@ -210,6 +247,10 @@ func GetClient[T, TL runtime.Object](c ClientGetter, namespace string) ktypes.Re
 		return c.Istio().NetworkingV1().WorkloadEntries(namespace).(ktypes.ReadWriteAPI[T, TL])
 	case *apiistioioapinetworkingv1.WorkloadGroup:
 		return c.Istio().NetworkingV1().WorkloadGroups(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *sigsk8siogatewayapiapisxv1alpha1.XBackendTrafficPolicy:
+		return c.GatewayAPI().ExperimentalV1alpha1().XBackendTrafficPolicies(namespace).(ktypes.ReadWriteAPI[T, TL])
+	case *sigsk8siogatewayapiapisxv1alpha1.XListenerSet:
+		return c.GatewayAPI().ExperimentalV1alpha1().XListenerSets(namespace).(ktypes.ReadWriteAPI[T, TL])
 	default:
 		panic(fmt.Sprintf("Unknown type %T", ptr.Empty[T]()))
 	}
@@ -219,8 +260,12 @@ func gvrToObject(g schema.GroupVersionResource) runtime.Object {
 	switch g {
 	case gvr.AuthorizationPolicy:
 		return &apiistioioapisecurityv1.AuthorizationPolicy{}
+	case gvr.BackendTLSPolicy:
+		return &sigsk8siogatewayapiapisv1.BackendTLSPolicy{}
 	case gvr.CertificateSigningRequest:
 		return &k8sioapicertificatesv1.CertificateSigningRequest{}
+	case gvr.ClusterTrustBundle:
+		return &k8sioapicertificatesv1beta1.ClusterTrustBundle{}
 	case gvr.ConfigMap:
 		return &k8sioapicorev1.ConfigMap{}
 	case gvr.CustomResourceDefinition:
@@ -245,6 +290,10 @@ func gvrToObject(g schema.GroupVersionResource) runtime.Object {
 		return &sigsk8siogatewayapiapisv1beta1.GatewayClass{}
 	case gvr.HTTPRoute:
 		return &sigsk8siogatewayapiapisv1beta1.HTTPRoute{}
+	case gvr.HorizontalPodAutoscaler:
+		return &k8sioapiautoscalingv2.HorizontalPodAutoscaler{}
+	case gvr.InferencePool:
+		return &sigsk8siogatewayapiinferenceextensionapiv1.InferencePool{}
 	case gvr.Ingress:
 		return &k8sioapinetworkingv1.Ingress{}
 	case gvr.IngressClass:
@@ -263,6 +312,8 @@ func gvrToObject(g schema.GroupVersionResource) runtime.Object {
 		return &apiistioioapisecurityv1.PeerAuthentication{}
 	case gvr.Pod:
 		return &k8sioapicorev1.Pod{}
+	case gvr.PodDisruptionBudget:
+		return &k8sioapipolicyv1.PodDisruptionBudget{}
 	case gvr.ProxyConfig:
 		return &apiistioioapinetworkingv1beta1.ProxyConfig{}
 	case gvr.ReferenceGrant:
@@ -299,6 +350,10 @@ func gvrToObject(g schema.GroupVersionResource) runtime.Object {
 		return &apiistioioapinetworkingv1.WorkloadEntry{}
 	case gvr.WorkloadGroup:
 		return &apiistioioapinetworkingv1.WorkloadGroup{}
+	case gvr.XBackendTrafficPolicy:
+		return &sigsk8siogatewayapiapisxv1alpha1.XBackendTrafficPolicy{}
+	case gvr.XListenerSet:
+		return &sigsk8siogatewayapiapisxv1alpha1.XListenerSet{}
 	default:
 		panic(fmt.Sprintf("Unknown type %v", g))
 	}
@@ -316,12 +371,26 @@ func getInformerFiltered(c ClientGetter, opts ktypes.InformerOptions, g schema.G
 		w = func(options metav1.ListOptions) (watch.Interface, error) {
 			return c.Istio().SecurityV1().AuthorizationPolicies(opts.Namespace).Watch(context.Background(), options)
 		}
+	case gvr.BackendTLSPolicy:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.GatewayAPI().GatewayV1().BackendTLSPolicies(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.GatewayAPI().GatewayV1().BackendTLSPolicies(opts.Namespace).Watch(context.Background(), options)
+		}
 	case gvr.CertificateSigningRequest:
 		l = func(options metav1.ListOptions) (runtime.Object, error) {
 			return c.Kube().CertificatesV1().CertificateSigningRequests().List(context.Background(), options)
 		}
 		w = func(options metav1.ListOptions) (watch.Interface, error) {
 			return c.Kube().CertificatesV1().CertificateSigningRequests().Watch(context.Background(), options)
+		}
+	case gvr.ClusterTrustBundle:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.Kube().CertificatesV1beta1().ClusterTrustBundles().List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.Kube().CertificatesV1beta1().ClusterTrustBundles().Watch(context.Background(), options)
 		}
 	case gvr.ConfigMap:
 		l = func(options metav1.ListOptions) (runtime.Object, error) {
@@ -407,6 +476,20 @@ func getInformerFiltered(c ClientGetter, opts ktypes.InformerOptions, g schema.G
 		w = func(options metav1.ListOptions) (watch.Interface, error) {
 			return c.GatewayAPI().GatewayV1beta1().HTTPRoutes(opts.Namespace).Watch(context.Background(), options)
 		}
+	case gvr.HorizontalPodAutoscaler:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.Kube().AutoscalingV2().HorizontalPodAutoscalers(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.Kube().AutoscalingV2().HorizontalPodAutoscalers(opts.Namespace).Watch(context.Background(), options)
+		}
+	case gvr.InferencePool:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.GatewayAPIInference().InferenceV1().InferencePools(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.GatewayAPIInference().InferenceV1().InferencePools(opts.Namespace).Watch(context.Background(), options)
+		}
 	case gvr.Ingress:
 		l = func(options metav1.ListOptions) (runtime.Object, error) {
 			return c.Kube().NetworkingV1().Ingresses(opts.Namespace).List(context.Background(), options)
@@ -469,6 +552,13 @@ func getInformerFiltered(c ClientGetter, opts ktypes.InformerOptions, g schema.G
 		}
 		w = func(options metav1.ListOptions) (watch.Interface, error) {
 			return c.Kube().CoreV1().Pods(opts.Namespace).Watch(context.Background(), options)
+		}
+	case gvr.PodDisruptionBudget:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.Kube().PolicyV1().PodDisruptionBudgets(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.Kube().PolicyV1().PodDisruptionBudgets(opts.Namespace).Watch(context.Background(), options)
 		}
 	case gvr.ProxyConfig:
 		l = func(options metav1.ListOptions) (runtime.Object, error) {
@@ -595,6 +685,20 @@ func getInformerFiltered(c ClientGetter, opts ktypes.InformerOptions, g schema.G
 		}
 		w = func(options metav1.ListOptions) (watch.Interface, error) {
 			return c.Istio().NetworkingV1().WorkloadGroups(opts.Namespace).Watch(context.Background(), options)
+		}
+	case gvr.XBackendTrafficPolicy:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.GatewayAPI().ExperimentalV1alpha1().XBackendTrafficPolicies(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.GatewayAPI().ExperimentalV1alpha1().XBackendTrafficPolicies(opts.Namespace).Watch(context.Background(), options)
+		}
+	case gvr.XListenerSet:
+		l = func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.GatewayAPI().ExperimentalV1alpha1().XListenerSets(opts.Namespace).List(context.Background(), options)
+		}
+		w = func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.GatewayAPI().ExperimentalV1alpha1().XListenerSets(opts.Namespace).Watch(context.Background(), options)
 		}
 	default:
 		panic(fmt.Sprintf("Unknown type %v", g))

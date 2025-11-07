@@ -22,6 +22,7 @@ import (
 
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/log"
 )
 
@@ -49,6 +50,18 @@ var (
 	TransportProtocolInput = &xds.TypedExtensionConfig{
 		Name:        "transport-protocol",
 		TypedConfig: protoconv.MessageToAny(&network.TransportProtocolInput{}),
+	}
+	AuthorityFilterStateInput = &xds.TypedExtensionConfig{
+		Name: "authority-filter-state",
+		TypedConfig: protoconv.MessageToAny(&network.FilterStateInput{
+			Key: filters.AuthorityFilterStateKey,
+		}),
+	}
+	RequestSourceFilterStateInput = &xds.TypedExtensionConfig{
+		Name: "request-source-filter-state",
+		TypedConfig: protoconv.MessageToAny(&network.FilterStateInput{
+			Key: filters.RequestSourceFilterStateKey,
+		}),
 	}
 )
 
@@ -85,6 +98,10 @@ func NewSourceIP() Mapper {
 
 func NewDestinationPort() Mapper {
 	return newMapper(DestinationPort)
+}
+
+func NewRequestSource() Mapper {
+	return newMapper(RequestSourceFilterStateInput)
 }
 
 type ProtocolMatch struct {

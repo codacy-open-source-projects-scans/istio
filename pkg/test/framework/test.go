@@ -254,7 +254,7 @@ func (t *testImpl) doRun(ctx *testContext, fn func(ctx TestContext), parallel bo
 		return
 	}
 
-	if t.requiredDualstack && !t.ctx.Settings().EnableDualStack {
+	if t.requiredDualstack && len(t.ctx.Settings().IPFamilies) < 2 {
 		t.goTest.Skipf("Skipping %q: context does not have DualStack configuration",
 			t.goTest.Name())
 	}
@@ -306,6 +306,9 @@ func (t *testImpl) doRun(ctx *testContext, fn func(ctx TestContext), parallel bo
 		message := "passed"
 		if t.goTest.Failed() {
 			message = "failed"
+		}
+		if t.goTest.Skipped() {
+			message = "skipped"
 		}
 		scopes.Framework.Infof("=== DONE (%s):  Test: '%s[%s] (%v)' ===",
 			message,

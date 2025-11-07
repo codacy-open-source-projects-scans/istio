@@ -26,6 +26,7 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -2614,17 +2615,13 @@ spec:
 					for _, tc := range tt.cfg {
 						cfg = cfg + "\n---\n" + tc.Config(t, variant)
 					}
-					istio, k, err := crd.ParseInputs(cfg)
-					if err != nil {
-						t.Fatal(err)
-					}
-					kubeo, err := kube.SlowConvertKindsToRuntimeObjects(k)
+					istio, _, err := crd.ParseInputs(cfg)
 					if err != nil {
 						t.Fatal(err)
 					}
 					s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
-						Configs:           istio,
-						KubernetesObjects: kubeo,
+						Configs:                istio,
+						KubernetesObjectString: cfg,
 					})
 					sim := simulation.NewSimulation(t, s, s.SetupProxy(tt.proxy))
 					xdstest.ValidateListeners(t, sim.Listeners)
@@ -2649,4 +2646,31 @@ spec:
 			}
 		})
 	}
+}
+
+func SlowConvertKindsToRuntimeObjects(in []crd.IstioKind) ([]runtime.Object, error) {
+	res := make([]runtime.Object, 0, len(in))
+	for _, o := range in {
+		r, err := SlowConvertToRuntimeObject(&o)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, r)
+	}
+	return res, nil
+}
+
+// SlowConvertToRuntimeObject converts an IstioKind to a runtime.Object.
+// As the name implies, it is not efficient.
+func SlowConvertToRuntimeObject(in *crd.IstioKind) (runtime.Object, error) {
+	by, err := config.ToJSON(in)
+	if err != nil {
+		return nil, err
+	}
+	gvk := in.GetObjectKind().GroupVersionKind()
+	obj, _, err := kube.IstioCodec.UniversalDeserializer().Decode(by, &gvk, nil)
+	if err != nil {
+		return nil, err
+	}
+	return obj, nil
 }

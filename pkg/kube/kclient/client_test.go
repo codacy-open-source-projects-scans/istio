@@ -40,7 +40,7 @@ import (
 	oldistionetclient "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/config/schema/kubeclient"
@@ -62,7 +62,7 @@ func TestSwappingClientIndex(t *testing.T) {
 	c := kube.NewFakeClient()
 	wasm := kclient.NewDelayedInformer[controllers.Object](c, gvr.WasmPlugin, kubetypes.StandardInformer, kubetypes.Filter{})
 	c.RunAndWait(stop)
-	idx := kclient.CreateStringIndex(wasm, func(o controllers.Object) []string {
+	idx := kclient.CreateStringIndex(wasm, "imagePullSecret", func(o controllers.Object) []string {
 		return []string{o.(*istioclient.WasmPlugin).Spec.ImagePullSecret}
 	})
 	assertIndex := func(k string, we ...controllers.Object) {
@@ -215,7 +215,10 @@ func TestDelayedClientWithRegisteredType(t *testing.T) {
 			}, nil
 		},
 		func(c kubeclient.ClientGetter, namespace string, o metav1.ListOptions) (watch.Interface, error) {
-			return c.Istio().NetworkingV1beta1().DestinationRules(namespace).Watch(context.Background(), o)
+			return c.Istio().NetworkingV1alpha3().DestinationRules(namespace).Watch(context.Background(), o)
+		},
+		func(c kubeclient.ClientGetter, namespace string) kubetypes.WriteAPI[*oldistionetclient.DestinationRule] {
+			return c.Istio().NetworkingV1alpha3().DestinationRules(namespace)
 		},
 	)
 
@@ -350,6 +353,45 @@ func TestClient(t *testing.T) {
 	assert.Equal(t, tester.Get(obj3.Name, obj3.Namespace), nil)
 }
 
+func TestShutdown(t *testing.T) {
+	tracker := assert.NewTracker[string](t)
+	removeTracker := assert.NewTracker[string](t)
+	c := kube.NewFakeClient()
+	deployments := kclient.NewFiltered[*appsv1.Deployment](c, kclient.Filter{})
+	deployments.AddEventHandler(clienttest.TrackerHandler(tracker))
+	removeReg := deployments.AddEventHandler(clienttest.TrackerHandler(removeTracker))
+	tester := clienttest.Wrap(t, deployments)
+
+	c.RunAndWait(test.NewStop(t))
+	obj1 := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "1", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{MinReadySeconds: 1},
+	}
+
+	// Create object, make sure we can see it
+	tester.Create(obj1)
+	// Client is cached, so its only eventually consistent
+	tracker.WaitUnordered("add/1")
+	removeTracker.WaitUnordered("add/1")
+
+	// Shutdown one
+	deployments.ShutdownHandler(removeReg)
+
+	// Update object, should see the update only one the active handler
+	obj1.Spec.MinReadySeconds = 2
+	tester.Update(obj1)
+	tracker.WaitOrdered("update/1")
+	removeTracker.Empty()
+
+	deployments.ShutdownHandlers()
+
+	// Update object, shouldn't see any updates since all handlers are removed
+	obj1.Spec.MinReadySeconds = 3
+	tester.Update(obj1)
+	tracker.Empty()
+	removeTracker.Empty()
+}
+
 func TestErrorHandler(t *testing.T) {
 	mt := monitortest.New(t)
 	c := kube.NewFakeClient()
@@ -414,7 +456,7 @@ func TestToOpts(t *testing.T) {
 func TestFilterNamespace(t *testing.T) {
 	tracker := assert.NewTracker[string](t)
 	c := kube.NewFakeClient()
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
 		MatchLabels: map[string]string{"kubernetes.io/metadata.name": "selected"},
 	}}})
 	testns := clienttest.NewWriter[*corev1.Namespace](t, c)
@@ -456,8 +498,9 @@ func TestFilterNamespace(t *testing.T) {
 
 func TestFilter(t *testing.T) {
 	tracker := assert.NewTracker[string](t)
+	removeTracker := assert.NewTracker[string](t)
 	c := kube.NewFakeClient()
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{})
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{})
 	testns := clienttest.NewWriter[*corev1.Namespace](t, c)
 	testns.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: map[string]string{"kubernetes.io/metadata.name": "default"}}})
 	testns.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "selected", Labels: map[string]string{"kubernetes.io/metadata.name": "selected"}}})
@@ -471,6 +514,7 @@ func TestFilter(t *testing.T) {
 		ObjectFilter: discoveryNamespacesFilter,
 	})
 	deployments.AddEventHandler(clienttest.TrackerHandler(tracker))
+	removeReg := deployments.AddEventHandler(clienttest.TrackerHandler(removeTracker))
 
 	// Create two dynamic informers: one with CRD initially ready, one later
 	// Ready now
@@ -498,6 +542,9 @@ func TestFilter(t *testing.T) {
 	}
 	tester.Create(obj1)
 	tracker.WaitOrdered("add/1")
+	removeTracker.WaitOrdered("add/1")
+	deployments.ShutdownHandler(removeReg)
+
 	obj2 := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "2", Namespace: "selected"},
 		Spec:       appsv1.DeploymentSpec{MinReadySeconds: 1},
@@ -508,9 +555,9 @@ func TestFilter(t *testing.T) {
 	assert.Equal(t, len(tester.List("", klabels.Everything())), 2)
 
 	// Update the selectors...
-	assert.NoError(t, meshWatcher.Update(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
+	meshWatcher.Set(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
 		MatchLabels: map[string]string{"kubernetes.io/metadata.name": "selected"},
-	}}}, time.Second))
+	}}})
 	tracker.WaitOrdered("delete/1")
 	assert.Equal(t, len(tester.List("", klabels.Everything())), 1)
 
@@ -529,12 +576,20 @@ func TestFilter(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "name4", Namespace: "selected"},
 	})
 	tracker.WaitOrdered("add/name4")
+
+	// Ensure we didn't get any events
+	removeTracker.Empty()
+	// Remove the other handler through ShutdownHandlers
+	deployments.ShutdownHandlers()
+	// We should get no event
+	meshWatcher.Set(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{}})
+	tracker.Empty()
 }
 
 func TestFilterClusterScoped(t *testing.T) {
 	tracker := assert.NewTracker[string](t)
 	c := kube.NewFakeClient()
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
 		MatchLabels: map[string]string{"kubernetes.io/metadata.name": "selected"},
 	}}})
 	// Note: it is silly to filter cluster scoped resources, but if it is done we should not break.
@@ -565,7 +620,7 @@ func TestFilterDeadlock(t *testing.T) {
 	c := kube.NewFakeClient(&appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "random", Namespace: "test"},
 	})
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{DiscoverySelectors: []*meshconfig.LabelSelector{{
 		MatchLabels: map[string]string{"selected": "yes"},
 	}}})
 	stop := test.NewStop(t)

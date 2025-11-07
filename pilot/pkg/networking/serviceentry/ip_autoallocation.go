@@ -27,10 +27,6 @@ import (
 	"istio.io/istio/pkg/config"
 )
 
-const (
-	IPAutoallocateStatusType = "ip-autoallocate"
-)
-
 func GetHostAddressesFromServiceEntry(se *networkingv1.ServiceEntry) map[string][]netip.Addr {
 	if se == nil {
 		return map[string][]netip.Addr{}
@@ -59,7 +55,7 @@ func getHostAddressesFromServiceEntryStatus(status *apiv1.ServiceEntryStatus) ma
 	for _, addr := range status.GetAddresses() {
 		parsed, err := netip.ParseAddr(addr.GetValue())
 		if err != nil {
-			// strange, we should have written these so it probaby should parse but for now unreadable is unusable and we move on
+			// strange, we should have written these so it probably should parse but for now unreadable is unusable and we move on
 			continue
 		}
 		host := addr.GetHost()
@@ -100,7 +96,7 @@ func shouldV2AutoAllocateIPFromPieces(meta v1.ObjectMeta, spec *apiv1.ServiceEnt
 		return false
 	}
 
-	// if the user assigned their own we don't alloate or use autoassigned addresses
+	// if the user assigned their own we don't allocate or use autoassigned addresses
 	if len(spec.Addresses) > 0 {
 		return false
 	}

@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -80,7 +79,7 @@ spec:
 			// Status should report error
 			retry.UntilSuccessOrFail(t, func() error {
 				return expectVirtualServiceStatus(t, ns, true)
-			}, retry.Timeout(time.Second*5))
+			}, retry.Timeout(time.Second*10))
 			// Apply config to make this not invalid
 			t.ConfigIstio().YAML(ns.Name(), `
 apiVersion: networking.istio.io/v1

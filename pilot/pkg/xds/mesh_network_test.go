@@ -40,7 +40,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/ptr"
@@ -76,7 +76,7 @@ func TestNetworkGatewayUpdates(t *testing.T) {
 		kubeObjects = append(kubeObjects, objs...)
 		configObjects = append(configObjects, w.configs()...)
 	}
-	meshNetworks := mesh.NewFixedNetworksWatcher(nil)
+	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
 		KubernetesObjects: kubeObjects,
 		Configs:           configObjects,
@@ -191,6 +191,7 @@ func TestMeshNetworking(t *testing.T) {
 				Spec: corev1.ServiceSpec{
 					Type:        corev1.ServiceTypeClusterIP,
 					ExternalIPs: []string{"3.3.3.3"},
+					Ports:       []corev1.ServicePort{{Port: 15443}},
 				},
 			}},
 		},
@@ -574,7 +575,10 @@ func gatewaySvc(name, ip, network string) *corev1.Service {
 			Namespace: "istio-system",
 			Labels:    map[string]string{label.TopologyNetwork.Name: network},
 		},
-		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 15443}},
+		},
 		Status: corev1.ServiceStatus{
 			LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: ip}}},
 		},
@@ -607,7 +611,7 @@ func runMeshNetworkingTest(t *testing.T, tt meshNetworkingTest, configs ...confi
 		KubernetesObjectStringByCluster: tt.kubeObjectsYAML,
 		ConfigString:                    tt.configYAML,
 		Configs:                         configObjects,
-		NetworksWatcher:                 mesh.NewFixedNetworksWatcher(tt.meshNetworkConfig),
+		NetworksWatcher:                 meshwatcher.NewFixedNetworksWatcher(tt.meshNetworkConfig),
 	})
 	for _, w := range tt.workloads {
 		w.setupProxy(s)

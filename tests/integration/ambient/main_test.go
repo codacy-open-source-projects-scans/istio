@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -19,6 +18,7 @@ package ambient
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -54,6 +54,53 @@ var (
 	prom prometheus.Instance
 )
 
+const (
+	ambientControlPlaneValues = `
+values:
+  pilot:
+    env:
+      # Note: support is alpha and env var is tightly scoped
+      ENABLE_WILDCARD_HOST_SERVICE_ENTRIES_FOR_TLS: "true"
+  cni:
+    # The CNI repair feature is disabled for these tests because this is a controlled environment,
+    # and it is important to catch issues that might otherwise be automatically fixed.
+    # Refer to issue #49207 for more context.
+    repair:
+      enabled: false
+  ztunnel:
+    terminationGracePeriodSeconds: 5
+    env:
+      SECRET_TTL: 5m
+    podLabels:
+      networking.istio.io/tunnel: "http"
+`
+
+	nativeNftablesValues = `
+  global:
+    nativeNftables: true
+`
+	ambientMultiNetworkControlPlaneValues = `
+values:
+  pilot:
+    env:
+      AMBIENT_ENABLE_MULTI_NETWORK: "true"
+      # Note: support is alpha and env var is tightly scoped
+      ENABLE_WILDCARD_HOST_SERVICE_ENTRIES_FOR_TLS: "true"
+  ztunnel:
+    terminationGracePeriodSeconds: 5
+    env:
+      SECRET_TTL: 5m
+    podLabels:
+      networking.istio.io/tunnel: "http"
+  cni:
+    # The CNI repair feature is disabled for these tests because this is a controlled environment,
+    # and it is important to catch issues that might otherwise be automatically fixed.
+    # Refer to issue #49207 for more context.
+    repair:
+      enabled: false
+`
+)
+
 type EchoDeployments struct {
 	// Namespace echo apps will be deployed
 	Namespace         namespace.Instance
@@ -82,7 +129,7 @@ type EchoDeployments struct {
 	MockExternal echo.Instances
 
 	// WaypointProxies by
-	WaypointProxies map[string]ambient.WaypointProxy
+	WaypointProxies map[string]ambient.Waypoints
 }
 
 // TestMain defines the entrypoint for pilot tests using a standard Istio installation.
@@ -102,21 +149,22 @@ func TestMain(m *testing.M) {
 			ctx.Settings().SkipVMs()
 			cfg.EnableCNI = true
 			cfg.DeployEastWestGW = false
-			cfg.ControlPlaneValues = `
-values:
-  cni:
-    # The CNI repair feature is disabled for these tests because this is a controlled environment,
-    # and it is important to catch issues that might otherwise be automatically fixed.
-    # Refer to issue #49207 for more context.
-    repair:
-      enabled: false
-  ztunnel:
-    terminationGracePeriodSeconds: 5
-    env:
-      SECRET_TTL: 5m
-`
+			cfg.ControlPlaneValues = ambientControlPlaneValues
+
+			if ctx.Settings().NativeNftables {
+				scopes.Framework.Infof("Running the integration tests with nativeNftables enabled")
+				cfg.ControlPlaneValues = strings.TrimRight(ambientControlPlaneValues, "\n") + nativeNftablesValues
+			}
+
+			if ctx.Settings().AmbientMultiNetwork {
+				cfg.DeployEastWestGW = true
+				cfg.DeployGatewayAPI = true
+				cfg.ControlPlaneValues = ambientMultiNetworkControlPlaneValues
+				cfg.SkipDeployCrossClusterSecrets = false
+			}
 		}, cert.CreateCASecretAlt)).
 		Setup(func(t resource.Context) error {
+			gatewayConformanceInputs.Cluster = t.Clusters().Default()
 			gatewayConformanceInputs.Client = t.Clusters().Default()
 			gatewayConformanceInputs.Cleanup = !t.Settings().NoCleanup
 
@@ -132,7 +180,7 @@ values:
 				if err != nil {
 					return err
 				}
-				return
+				return err
 			},
 		).
 		Run()
@@ -144,6 +192,9 @@ const (
 	Captured                  = "captured"
 	Uncaptured                = "uncaptured"
 	Sidecar                   = "sidecar"
+	Global                    = "global"
+	Local                     = "local"
+	EastWestGateway           = "eastwest-gateway"
 )
 
 var inMesh = match.Matcher(func(instance echo.Instance) bool {
@@ -336,7 +387,7 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 	}
 
 	if apps.WaypointProxies == nil {
-		apps.WaypointProxies = make(map[string]ambient.WaypointProxy)
+		apps.WaypointProxies = make(map[string]ambient.Waypoints)
 	}
 
 	for _, echo := range echos {

@@ -46,11 +46,13 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
@@ -70,7 +72,7 @@ func eventually(t test.Failer, cond func() bool) {
 }
 
 func TestServices(t *testing.T) {
-	networksWatcher := mesh.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
+	networksWatcher := meshwatcher.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
 		Networks: map[string]*meshconfig.Network{
 			"network1": {
 				Endpoints: []*meshconfig.Network_NetworkEndpoints{
@@ -175,7 +177,9 @@ func TestController_GetPodLocality(t *testing.T) {
 	pod1 := generatePod([]string{"128.0.1.1"}, "pod1", "nsA", "", "node1", map[string]string{"app": "prod-app"}, map[string]string{})
 	pod2 := generatePod([]string{"128.0.1.2"}, "pod2", "nsB", "", "node2", map[string]string{"app": "prod-app"}, map[string]string{})
 	podOverride := generatePod([]string{"128.0.1.2"}, "pod2", "nsB", "",
-		"node1", map[string]string{"app": "prod-app", model.LocalityLabel: "regionOverride.zoneOverride.subzoneOverride"}, map[string]string{})
+		"node1", map[string]string{"app": "prod-app", pm.LocalityLabel: "regionOverride.zoneOverride.subzoneOverride"}, map[string]string{})
+	podOverride2 := generatePod([]string{"128.0.1.2"}, "pod2", "nsB", "",
+		"node1", map[string]string{"app": "prod-app", label.TopologyLocality.Name: "regionOverride.zoneOverride.subzoneOverride"}, map[string]string{})
 	testCases := []struct {
 		name   string
 		pods   []*corev1.Pod
@@ -267,6 +271,16 @@ func TestController_GetPodLocality(t *testing.T) {
 				podOverride: "regionOverride/zoneOverride/subzoneOverride",
 			},
 		},
+		{
+			name: "should return correct az with new label",
+			pods: []*corev1.Pod{podOverride2},
+			nodes: []*corev1.Node{
+				generateNode("node1", map[string]string{NodeZoneLabel: "zone1", NodeRegionLabel: "region1", label.TopologySubzone.Name: "subzone1"}),
+			},
+			wantAZ: map[*corev1.Pod]string{
+				podOverride2: "regionOverride/zoneOverride/subzoneOverride",
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -311,7 +325,7 @@ func TestProxyK8sHostnameLabel(t *testing.T) {
 		IPAddresses: []string{"128.0.0.1"},
 		ID:          "pod1.nsa",
 		DNSDomain:   "nsa.svc.cluster.local",
-		Metadata:    &model.NodeMetadata{Namespace: "nsa", ClusterID: clusterID},
+		Metadata:    &model.NodeMetadata{Namespace: "nsa", ClusterID: clusterID, NodeName: pod.Spec.NodeName},
 	}
 	got := controller.GetProxyWorkloadLabels(proxy)
 	if pod.Spec.NodeName != got[labelutil.LabelHostname] {
@@ -1097,7 +1111,7 @@ func TestController_Service(t *testing.T) {
 }
 
 func TestController_ServiceWithFixedDiscoveryNamespaces(t *testing.T) {
-	meshWatcher := mesh.NewFixedWatcher(&meshconfig.MeshConfig{
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{
 		DiscoverySelectors: []*meshconfig.LabelSelector{
 			{
 				MatchLabels: map[string]string{
@@ -1266,14 +1280,12 @@ func TestController_ServiceWithChangingDiscoveryNamespaces(t *testing.T) {
 		meshConfig *meshconfig.MeshConfig,
 		expectedSvcList []*model.Service,
 		expectedNumSvcEvents int,
-		testMeshWatcher *mesh.TestWatcher,
+		testMeshWatcher meshwatcher.TestWatcher,
 		fx *xdsfake.Updater,
 		controller *FakeController,
 	) {
 		// update meshConfig
-		if err := testMeshWatcher.Update(meshConfig, time.Second*5); err != nil {
-			t.Fatalf("%v", err)
-		}
+		testMeshWatcher.Set(meshConfig)
 
 		// assert firing of service events
 		for i := 0; i < expectedNumSvcEvents; i++ {
@@ -1286,7 +1298,7 @@ func TestController_ServiceWithChangingDiscoveryNamespaces(t *testing.T) {
 		})
 	}
 
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{})
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{})
 
 	nsA := "nsA"
 	nsB := "nsB"
@@ -1443,15 +1455,13 @@ func TestControllerResourceScoping(t *testing.T) {
 		meshConfig *meshconfig.MeshConfig,
 		expectedSvcList []*model.Service,
 		expectedNumSvcEvents int,
-		testMeshWatcher *mesh.TestWatcher,
+		testMeshWatcher meshwatcher.TestWatcher,
 		fx *xdsfake.Updater,
 		controller *FakeController,
 	) {
 		t.Helper()
 		// update meshConfig
-		if err := testMeshWatcher.Update(meshConfig, time.Second*5); err != nil {
-			t.Fatalf("%v", err)
-		}
+		testMeshWatcher.Set(meshConfig)
 
 		// assert firing of service events
 		for i := 0; i < expectedNumSvcEvents; i++ {
@@ -1466,7 +1476,7 @@ func TestControllerResourceScoping(t *testing.T) {
 
 	client := kubelib.NewFakeClient()
 	t.Cleanup(client.Shutdown)
-	meshWatcher := mesh.NewTestWatcher(&meshconfig.MeshConfig{})
+	meshWatcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{})
 
 	nsA := "nsA"
 	nsB := "nsB"
@@ -1690,6 +1700,8 @@ func createEndpoints(t *testing.T, controller *FakeController, name, namespace s
 		eps = append(eps, corev1.EndpointPort{Name: name, Port: portNum})
 	}
 
+	// Endpoints is deprecated in k8s >=1.33, but we should still support it.
+	// nolint: staticcheck
 	endpoint := &corev1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -1701,7 +1713,7 @@ func createEndpoints(t *testing.T, controller *FakeController, name, namespace s
 			Ports:     eps,
 		}},
 	}
-	clienttest.NewWriter[*corev1.Endpoints](t, controller.client).CreateOrUpdate(endpoint)
+	clienttest.NewWriter[*corev1.Endpoints](t, controller.client).CreateOrUpdate(endpoint) // nolint: staticcheck
 
 	// Create endpoint slice as well
 	esps := make([]discovery.EndpointPort, 0)
@@ -1741,6 +1753,8 @@ func updateEndpoints(controller *FakeController, name, namespace string, portNam
 		eps = append(eps, corev1.EndpointPort{Name: name, Port: portNum})
 	}
 
+	// Endpoints is deprecated in k8s >=1.33, but we should still support it.
+	// nolint: staticcheck
 	endpoint := &corev1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -2429,8 +2443,48 @@ func TestUpdateEdsCacheOnServiceUpdate(t *testing.T) {
 	fx.WaitOrFail(t, "eds cache")
 }
 
+func TestVisibilityNoneService(t *testing.T) {
+	controller, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{})
+	serviceHandler := func(_, curr *model.Service, _ model.Event) {
+		pushReq := &model.PushRequest{
+			Full:           true,
+			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: string(curr.Hostname), Namespace: curr.Attributes.Namespace}),
+			Reason:         model.NewReasonStats(model.ServiceUpdate),
+		}
+		fx.ConfigUpdate(pushReq)
+	}
+	controller.Controller.AppendServiceHandler(serviceHandler)
+
+	// Create an initial pod with a service with None visibility, and endpoint.
+	pod1 := generatePod([]string{"172.0.1.1"}, "pod1", "nsA", "", "node1", map[string]string{"app": "prod-app"}, map[string]string{})
+	pod2 := generatePod([]string{"172.0.1.2"}, "pod2", "nsA", "", "node1", map[string]string{"app": "prod-app"}, map[string]string{})
+	pods := []*corev1.Pod{pod1, pod2}
+	nodes := []*corev1.Node{
+		generateNode("node1", map[string]string{NodeZoneLabel: "zone1", NodeRegionLabel: "region1", label.TopologySubzone.Name: "subzone1"}),
+	}
+	addNodes(t, controller, nodes...)
+	addPods(t, controller, fx, pods...)
+	createServiceWait(controller, "svc1", "nsA", []string{"10.0.0.1"}, nil, map[string]string{annotation.NetworkingExportTo.Name: "~"},
+		[]int32{8080}, map[string]string{"app": "prod-app"}, t)
+
+	pod1Ips := []string{"172.0.1.1"}
+	portNames := []string{"tcp-port"}
+	createEndpoints(t, controller, "svc1", "nsA", portNames, pod1Ips, nil, nil)
+	// We should not get any events - service should be ignored.
+	fx.AssertEmpty(t, 0)
+
+	// update service and remove exportTo annotation.
+	svc := getService(controller, "svc1", "nsA", t)
+	svc.Annotations = map[string]string{}
+	updateService(controller, svc, t)
+	fx.WaitOrFail(t, "service")
+	host := string(kube.ServiceHostname("svc1", "nsA", controller.opts.DomainSuffix))
+	// We should see a full push.
+	fx.MatchOrFail(t, xdsfake.Event{Type: "xds full", ID: host})
+}
+
 func TestDiscoverySelector(t *testing.T) {
-	networksWatcher := mesh.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
+	networksWatcher := meshwatcher.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
 		Networks: map[string]*meshconfig.Network{
 			"network1": {
 				Endpoints: []*meshconfig.Network_NetworkEndpoints{

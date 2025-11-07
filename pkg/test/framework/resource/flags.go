@@ -63,6 +63,12 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 	}
 	s.SkipWorkloadClasses = normalized
 
+	normalizedIPFamilies := make(ArrayFlags, 0)
+	for _, ipFamily := range s.IPFamilies {
+		normalizedIPFamilies = append(normalizedIPFamilies, strings.Split(ipFamily, ",")...)
+	}
+	s.IPFamilies = normalizedIPFamilies
+
 	if s.Image.Hub == "" {
 		s.Image.Hub = env.HUB.ValueOrDefault("gcr.io/istio-testing")
 	}
@@ -127,6 +133,11 @@ func validate(s *Settings) error {
 		return fmt.Errorf("values for Hub & Tag are not detected. Please supply them through command-line or via environment")
 	}
 
+	for _, ipFamily := range s.IPFamilies {
+		if ipFamily != "IPv4" && ipFamily != "IPv6" {
+			return fmt.Errorf("supported values for --istio.test.IPFamilies are `IPv4`, `IPv6`, `IPv4,IPv6` or `IPv6,IPv4`")
+		}
+	}
 	return nil
 }
 
@@ -202,15 +213,31 @@ func init() {
 			"Secret should already exist when used with istio.test.stableNamespaces.")
 	flag.Uint64Var(&settingsFromCommandLine.MaxDumps, "istio.test.maxDumps", settingsFromCommandLine.MaxDumps,
 		"Maximum number of full test dumps that are allowed to occur within a test suite.")
-	flag.BoolVar(&settingsFromCommandLine.EnableDualStack, "istio.test.enableDualStack", settingsFromCommandLine.EnableDualStack,
-		"Deploy Istio with Dual Stack enabled.")
 	flag.StringVar(&settingsFromCommandLine.HelmRepo, "istio.test.helmRepo", settingsFromCommandLine.HelmRepo, "Helm repo to use to pull the charts.")
+	flag.Var(&settingsFromCommandLine.IPFamilies, "istio.test.IPFamilies",
+		"IP families (IPv6, IPv4) to test with. If both specified, dualstack config will be used. The order the families are defined indicates precedence.")
 	flag.BoolVar(&settingsFromCommandLine.GatewayConformanceStandardOnly, "istio.test.gatewayConformanceStandardOnly",
 		settingsFromCommandLine.GatewayConformanceStandardOnly,
 		"If set, only the standard gateway conformance tests will be run; tests relying on experimental resources will be skipped.")
 
 	flag.BoolVar(&settingsFromCommandLine.OpenShift, "istio.test.openshift", settingsFromCommandLine.OpenShift,
 		"Indicate the tests run in an OpenShift platform rather than in plain Kubernetes.")
+
+	flag.BoolVar(&settingsFromCommandLine.AmbientMultiNetwork, "istio.test.ambient.multinetwork", settingsFromCommandLine.AmbientMultiNetwork,
+		"Indicate the use of ambient multicluster.")
+
+	flag.BoolVar(&settingsFromCommandLine.IstioOwnedCNIConfig, "istio.test.ambient.istioOwnedCNIConfig", settingsFromCommandLine.IstioOwnedCNIConfig,
+		"Indicate the use of an Istio owned CNI configuration.")
+
+	flag.BoolVar(
+		&settingsFromCommandLine.GatewayConformanceAllowCRDsMismatch,
+		"istio.test.GatewayConformanceAllowCRDsMismatch",
+		settingsFromCommandLine.GatewayConformanceAllowCRDsMismatch,
+		"If set, gateway conformance tests will run even if the environment has pre-installed Gateway API CRDs that differ from the current Gateway API version.",
+	)
+
+	flag.BoolVar(&settingsFromCommandLine.NativeNftables, "istio.test.nativeNftables", settingsFromCommandLine.NativeNftables,
+		"If set, native nftable rules will be used instead of iptable rules for traffic redirection.")
 
 	initGatewayConformanceTimeouts()
 }
@@ -247,7 +274,7 @@ func initGatewayConformanceTimeouts() {
 		"istio.test.gatewayConformance.tlsRouteMustHaveConditionTimeout", 0,
 		"Gateway conformance test timeout for waiting for an TLSRoute to have a certain condition.")
 	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.RouteMustHaveParents, "istio.test.gatewayConformance.routeMustHaveParentsTimeout",
-		0, "Gateway conformance test timeout for the the maximum time for an xRoute to have parents in status that match the expected parents.")
+		0, "Maximum time in the Gateway conformance test for an xRoute to have parents in status that match the expected parents before timing out.")
 	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.ManifestFetchTimeout, "istio.test.gatewayConformance.manifestFetchTimeout",
 		0, "Gateway conformance test timeout for the maximum time for getting content from a https:// URL.")
 	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.MaxTimeToConsistency, "istio.test.gatewayConformance.maxTimeToConsistency",

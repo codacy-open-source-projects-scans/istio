@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
+	"k8s.io/apimachinery/pkg/types"
 
 	authzpb "istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/security/trustdomain"
@@ -32,19 +33,20 @@ const (
 	RBACShadowRulesDenyStatPrefix     = "istio_dry_run_deny_"
 	RBACExtAuthzShadowRulesStatPrefix = "istio_ext_authz_"
 
-	attrRequestHeader    = "request.headers"             // header name is surrounded by brackets, e.g. "request.headers[User-Agent]".
-	attrSrcIP            = "source.ip"                   // supports both single ip and cidr, e.g. "10.1.2.3" or "10.1.0.0/16".
-	attrRemoteIP         = "remote.ip"                   // original client ip determined from x-forwarded-for or proxy protocol.
-	attrSrcNamespace     = "source.namespace"            // e.g. "default".
-	attrSrcPrincipal     = "source.principal"            // source identity, e,g, "cluster.local/ns/default/sa/productpage".
-	attrRequestPrincipal = "request.auth.principal"      // authenticated principal of the request.
-	attrRequestAudiences = "request.auth.audiences"      // intended audience(s) for this authentication information.
-	attrRequestPresenter = "request.auth.presenter"      // authorized presenter of the credential.
-	attrRequestClaims    = "request.auth.claims"         // claim name is surrounded by brackets, e.g. "request.auth.claims[iss]".
-	attrDestIP           = "destination.ip"              // supports both single ip and cidr, e.g. "10.1.2.3" or "10.1.0.0/16".
-	attrDestPort         = "destination.port"            // must be in the range [0, 65535].
-	attrConnSNI          = "connection.sni"              // server name indication, e.g. "www.example.com".
-	attrEnvoyFilter      = "experimental.envoy.filters." // an experimental attribute for checking Envoy Metadata directly.
+	attrRequestHeader     = "request.headers"             // header name is surrounded by brackets, e.g. "request.headers[User-Agent]".
+	attrSrcIP             = "source.ip"                   // supports both single ip and cidr, e.g. "10.1.2.3" or "10.1.0.0/16".
+	attrRemoteIP          = "remote.ip"                   // original client ip determined from x-forwarded-for or proxy protocol.
+	attrSrcNamespace      = "source.namespace"            // e.g. "default".
+	attrSrcServiceAccount = "source.serviceAccount"       // e.g. "default/productpage".
+	attrSrcPrincipal      = "source.principal"            // source identity, e,g, "cluster.local/ns/default/sa/productpage".
+	attrRequestPrincipal  = "request.auth.principal"      // authenticated principal of the request.
+	attrRequestAudiences  = "request.auth.audiences"      // intended audience(s) for this authentication information.
+	attrRequestPresenter  = "request.auth.presenter"      // authorized presenter of the credential.
+	attrRequestClaims     = "request.auth.claims"         // claim name is surrounded by brackets, e.g. "request.auth.claims[iss]".
+	attrDestIP            = "destination.ip"              // supports both single ip and cidr, e.g. "10.1.2.3" or "10.1.0.0/16".
+	attrDestPort          = "destination.port"            // must be in the range [0, 65535].
+	attrConnSNI           = "connection.sni"              // server name indication, e.g. "www.example.com".
+	attrEnvoyFilter       = "experimental.envoy.filters." // an experimental attribute for checking Envoy Metadata directly.
 
 	// Internal names used to generate corresponding Envoy matcher.
 	methodHeader = ":method"
@@ -73,7 +75,7 @@ type Model struct {
 }
 
 // New returns a model representing a single authorization policy.
-func New(r *authzpb.Rule) (*Model, error) {
+func New(policyName types.NamespacedName, r *authzpb.Rule) (*Model, error) {
 	m := Model{}
 
 	basePermission := ruleList{}
@@ -97,6 +99,8 @@ func New(r *authzpb.Rule) (*Model, error) {
 			basePrincipal.appendLast(remoteIPGenerator{}, k, when.Values, when.NotValues)
 		case k == attrSrcNamespace:
 			basePrincipal.appendLast(srcNamespaceGenerator{}, k, when.Values, when.NotValues)
+		case k == attrSrcServiceAccount:
+			basePrincipal.appendLast(srcServiceAccountGenerator{policyName: policyName}, k, when.Values, when.NotValues)
 		case k == attrSrcPrincipal:
 			basePrincipal.appendLast(srcPrincipalGenerator{}, k, when.Values, when.NotValues)
 		case k == attrRequestPrincipal:
@@ -120,6 +124,7 @@ func New(r *authzpb.Rule) (*Model, error) {
 			merged.insertFront(srcIPGenerator{}, attrSrcIP, s.IpBlocks, s.NotIpBlocks)
 			merged.insertFront(remoteIPGenerator{}, attrRemoteIP, s.RemoteIpBlocks, s.NotRemoteIpBlocks)
 			merged.insertFront(srcNamespaceGenerator{}, attrSrcNamespace, s.Namespaces, s.NotNamespaces)
+			merged.insertFront(srcServiceAccountGenerator{policyName: policyName}, attrSrcServiceAccount, s.ServiceAccounts, s.NotServiceAccounts)
 			merged.insertFrontExtended(requestPrincipalGenerator{}, attrRequestPrincipal, s.RequestPrincipals, s.NotRequestPrincipals)
 			merged.insertFront(srcPrincipalGenerator{}, attrSrcPrincipal, s.Principals, s.NotPrincipals)
 		}

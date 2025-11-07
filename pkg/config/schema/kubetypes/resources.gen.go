@@ -5,15 +5,20 @@ package kubetypes
 import (
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
+	k8sioapiautoscalingv2 "k8s.io/api/autoscaling/v2"
 	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
+	k8sioapicertificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	k8sioapicoordinationv1 "k8s.io/api/coordination/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
+	k8sioapipolicyv1 "k8s.io/api/policy/v1"
 	k8sioapiextensionsapiserverpkgapisapiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	sigsk8siogatewayapiinferenceextensionapiv1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	sigsk8siogatewayapiapisv1 "sigs.k8s.io/gateway-api/apis/v1"
 	sigsk8siogatewayapiapisv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	sigsk8siogatewayapiapisv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	sigsk8siogatewayapiapisxv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	istioioapiextensionsv1alpha1 "istio.io/api/extensions/v1alpha1"
 	istioioapimeshv1alpha1 "istio.io/api/mesh/v1alpha1"
@@ -37,8 +42,12 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.AuthorizationPolicy, true
 	case *apiistioioapisecurityv1.AuthorizationPolicy:
 		return gvk.AuthorizationPolicy, true
+	case *sigsk8siogatewayapiapisv1.BackendTLSPolicy:
+		return gvk.BackendTLSPolicy, true
 	case *k8sioapicertificatesv1.CertificateSigningRequest:
 		return gvk.CertificateSigningRequest, true
+	case *k8sioapicertificatesv1beta1.ClusterTrustBundle:
+		return gvk.ClusterTrustBundle, true
 	case *k8sioapicorev1.ConfigMap:
 		return gvk.ConfigMap, true
 	case *k8sioapiextensionsapiserverpkgapisapiextensionsv1.CustomResourceDefinition:
@@ -69,6 +78,10 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.GatewayClass, true
 	case *sigsk8siogatewayapiapisv1beta1.HTTPRoute:
 		return gvk.HTTPRoute, true
+	case *k8sioapiautoscalingv2.HorizontalPodAutoscaler:
+		return gvk.HorizontalPodAutoscaler, true
+	case *sigsk8siogatewayapiinferenceextensionapiv1.InferencePool:
+		return gvk.InferencePool, true
 	case *k8sioapinetworkingv1.Ingress:
 		return gvk.Ingress, true
 	case *k8sioapinetworkingv1.IngressClass:
@@ -93,6 +106,8 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.PeerAuthentication, true
 	case *k8sioapicorev1.Pod:
 		return gvk.Pod, true
+	case *k8sioapipolicyv1.PodDisruptionBudget:
+		return gvk.PodDisruptionBudget, true
 	case *istioioapinetworkingv1beta1.ProxyConfig:
 		return gvk.ProxyConfig, true
 	case *apiistioioapinetworkingv1beta1.ProxyConfig:
@@ -147,6 +162,10 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.WorkloadGroup, true
 	case *apiistioioapinetworkingv1.WorkloadGroup:
 		return gvk.WorkloadGroup, true
+	case *sigsk8siogatewayapiapisxv1alpha1.XBackendTrafficPolicy:
+		return gvk.XBackendTrafficPolicy, true
+	case *sigsk8siogatewayapiapisxv1alpha1.XListenerSet:
+		return gvk.XListenerSet, true
 	default:
 		return config.GroupVersionKind{}, false
 	}

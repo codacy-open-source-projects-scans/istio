@@ -28,6 +28,7 @@ import (
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
@@ -35,7 +36,7 @@ import (
 
 func TestNewInformer(t *testing.T) {
 	stop := test.NewStop(t)
-	opts := KrtOptions{stop}
+	opts := testOptions(t)
 	c := kube.NewFakeClient()
 	ConfigMaps := krt.NewInformer[*corev1.ConfigMap](c, opts.WithName("ConfigMaps")...)
 	c.RunAndWait(stop)
@@ -88,8 +89,7 @@ func TestNewInformer(t *testing.T) {
 }
 
 func TestUnregisteredTypeCollection(t *testing.T) {
-	stop := test.NewStop(t)
-	opts := KrtOptions{stop}
+	opts := testOptions(t)
 	np := &v1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "netpol",
@@ -107,8 +107,26 @@ func TestUnregisteredTypeCollection(t *testing.T) {
 		func(c kubeclient.ClientGetter, namespace string, o metav1.ListOptions) (watch.Interface, error) {
 			return c.Kube().NetworkingV1().NetworkPolicies(namespace).Watch(context.Background(), o)
 		},
+		func(c kubeclient.ClientGetter, namespace string) kubetypes.WriteAPI[*v1.NetworkPolicy] {
+			return c.Kube().NetworkingV1().NetworkPolicies(namespace)
+		},
 	)
 	npcoll := krt.NewInformer[*v1.NetworkPolicy](c, opts.WithName("NetworkPolicies")...)
 	c.RunAndWait(test.NewStop(t))
 	assert.Equal(t, npcoll.List(), []*v1.NetworkPolicy{np})
+}
+
+func TestInformerCollectionMetadata(t *testing.T) {
+	opts := testOptions(t)
+	c := kube.NewFakeClient()
+	meta := krt.Metadata{
+		"key1": "value1",
+	}
+	ConfigMaps := krt.NewInformer[*corev1.ConfigMap](c, opts.With(
+		krt.WithName("ConfigMaps"),
+		krt.WithMetadata(meta),
+	)...)
+	c.RunAndWait(opts.Stop())
+
+	assert.Equal(t, ConfigMaps.Metadata(), meta)
 }

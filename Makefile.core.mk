@@ -49,7 +49,7 @@ endif
 export VERSION
 
 # Base version of Istio image to use
-BASE_VERSION ?= master-2024-12-17T19-00-43
+BASE_VERSION ?= master-2025-11-06T19-00-48
 ISTIO_BASE_REGISTRY ?= gcr.io/istio-release
 
 export GO111MODULE ?= on
@@ -213,10 +213,11 @@ STANDARD_BINARIES:=./istioctl/cmd/istioctl \
   ./pkg/test/echo/cmd/server \
   ./samples/extauthz/cmd/extauthz
 
+CNI_BINARIES:=./cni/cmd/istio-cni \
+	./cni/cmd/install-cni
 # These are binaries that require Linux to build, and should
 # be skipped on other platforms. Notably this includes the current Linux-only Istio CNI plugin
-LINUX_AGENT_BINARIES:=./cni/cmd/istio-cni \
-  ./cni/cmd/install-cni \
+LINUX_AGENT_BINARIES:=$(CNI_BINARIES) \
   $(AGENT_BINARIES)
 
 BINARIES:=$(STANDARD_BINARIES) $(AGENT_BINARIES) $(LINUX_AGENT_BINARIES)
@@ -227,7 +228,8 @@ RELEASE_SIZE_TEST_BINARIES:=pilot-discovery pilot-agent istioctl envoy ztunnel c
 # agent: enables agent-specific files. Usually this is used to trim dependencies where they would be hard to trim through standard refactoring
 # disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
 # not set vtprotobuf: this adds some performance improvement, but at a binary cost increase that is not worth it for the agent
-AGENT_TAGS=agent,disable_pgv
+# notrace: helps with https://github.com/istio/istio/issues/56636 and reduces binary size
+AGENT_TAGS=agent,disable_pgv,grpcnotrace,retrynotrace
 # disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
 # vtprotobuf: enables optimized protobuf marshalling.
 STANDARD_TAGS=vtprotobuf,disable_pgv
@@ -245,6 +247,10 @@ build: depend ## Builds all go binaries.
 build-linux: depend
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(STANDARD_TAGS) $(STANDARD_BINARIES)
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(AGENT_TAGS) $(LINUX_AGENT_BINARIES)
+
+.PHONY: build-cni
+build-cni: depend
+	GOOS=$(GOOS_LOCAL) GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT)/ -tags=$(AGENT_TAGS) $(CNI_BINARIES)
 
 # Create targets for TARGET_OUT_LINUX/binary
 # There are two use cases here:
@@ -288,17 +294,19 @@ go-gen:
 	@PATH="${PATH}":/tmp/bin go generate ./...
 
 refresh-goldens:
-	@REFRESH_GOLDEN=true go test ${GOBUILDFLAGS} ./operator/... \
+	REFRESH_GOLDEN=true go test ${GOBUILDFLAGS} ./operator/... \
 		./pkg/bootstrap/... \
 		./pkg/kube/inject/... \
+		./pilot/pkg/config/kube/gateway/... \
 		./pilot/pkg/security/authz/builder/... \
-		./cni/pkg/plugin/...
+		./pilot/pkg/serviceregistry/kube/controller/ambient/... \
+		./cni/pkg/iptables/... \
+		./cni/pkg/plugin/... \
+		./istioctl/pkg/workload/... \
+		./istioctl/pkg/writer/envoy/configdump/... \
+		./istioctl/pkg/writer/ztunnel/configdump/...
 
 update-golden: refresh-goldens
-
-# Keep dummy target since some build pipelines depend on this
-gen-charts:
-	@echo "This target is no longer required and will be removed in the future"
 
 gen-addons:
 	manifests/addons/gen.sh
@@ -322,16 +330,23 @@ copy-templates:
 
 	# gateway charts
 	cp -r manifests/charts/gateways/istio-ingress/templates/* manifests/charts/gateways/istio-egress/templates
-	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/ingress/egress/g' {} \;
-	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/Ingress/Egress/g' {} \;
+	find ./manifests/charts/gateways/istio-egress/templates -type f -name "*.yaml" ! -name "networkpolicy.yaml" -exec sed -i -e 's/ingress/egress/g' {} \;
+	find ./manifests/charts/gateways/istio-egress/templates -type f -name "*.yaml" ! -name "networkpolicy.yaml" -exec sed -i -e 's/Ingress/Egress/g' {} \;
+	if [ -f ./manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml ]; then \
+		sed -i -e 's/"IngressGateways"/"EgressGateways"/g' ./manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml; \
+		sed -i -e 's/istio-ingress/istio-egress/g' ./manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml; \
+		sed -i -e 's/app: istio-ingress/app: istio-egress/g' ./manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml; \
+		sed -i -e 's/istio: ingressgateway/istio: egressgateway/g' ./manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml; \
+	fi
 
 	# copy istio-discovery values, but apply some local customizations
 	warning=$$(cat manifests/helm-profiles/warning-edit.txt | sed ':a;N;$$!ba;s/\n/\\n/g') ; \
 	for chart in $(CHARTS) ; do \
+	    rm -rf manifests/charts/$$chart/files/profile-*.yaml ; \
 		for profile in manifests/helm-profiles/*.yaml ; do \
 			sed "1s|^|$${warning}\n\n|" $$profile > manifests/charts/$$chart/files/profile-$$(basename $$profile) ; \
 		done; \
-		[[ "$$chart" == "ztunnel" ]] && flatten="true" || flatten="false" ; \
+		[[ "$$chart" == "ztunnel" ]] || [[ "$$chart" == "gateway" ]] && flatten="true" || flatten="false" ; \
 		cat manifests/zzz_profile.yaml | \
 		  sed "s/FLATTEN_GLOBALS_REPLACEMENT/$${flatten}/g" \
 		  > manifests/charts/$$chart/templates/zzz_profile.yaml ; \

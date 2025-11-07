@@ -140,6 +140,29 @@ func TestValidateCondition(t *testing.T) {
 			values: []string{"value"},
 		},
 		{
+			key:       "source.serviceAccount",
+			values:    []string{"too/many/slashes"},
+			wantError: true,
+		},
+		{
+			key:       "source.serviceAccount",
+			values:    []string{"/emptyns"},
+			wantError: true,
+		},
+		{
+			key:       "source.serviceAccount",
+			values:    []string{"emptysa/"},
+			wantError: true,
+		},
+		{
+			key:    "source.serviceAccount",
+			values: []string{"ns/sa"},
+		},
+		{
+			key:    "source.serviceAccount",
+			values: []string{"sa"},
+		},
+		{
 			key:    "request.auth.principal",
 			values: []string{"value"},
 		},

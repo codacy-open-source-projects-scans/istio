@@ -17,6 +17,7 @@ package nodeagent
 import (
 	"net/netip"
 
+	"istio.io/istio/cni/pkg/util"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/env"
 )
@@ -45,10 +46,14 @@ const (
 )
 
 type AmbientArgs struct {
-	SystemNamespace string
-	Revision        string
-	KubeConfig      string
-	ServerSocket    string
-	DNSCapture      bool
-	EnableIPv6      bool
+	SystemNamespace            string
+	Revision                   string
+	KubeConfig                 string
+	ServerSocket               string
+	EnablementSelector         *util.CompiledEnablementSelectors
+	DNSCapture                 bool
+	EnableIPv6                 bool
+	ReconcilePodRulesOnStartup bool
+	NativeNftables             bool
+	ForceIptablesBinary        string
 }

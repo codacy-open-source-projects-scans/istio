@@ -26,7 +26,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/util/protomarshal"
@@ -74,6 +74,12 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		Kind:      gvk.Service.Kind,
 		Name:      "foo-svc",
 		Namespace: "foo",
+	}
+	policyWithGWClassRef := protomarshal.Clone(policy)
+	policyWithGWClassRef.TargetRef = &selectorpb.PolicyTargetReference{
+		Group: gvk.GatewayClass.Group,
+		Kind:  gvk.GatewayClass.Kind,
+		Name:  "istio-waypoint",
 	}
 
 	denyPolicy := protomarshal.Clone(policy)
@@ -428,6 +434,32 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
 			},
 		},
+		{
+			name: "waypoint with default policies",
+			selectionOpts: WorkloadPolicyMatcher{
+				IsWaypoint: true,
+				Services: []ServiceInfoForPolicyMatcher{
+					{Name: "foo-svc", Namespace: "foo", Registry: provider.Kubernetes},
+				},
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "foo-waypoint",
+					// labels match in selector policy but ignore them for waypoint
+					"app":     "httpbin",
+					"version": "v1",
+				},
+				RootNamespace: "istio-config",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "foo", policyWithServiceRef),
+				newConfig("default", "istio-config", policyWithGWClassRef),
+				newConfig("default-non-waypoint", "istio-config", policyWithSelector),
+			},
+			wantAllow: []AuthorizationPolicy{
+				{Name: "default", Namespace: "istio-config", Spec: policyWithGWClassRef},
+				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -458,7 +490,7 @@ func createFakeAuthorizationPolicies(configs []config.Config) *AuthorizationPoli
 	}
 	environment := &Environment{
 		ConfigStore: store,
-		Watcher:     mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-config"}),
+		Watcher:     meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-config"}),
 	}
 	authzPolicies := GetAuthorizationPolicies(environment)
 	return authzPolicies
@@ -529,9 +561,5 @@ func (fs *authzFakeStore) Update(config.Config) (string, error) {
 }
 
 func (fs *authzFakeStore) UpdateStatus(config.Config) (string, error) {
-	return "not implemented", nil
-}
-
-func (fs *authzFakeStore) Patch(orig config.Config, patchFn config.PatchFunc) (string, error) {
 	return "not implemented", nil
 }

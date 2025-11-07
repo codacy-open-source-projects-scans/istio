@@ -38,8 +38,10 @@ type Response struct {
 	Method string
 	// Protocol used for the request.
 	Protocol string
-	// Alpn value (for HTTP).
+	// Alpn value (for TLS).
 	Alpn string
+	// SNI value (for TLS).
+	SNI string
 	// ProxyProtocol value.
 	ProxyProtocol string
 	// RawContent is the original unparsed content for this response
@@ -70,6 +72,10 @@ type Response struct {
 	RawBody         map[string]string
 	RequestHeaders  http.Header
 	ResponseHeaders http.Header
+	// ClientCertSubject is the subject of the client certificate.
+	ClientCertSubject string
+	// ClientCertSerialNumber is the serial number of the client certificate.
+	ClientCertSerialNumber string
 }
 
 // Count occurrences of the given text within the body of this response.

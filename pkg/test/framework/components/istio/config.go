@@ -105,6 +105,7 @@ var (
 		EgressGatewayServiceNamespace: DefaultSystemNamespace,
 		EgressGatewayServiceName:      DefaultEgressGatewayServiceName,
 		EgressGatewayIstioLabel:       DefaultEgressGatewayIstioLabel,
+		DeployGatewayAPI:              true,
 	}
 )
 
@@ -209,6 +210,13 @@ type Config struct {
 	// upon installing Istio.
 	// This field should only be set when DeployIstio is false.
 	SharedMeshConfigName string
+
+	// ControlPlaneInstaller allows installation of custom control planes on istio deployments via an external script
+	// This field should only be set when DeployIstio is false
+	ControlPlaneInstaller string
+
+	// DeployGatewayAPI indicates that the test should deploy Gateway API during tests execution
+	DeployGatewayAPI bool
 }
 
 func (c *Config) OverridesYAML(s *resource.Settings) string {
@@ -383,6 +391,7 @@ func (c *Config) String() string {
 	result += fmt.Sprintf("EgressGatewayServiceNamespace:  %v\n", c.EgressGatewayServiceNamespace)
 	result += fmt.Sprintf("EgressGatewayIstioLabel:        %v\n", c.EgressGatewayIstioLabel)
 	result += fmt.Sprintf("SharedMeshConfigName:           %v\n", c.SharedMeshConfigName)
+	result += fmt.Sprintf("ControlPlaneInstaller:          %v\n", c.ControlPlaneInstaller)
 
 	return result
 }

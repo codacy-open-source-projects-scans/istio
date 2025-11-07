@@ -15,7 +15,9 @@
 package core
 
 import (
+	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/util/sets"
@@ -31,8 +33,18 @@ const (
 	// ConnectOriginate is the name for the resources associated with the origination of HTTP CONNECT.
 	ConnectOriginate = "connect_originate"
 
+	// ForwardInnerConnect is the name for resources associated with the forwarding of an inner CONNECT tunnel.
+	ForwardInnerConnect = "forward_inner_connect"
+
 	// EncapClusterName is the name of the cluster used for traffic to the connect_originate listener.
 	EncapClusterName = "encap"
+
+	// DoubleHBONEInnerConnectOriginate and DoubleHBONEOuterConnectOriginate is the name for resources (cluster and
+	// listener) associated with estabslishing double HBONE (CONNECT within CONNECT) tunnel.
+	// DoubleHBONEInnerConnectOriginate is used for the inner CONNECT tunnel and DoubleHBONEOuterConnectOriginate
+	// is used for the outer CONNECT tunnel.
+	DoubleHBONEInnerConnectOriginate = "inner_connect_originate"
+	DoubleHBONEOuterConnectOriginate = "outer_connect_originate"
 
 	// ConnectUpgradeType is the type of upgrade for HTTP CONNECT.
 	ConnectUpgradeType = "CONNECT"
@@ -45,14 +57,20 @@ type waypointServices struct {
 
 // findWaypointResources returns workloads and services associated with the waypoint proxy
 func findWaypointResources(node *model.Proxy, push *model.PushContext) ([]model.WorkloadInfo, *waypointServices) {
-	key := model.WaypointKeyForProxy(node)
+	var key model.WaypointKey
+	if isEastWestGateway(node) {
+		key = model.WaypointKeyForNetworkGatewayProxy(node)
+	} else {
+		key = model.WaypointKeyForProxy(node)
+	}
+
 	workloads := push.WorkloadsForWaypoint(key)
 	serviceInfos := push.ServicesForWaypoint(key)
 
 	waypointServices := &waypointServices{}
 	for _, s := range serviceInfos {
 		hostName := host.Name(s.Service.Hostname)
-		svc, ok := push.ServiceIndex.HostnameAndNamespace[hostName][s.Namespace]
+		svc, ok := push.ServiceIndex.HostnameAndNamespace[hostName][s.Service.Namespace]
 		if !ok {
 			continue
 		}
@@ -81,7 +99,8 @@ func findWaypointResources(node *model.Proxy, push *model.PushContext) ([]model.
 func filterWaypointOutboundServices(
 	referencedServices map[string]sets.String,
 	waypointServices map[host.Name]*model.Service,
-	extraServices sets.String,
+	extraNamespacedHostnames sets.Set[model.NamespacedHostname],
+	extraHostnames sets.String,
 	services []*model.Service,
 ) []*model.Service {
 	outboundServices := sets.New[string]()
@@ -97,9 +116,36 @@ func filterWaypointOutboundServices(
 	}
 	res := make([]*model.Service, 0, len(outboundServices))
 	for _, s := range services {
-		if outboundServices.Contains(s.Hostname.String()) || extraServices.Contains(s.Hostname.String()) {
+		if outboundServices.Contains(s.Hostname.String()) ||
+			extraHostnames.Contains(s.Hostname.String()) ||
+			extraNamespacedHostnames.Contains(model.NamespacedHostname{
+				Hostname:  s.Hostname,
+				Namespace: s.Attributes.Namespace,
+			}) {
 			res = append(res, s)
 		}
 	}
 	return res
+}
+
+func isEastWestGateway(node *model.Proxy) bool {
+	if node == nil || node.Type != model.Waypoint {
+		return false
+	}
+	controller, isManagedGateway := node.Labels[label.GatewayManaged.Name]
+
+	return isManagedGateway && controller == constants.ManagedGatewayEastWestControllerLabel
+}
+
+// isWaypointProxy checks if the proxy is an actual waypoint and not say an E/W gateway.
+// We need it because as you can see by looking at isEastWestGateway above, E/W gateway is also
+// considered a waypoint proxy, so to tell if it's actually a waypoint just checking node type
+// isn't enough
+func isWaypointProxy(node *model.Proxy) bool {
+	if node == nil || node.Type != model.Waypoint {
+		return false
+	}
+	controller, isManagedGateway := node.Labels[label.GatewayManaged.Name]
+
+	return isManagedGateway && controller == constants.ManagedGatewayMeshControllerLabel
 }

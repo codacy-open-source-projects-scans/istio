@@ -21,7 +21,6 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"golang.org/x/sync/errgroup"
-	corev1 "k8s.io/api/core/v1"
 
 	"istio.io/api/annotation"
 	"istio.io/api/label"
@@ -69,6 +68,9 @@ type Config struct {
 	// Custom echo instances will be accessible from the `All` field in the namespace(s) under which they
 	// were created.
 	Configs echo.ConfigGetter
+
+	// ServiceNamePrefix allows setting a common prefix for all Services in the Configs
+	ServiceNamePrefix string
 }
 
 // AddConfigs appends to the configs to be deployed
@@ -100,8 +102,16 @@ func (c *Config) fillDefaults(ctx resource.Context) error {
 		c.Configs = echo.ConfigFuture(&defaultConfigs)
 	}
 
+	configs := c.Configs.Get()
+
+	if c.ServiceNamePrefix != "" {
+		for i := 0; i < len(configs); i++ {
+			configs[i].Service = c.ServiceNamePrefix + configs[i].Service
+		}
+	}
+
 	// Verify the namespace for any custom deployments.
-	for _, config := range c.Configs.Get() {
+	for _, config := range configs {
 		if config.Namespace != nil {
 			found := false
 			for _, ns := range c.Namespaces {
@@ -274,15 +284,14 @@ func (c *Config) DefaultEchoConfigs(t resource.Context) []echo.Config {
 
 	defaultConfigs = append(defaultConfigs, a, b, cSvc, headless, stateful, naked, tProxy, vmSvc)
 
-	if t.Settings().EnableDualStack {
+	if len(t.Settings().IPFamilies) > 1 {
 		dSvc := echo.Config{
 			Service:         DSvc,
 			ServiceAccount:  true,
 			Ports:           ports.All(),
 			Subsets:         []echo.SubsetConfig{{}},
 			IncludeExtAuthz: c.IncludeExtAuthz,
-			IPFamilies:      "IPv6, IPv4",
-			IPFamilyPolicy:  string(corev1.IPFamilyPolicyRequireDualStack),
+			IPFamilies:      t.Settings().IPFamilies[0],
 			DualStack:       true,
 		}
 		eSvc := echo.Config{
@@ -291,8 +300,7 @@ func (c *Config) DefaultEchoConfigs(t resource.Context) []echo.Config {
 			Ports:           ports.All(),
 			Subsets:         []echo.SubsetConfig{{}},
 			IncludeExtAuthz: c.IncludeExtAuthz,
-			IPFamilies:      "IPv6",
-			IPFamilyPolicy:  string(corev1.IPFamilyPolicySingleStack),
+			IPFamilies:      t.Settings().IPFamilies[1],
 			DualStack:       true,
 		}
 		defaultConfigs = append(defaultConfigs, dSvc, eSvc)
@@ -449,6 +457,7 @@ func New(ctx resource.Context, cfg Config) (*Echos, error) {
 	apps.NS = make([]EchoNamespace, len(cfg.Namespaces))
 	for i, ns := range cfg.Namespaces {
 		apps.NS[i].Namespace = ns.Get()
+		apps.NS[i].ServiceNamePrefix = cfg.ServiceNamePrefix
 	}
 	if !cfg.NoExternalNamespace {
 		apps.External.Namespace = cfg.ExternalNamespace.Get()
@@ -470,7 +479,7 @@ func New(ctx resource.Context, cfg Config) (*Echos, error) {
 
 	if ctx.Settings().Ambient {
 
-		waypointProxies := make(map[string]ambient.WaypointProxy)
+		waypointProxies := make(map[string]ambient.Waypoints)
 
 		for _, echo := range echos {
 			svcwp := echo.Config().ServiceWaypointProxy

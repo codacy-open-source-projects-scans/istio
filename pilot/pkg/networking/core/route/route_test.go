@@ -21,14 +21,15 @@ import (
 
 	envoycore "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extproc "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/types"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/networking/core/route"
@@ -37,12 +38,53 @@ import (
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/gateway/kube"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/wellknown"
 )
+
+func buildRouteOpts(sr map[host.Name]*model.Service, hash route.DestinationHashMap) route.RouteOptions {
+	return route.RouteOptions{
+		IsTLS:                     false,
+		IsHTTP3AltSvcHeaderNeeded: false,
+		Mesh:                      mesh.DefaultMeshConfig(),
+		Push:                      nil, // Will be set by individual tests if needed
+		LookupService: func(name host.Name) *model.Service {
+			return sr[name]
+		},
+		LookupDestinationCluster: route.GetDestinationCluster,
+		LookupHash: func(destination *networking.HTTPRouteDestination) *networking.LoadBalancerSettings_ConsistentHashLB {
+			return hash[destination]
+		},
+	}
+}
+
+func buildRouteOptsWithXForwardedHost(sr map[host.Name]*model.Service, hash route.DestinationHashMap) route.RouteOptions {
+	meshConfig := mesh.DefaultMeshConfig()
+	meshConfig.DefaultConfig.ProxyHeaders = &meshconfig.ProxyConfig_ProxyHeaders{
+		XForwardedHost: &meshconfig.ProxyConfig_ProxyHeaders_XForwardedHost{
+			Enabled: &wrapperspb.BoolValue{Value: true},
+		},
+	}
+
+	return route.RouteOptions{
+		IsTLS:                     false,
+		IsHTTP3AltSvcHeaderNeeded: false,
+		Mesh:                      meshConfig,
+		Push:                      nil, // Will be set by individual tests if needed
+		LookupService: func(name host.Name) *model.Service {
+			return sr[name]
+		},
+		LookupDestinationCluster: route.GetDestinationCluster,
+		LookupHash: func(destination *networking.HTTPRouteDestination) *networking.LoadBalancerSettings_ConsistentHashLB {
+			return hash[destination]
+		},
+	}
+}
 
 func TestBuildHTTPRoutes(t *testing.T) {
 	serviceRegistry := map[host.Name]*model.Service{
@@ -58,6 +100,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			},
 		},
 	}
+	routeOpts := buildRouteOpts(serviceRegistry, nil)
 
 	node := func(cg *core.ConfigGenTest) *model.Proxy {
 		return cg.SetupProxy(&model.Proxy{
@@ -65,6 +108,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			IPAddresses: []string{"1.1.1.1"},
 			ID:          "someID",
 			DNSDomain:   "foo.com",
+			Metadata:    &model.NodeMetadata{},
 			IstioVersion: &model.IstioVersion{
 				Major: 1,
 				Minor: 20,
@@ -86,7 +130,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		t.Setenv("ISTIO_DEFAULT_REQUEST_TIMEOUT", "0ms")
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -101,8 +147,10 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{IsHTTP3AltSvcHeaderNeeded: true})
+		routeOpts := buildRouteOpts(serviceRegistry, nil)
+		routeOpts.IsHTTP3AltSvcHeaderNeeded = true
+		routeOpts.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(routes[0].GetResponseHeadersToAdd()).To(Equal([]*envoycore.HeaderValueOption{
@@ -120,8 +168,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeout, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeout, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -136,8 +185,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeoutDisabled, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeoutDisabled, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -151,7 +201,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithCatchAllRoute,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -164,7 +214,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithCatchAllPort,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -183,7 +233,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		vs.Annotations[constants.InternalRouteSemantics] = constants.RouteSemanticsIngress
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), vs,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -206,7 +256,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		vs.Annotations[constants.InternalRouteSemantics] = constants.RouteSemanticsGateway
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), vs,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -227,7 +277,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithCatchAllRouteWeightedDestination,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -239,7 +289,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithCatchAllMultiPrefixRoute,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -251,7 +301,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRegexMatchingOnURI,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -263,7 +313,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithStatPrefix,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(3))
@@ -281,7 +331,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(nodeWithExtended(cg), virtualServiceWithExactMatchingOnHeaderForJWTClaims,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -297,7 +347,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRegexMatchingOnHeader,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -309,7 +359,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRegexMatchingOnWithoutHeader,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -323,7 +373,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithPresentMatchingOnHeader,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		g.Expect(err).NotTo(HaveOccurred())
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(len(routes)).To(Equal(1))
@@ -332,7 +382,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g.Expect(routes[0].GetMatch().GetHeaders()[0].GetInvertMatch()).To(Equal(false))
 
 		routes, err = route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithPresentMatchingOnHeader2,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		g.Expect(err).NotTo(HaveOccurred())
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(len(routes)).To(Equal(1))
@@ -346,7 +396,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithPresentMatchingOnWithoutHeader,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		g.Expect(err).NotTo(HaveOccurred())
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(len(routes)).To(Equal(1))
@@ -361,8 +411,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		for _, c := range cset {
 			g := NewWithT(t)
 			cg := core.NewConfigGenTest(t, core.TestOptions{})
-			routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), *c, serviceRegistry, nil,
-				8080, gatewayNames, route.RouteOptions{})
+			routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), *c,
+				8080, gatewayNames, routeOpts)
 			xdstest.ValidateRoutes(t, routes)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(len(routes)).To(Equal(1))
@@ -378,7 +428,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithExactMatchingOnQueryParameter,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -390,7 +440,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithPrefixMatchingOnQueryParameter,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -402,7 +452,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRegexMatchingOnQueryParameter,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -415,8 +465,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		for _, c := range cset {
 			g := NewWithT(t)
 			cg := core.NewConfigGenTest(t, core.TestOptions{})
-			routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), *c, serviceRegistry, nil,
-				8080, gatewayNames, route.RouteOptions{})
+			routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), *c,
+				8080, gatewayNames, routeOpts)
 			xdstest.ValidateRoutes(t, routes)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(len(routes)).To(Equal(1))
@@ -434,7 +484,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(fooNode, virtualServiceMatchingOnSourceNamespace,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -445,7 +495,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		})
 
 		routes, err = route.BuildHTTPRoutesForVirtualService(barNode, virtualServiceMatchingOnSourceNamespace,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
 		g.Expect(routes[0].GetName()).To(Equal("bar"))
@@ -486,8 +536,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		proxy := node(cg)
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualServicePlain)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -535,8 +585,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		proxy := node(cg)
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualServicePlain)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -581,8 +631,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		proxy := node(cg)
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualService)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -624,8 +674,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		proxy := node(cg)
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualService)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -639,6 +689,91 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			},
 		}
 		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(ConsistOf(hashPolicy))
+	})
+
+	t.Run("for virtual service with cookie hash policy with attributes", func(t *testing.T) {
+		g := NewWithT(t)
+		ttl := durationpb.Duration{Nanos: 100}
+		cg := core.NewConfigGenTest(t, core.TestOptions{
+			Services: exampleService,
+			Configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "acme",
+						Namespace:        "istio-system",
+					},
+					Spec: &networking.DestinationRule{
+						Host: "*.example.org",
+						TrafficPolicy: &networking.TrafficPolicy{
+							LoadBalancer: &networking.LoadBalancerSettings{
+								LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+									ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+										HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+											HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+												Name: "hash-cookie-with-attributes",
+												Ttl:  &ttl,
+												Path: "/api",
+												Attributes: []*networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie_Attribute{
+													{
+														Name:  "SameSite",
+														Value: "Strict",
+													},
+													{
+														Name:  "Secure",
+														Value: "true",
+													},
+													{
+														Name:  "HttpOnly",
+														Value: "true",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		proxy := node(cg)
+		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualServicePlain)
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		expectedAttributes := []*envoyroute.RouteAction_HashPolicy_CookieAttribute{
+			{
+				Name:  "SameSite",
+				Value: "Strict",
+			},
+			{
+				Name:  "Secure",
+				Value: "true",
+			},
+			{
+				Name:  "HttpOnly",
+				Value: "true",
+			},
+		}
+
+		hashPolicy := &envoyroute.RouteAction_HashPolicy{
+			PolicySpecifier: &envoyroute.RouteAction_HashPolicy_Cookie_{
+				Cookie: &envoyroute.RouteAction_HashPolicy_Cookie{
+					Name:       "hash-cookie-with-attributes",
+					Ttl:        &ttl,
+					Path:       "/api",
+					Attributes: expectedAttributes,
+				},
+			},
+		}
+		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(ConsistOf(hashPolicy))
+		g.Expect(len(routes[0].GetRoute().GetRetryPolicy().RetryHostPredicate)).To(Equal(0))
 	})
 
 	t.Run("for virtual service with subsets and top level traffic policy with ring hash", func(t *testing.T) {
@@ -670,8 +805,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		proxy := node(cg)
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualService)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -705,8 +840,8 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		proxy := node(cg)
 		gatewayNames := sets.New("some-gateway")
 		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualServicePlain)
-		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, serviceRegistry,
-			hashByDestination, 8080, gatewayNames, route.RouteOptions{})
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -727,7 +862,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithHeaderOperationsForSingleCluster,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -812,7 +947,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithHeaderOperationsForWeightedCluster,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -922,8 +1057,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirect, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirect, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -937,8 +1071,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithInvalidRedirect, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithInvalidRedirect, 8080, gatewayNames, routeOpts)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
 
@@ -950,8 +1083,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectPathPrefix, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectPathPrefix, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -966,9 +1098,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 	t.Run("for host rewrite", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
+		routeOpts.Push = cg.PushContext()
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteHost, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteHost, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -984,8 +1116,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteFullPath, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteFullPath, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1005,8 +1136,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewritePrefixPath, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewritePrefixPath, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1020,8 +1150,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithEmptyRewritePrefixPath, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithEmptyRewritePrefixPath, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1042,7 +1171,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg),
 			virtualServiceWithRewriteFullPathAndHost,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1066,7 +1195,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg),
 			virtualServiceWithPathRegexMatchRegexRewrite,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1081,13 +1210,53 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}))
 	})
 
+	t.Run("for host rewrite with XForwardedHost enabled", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOptsWithXForwardedHost := buildRouteOptsWithXForwardedHost(serviceRegistry, nil)
+		routeOptsWithXForwardedHost.Push = cg.PushContext()
+		routeOptsWithXForwardedHost.Push.Mesh = routeOptsWithXForwardedHost.Mesh
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteHost, 8080, gatewayNames, routeOptsWithXForwardedHost)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		routeAction, ok := routes[0].Action.(*envoyroute.Route_Route)
+		g.Expect(ok).NotTo(BeFalse())
+		g.Expect(routeAction.Route.HostRewriteSpecifier).To(Equal(&envoyroute.RouteAction_HostRewriteLiteral{
+			HostRewriteLiteral: "bar.example.org",
+		}))
+		// Verify that XForwardedHost is enabled
+		g.Expect(routeAction.Route.AppendXForwardedHost).To(Equal(true))
+	})
+
+	t.Run("for prefix path rewrite with XForwardedHost enabled", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOptsWithXForwardedHost := buildRouteOptsWithXForwardedHost(serviceRegistry, nil)
+		routeOptsWithXForwardedHost.Push = cg.PushContext()
+		routeOptsWithXForwardedHost.Push.Mesh = routeOptsWithXForwardedHost.Mesh
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewritePrefixPath, 8080, gatewayNames, routeOptsWithXForwardedHost)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		routeAction, ok := routes[0].Action.(*envoyroute.Route_Route)
+		g.Expect(ok).NotTo(BeFalse())
+		g.Expect(routeAction.Route.PrefixRewrite).To(Equal("/replace-prefix"))
+		// Verify that XForwardedHost is enabled
+		g.Expect(routeAction.Route.AppendXForwardedHost).To(Equal(true))
+	})
+
 	t.Run("for redirect uri prefix '%PREFIX()%' that is without gateway semantics", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg),
 			virtualServiceWithRedirectPathPrefixNoGatewaySematics,
-			serviceRegistry, nil, 8080, gatewayNames, route.RouteOptions{})
+			8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1103,8 +1272,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectFullPath, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectFullPath, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1120,8 +1288,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectAndSetHeader, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectAndSetHeader, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1139,8 +1306,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithDirectResponse, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithDirectResponse, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1155,8 +1321,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithDirectResponseAndSetHeader, serviceRegistry,
-			nil, 8080, gatewayNames, route.RouteOptions{})
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithDirectResponseAndSetHeader, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
@@ -1260,6 +1425,55 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("for virtual service with routing to an service with inference semantics", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOpts := buildRouteOpts(serviceRegistry, nil)
+		routeOpts.InferencePoolExtensionRefs = map[string]kube.InferencePoolRouteRuleConfig{
+			"routeA": {FQDN: "ext-proc-svc.test-namespace.svc.cluster.local", Port: "9002"},
+		}
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(routes[0].GetTypedPerFilterConfig()).To(HaveKey(wellknown.HTTPExternalProcessing))
+		extProcPerRoute := new(extproc.ExtProcPerRoute)
+		if err := routes[0].GetTypedPerFilterConfig()[wellknown.HTTPExternalProcessing].UnmarshalTo(extProcPerRoute); err != nil {
+			t.Errorf("couldn't unmarshal any proto: %v \n", err)
+		}
+		// nolint lll
+		g.Expect(extProcPerRoute.GetOverrides().GetGrpcService().GetTargetSpecifier().(*envoycore.GrpcService_EnvoyGrpc_).EnvoyGrpc.GetClusterName()).To(Equal("outbound|9002||ext-proc-svc.test-namespace.svc.cluster.local"))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetFailureModeAllow().GetValue()).To(BeFalse())
+	})
+
+	t.Run("for virtual service with routing to an service with inference semantics with failuremode override", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOpts := buildRouteOpts(serviceRegistry, nil)
+		routeOpts.InferencePoolExtensionRefs = map[string]kube.InferencePoolRouteRuleConfig{
+			"routeA": {FQDN: "ext-proc-svc.test-namespace.svc.cluster.local", Port: "9002", FailureModeAllow: true},
+		}
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(routes[0].GetTypedPerFilterConfig()).To(HaveKey(wellknown.HTTPExternalProcessing))
+		extProcPerRoute := new(extproc.ExtProcPerRoute)
+		if err := routes[0].GetTypedPerFilterConfig()[wellknown.HTTPExternalProcessing].UnmarshalTo(extProcPerRoute); err != nil {
+			t.Errorf("couldn't unmarshal any proto: %v \n", err)
+		}
+		// nolint lll
+		g.Expect(extProcPerRoute.GetOverrides().GetGrpcService().GetTargetSpecifier().(*envoycore.GrpcService_EnvoyGrpc_).EnvoyGrpc.GetClusterName()).To(Equal("outbound|9002||ext-proc-svc.test-namespace.svc.cluster.local"))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetFailureModeAllow().GetValue()).To(BeTrue())
+	})
 	t.Run("for virtualservices with with wildcard hosts outside of the serviceregistry (on port 80)", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{
@@ -1366,6 +1580,7 @@ var virtualServicePlain = config.Config{
 		Gateways: []string{"some-gateway"},
 		Http: []*networking.HTTPRoute{
 			{
+				Name: "routeA",
 				Route: []*networking.HTTPRouteDestination{
 					{
 						Destination: &networking.Destination{
@@ -2986,13 +3201,13 @@ func TestSortVHostRoutes(t *testing.T) {
 
 func TestInboundHTTPRoute(t *testing.T) {
 	testCases := []struct {
-		name        string
-		enableRetry bool
-		expected    *envoyroute.Route
+		name     string
+		protocol protocol.Instance
+		expected *envoyroute.Route
 	}{
 		{
-			name:        "enable retry",
-			enableRetry: true,
+			name:     "http protocol",
+			protocol: protocol.HTTP,
 			expected: &envoyroute.Route{
 				Name:  "default",
 				Match: route.TranslateRouteMatch(config.Config{}, nil),
@@ -3018,8 +3233,8 @@ func TestInboundHTTPRoute(t *testing.T) {
 			},
 		},
 		{
-			name:        "disable retry",
-			enableRetry: false,
+			name:     "grpc protocol",
+			protocol: protocol.GRPC,
 			expected: &envoyroute.Route{
 				Name:  "default",
 				Match: route.TranslateRouteMatch(config.Config{}, nil),
@@ -3041,9 +3256,8 @@ func TestInboundHTTPRoute(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableInboundRetryPolicy, tc.enableRetry)
 			inroute := route.BuildDefaultHTTPInboundRoute(&model.Proxy{IstioVersion: &model.IstioVersion{Major: 1, Minor: 24, Patch: -1}},
-				"cluster", "operation")
+				"cluster", "operation", tc.protocol)
 			if !reflect.DeepEqual(tc.expected, inroute) {
 				t.Errorf("error in inbound routes. Got: %v, Want: %v", inroute, tc.expected)
 			}

@@ -20,48 +20,15 @@ import (
 	"strings"
 	"testing"
 
+	"istio.io/istio/cni/pkg/config"
 	"istio.io/istio/cni/pkg/scopes"
 	testutil "istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/test/util/assert"
 	dep "istio.io/istio/tools/istio-iptables/pkg/dependencies"
 )
 
 func TestIptablesPodOverrides(t *testing.T) {
-	cases := []struct {
-		name         string
-		config       func(cfg *IptablesConfig)
-		podOverrides PodLevelOverrides
-	}{
-		{
-			name: "default",
-			config: func(cfg *IptablesConfig) {
-				cfg.RedirectDNS = true
-			},
-			podOverrides: PodLevelOverrides{},
-		},
-		{
-			name: "ingress",
-			config: func(cfg *IptablesConfig) {
-			},
-			podOverrides: PodLevelOverrides{IngressMode: true},
-		},
-		{
-			name: "virtual_interfaces",
-			config: func(cfg *IptablesConfig) {
-			},
-			podOverrides: PodLevelOverrides{
-				VirtualInterfaces: []string{"fake1s0f0", "fake1s0f1"},
-			},
-		},
-		{
-			name: "ingress_and_virtual_interfaces",
-			config: func(cfg *IptablesConfig) {
-			},
-			podOverrides: PodLevelOverrides{
-				IngressMode:       true,
-				VirtualInterfaces: []string{"fake1s0f0", "fake1s0f1"},
-			},
-		},
-	}
+	cases := GetCommonInPodTestCases()
 
 	for _, tt := range cases {
 		for _, ipv6 := range []bool{false, true} {
@@ -70,7 +37,7 @@ func TestIptablesPodOverrides(t *testing.T) {
 				cfg.EnableIPv6 = ipv6
 				tt.config(cfg)
 				ext := &dep.DependenciesStub{}
-				iptConfigurator, _, _ := NewIptablesConfigurator(cfg, ext, ext, EmptyNlDeps())
+				iptConfigurator, _, _ := NewIptablesConfigurator(cfg, cfg, ext, ext, EmptyNlDeps())
 				err := iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides)
 				if err != nil {
 					t.Fatal(err)
@@ -82,17 +49,25 @@ func TestIptablesPodOverrides(t *testing.T) {
 	}
 }
 
-func TestIptablesHostRules(t *testing.T) {
-	cases := []struct {
-		name   string
-		config func(cfg *IptablesConfig)
-	}{
-		{
-			"hostprobe",
-			func(cfg *IptablesConfig) {
-			},
-		},
+func TestIPv6NotAvailable(t *testing.T) {
+	setup(t)
+	cfg := constructTestConfig()
+	ext := &dep.DependenciesStub{
+		ForceIPv6DetectionFail: true,
 	}
+
+	// Istio shouldn't fail if we're working with IPv4 interfaces only, and ip6tables is unavailable.
+	cfg.EnableIPv6 = false
+	_, _, err := NewIptablesConfigurator(cfg, cfg, ext, ext, EmptyNlDeps())
+	assert.NoError(t, err)
+
+	cfg.EnableIPv6 = true
+	_, _, err = NewIptablesConfigurator(cfg, cfg, ext, ext, EmptyNlDeps())
+	assert.Error(t, err)
+}
+
+func TestIptablesHostRules(t *testing.T) {
+	cases := GetCommonHostTestCases()
 
 	for _, tt := range cases {
 		for _, ipv6 := range []bool{false, true} {
@@ -103,7 +78,7 @@ func TestIptablesHostRules(t *testing.T) {
 				cfg.HostProbeV6SNATAddress = netip.MustParseAddr("fd16:9254:7127:1337:ffff:ffff:ffff:ffff")
 				tt.config(cfg)
 				ext := &dep.DependenciesStub{}
-				iptConfigurator, _, _ := NewIptablesConfigurator(cfg, ext, ext, EmptyNlDeps())
+				iptConfigurator, _, _ := NewIptablesConfigurator(cfg, cfg, ext, ext, EmptyNlDeps())
 				err := iptConfigurator.CreateHostRulesForHealthChecks()
 				if err != nil {
 					t.Fatal(err)
@@ -116,36 +91,29 @@ func TestIptablesHostRules(t *testing.T) {
 }
 
 func TestInvokedTwiceIsIdempotent(t *testing.T) {
-	tt := struct {
-		name         string
-		config       func(cfg *IptablesConfig)
-		podOverrides PodLevelOverrides
-	}{
-		"default",
-		func(cfg *IptablesConfig) {
-			cfg.RedirectDNS = true
-		},
-		PodLevelOverrides{},
-	}
+	tests := GetCommonInPodTestCases()
 
-	cfg := constructTestConfig()
-	tt.config(cfg)
-	ext := &dep.DependenciesStub{}
-	iptConfigurator, _, _ := NewIptablesConfigurator(cfg, ext, ext, EmptyNlDeps())
-	err := iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides)
-	if err != nil {
-		t.Fatal(err)
-	}
-	compareToGolden(t, false, tt.name, ext.ExecutedAll)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := constructTestConfig()
+			tt.config(cfg)
+			ext := &dep.DependenciesStub{}
+			iptConfigurator, _, _ := NewIptablesConfigurator(cfg, cfg, ext, ext, EmptyNlDeps())
+			err := iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides)
+			if err != nil {
+				t.Fatal(err)
+			}
+			compareToGolden(t, false, tt.name, ext.ExecutedAll)
 
-	*ext = dep.DependenciesStub{}
-	// run another time to make sure we are idempotent
-	err = iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides)
-	if err != nil {
-		t.Fatal(err)
+			*ext = dep.DependenciesStub{}
+			// run another time to make sure we are idempotent
+			err = iptConfigurator.CreateInpodRules(scopes.CNIAgent, tt.podOverrides)
+			if err != nil {
+				t.Fatal(err)
+			}
+			compareToGolden(t, false, tt.name, ext.ExecutedAll)
+		})
 	}
-
-	compareToGolden(t, false, tt.name, ext.ExecutedAll)
 }
 
 func ipstr(ipv6 bool) string {
@@ -165,10 +133,10 @@ func compareToGolden(t *testing.T, ipv6 bool, name string, actual []string) {
 	testutil.CompareContent(t, gotBytes, goldenFile)
 }
 
-func constructTestConfig() *IptablesConfig {
+func constructTestConfig() *config.AmbientConfig {
 	probeSNATipv4 := netip.MustParseAddr("169.254.7.127")
 	probeSNATipv6 := netip.MustParseAddr("e9ac:1e77:90ca:399f:4d6d:ece2:2f9b:3164")
-	return &IptablesConfig{
+	return &config.AmbientConfig{
 		HostProbeSNATAddress:   probeSNATipv4,
 		HostProbeV6SNATAddress: probeSNATipv6,
 	}
