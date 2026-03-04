@@ -38,6 +38,7 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/core/loadbalancer"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
 	networkutil "istio.io/istio/pilot/pkg/util/network"
@@ -105,6 +106,11 @@ type clusterWrapper struct {
 	httpProtocolOptions *http.HttpProtocolOptions
 	// isDFPCluster indicates whether the cluster is a dynamic forward proxy cluster
 	isDFPCluster bool
+
+	// dnsWrappedLocalityLbEndpoints are the locality lb endpoints wrapped with IstioEndpoints.
+	// It is used to do failover priority label match with proxy labels.
+	// Only used for DNS type of clusters.
+	dnsWrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints
 }
 
 // metadataCerts hosts client certificate related metadata specified in proxy metadata.
@@ -319,6 +325,7 @@ func (cb *ClusterBuilder) buildSubsetCluster(
 	maybeApplyEdsConfig(subsetCluster.cluster)
 
 	cb.applyMetadataExchange(opts.mutable.cluster)
+	cb.maybeApplyBaggageMetadataDiscovery(opts.mutable.cluster)
 
 	// Add the DestinationRule+subsets metadata. Metadata here is generated on a per-cluster
 	// basis in buildCluster, so we can just insert without a copy.
@@ -368,6 +375,7 @@ func (cb *ClusterBuilder) applyDestinationRule(mc *clusterWrapper, clusterMode C
 	maybeApplyEdsConfig(mc.cluster)
 
 	cb.applyMetadataExchange(opts.mutable.cluster)
+	cb.maybeApplyBaggageMetadataDiscovery(opts.mutable.cluster)
 
 	if service.MeshExternal || opts.allInstancesHBONE {
 		// Conditionally skips based on config
@@ -401,6 +409,44 @@ func (cb *ClusterBuilder) applyDestinationRule(mc *clusterWrapper, clusterMode C
 func (cb *ClusterBuilder) applyMetadataExchange(c *cluster.Cluster) {
 	if features.MetadataExchange {
 		c.Filters = append(c.Filters, xdsfilters.TCPClusterMx)
+	}
+}
+
+func (cb *ClusterBuilder) maybeApplyBaggageMetadataDiscovery(c *cluster.Cluster) {
+	if cb.sendHbone && c.GetType() == cluster.Cluster_EDS {
+		applyBaggageMetadataDiscovery(c)
+	}
+}
+
+func (cb *ClusterBuilder) maybeDisableBaggageDiscovery(c *cluster.Cluster) {
+	if cb.sendHbone {
+		addDisableBaggageDiscoveryMetadata(c)
+	}
+}
+
+func applyBaggageMetadataDiscovery(c *cluster.Cluster) {
+	if features.EnableAmbientBaggage {
+		c.Filters = append(c.Filters, xdsfilters.WaypointClusterBaggagePeerMetadata)
+	}
+}
+
+func addDisableBaggageDiscoveryMetadata(c *cluster.Cluster) {
+	if features.EnableAmbientBaggage {
+		if c.Metadata == nil {
+			c.Metadata = &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{},
+			}
+		}
+		if _, ok := c.Metadata.FilterMetadata[util.IstioPeerMetadataKey]; !ok {
+			c.Metadata.FilterMetadata[util.IstioPeerMetadataKey] = &structpb.Struct{
+				Fields: map[string]*structpb.Value{},
+			}
+		}
+		c.Metadata.FilterMetadata[util.IstioPeerMetadataKey].Fields["disable_baggage_discovery"] = &structpb.Value{
+			Kind: &structpb.Value_BoolValue{
+				BoolValue: true,
+			},
+		}
 	}
 }
 

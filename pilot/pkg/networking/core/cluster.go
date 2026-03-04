@@ -32,6 +32,7 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core/envoyfilter"
+	"istio.io/istio/pilot/pkg/networking/core/loadbalancer"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/util/protoconv"
@@ -248,8 +249,14 @@ func (configgen *ConfigGeneratorImpl) buildClusters(proxy *model.Proxy, req *mod
 		// Waypoint proxies do not need outbound clusters in most cases, unless we have a route pointing to something
 		outboundPatcher := clusterPatcher{efw: envoyFilterPatches, pctx: networking.EnvoyFilter_SIDECAR_OUTBOUND}
 		extraNamespacedHosts, extraHosts := req.Push.ExtraWaypointServices(proxy, envoyFilterPatches)
-		ob, cs := configgen.buildOutboundClusters(cb, proxy, outboundPatcher, filterWaypointOutboundServices(
-			req.Push.ServicesAttachedToMesh(), wps.services, extraNamespacedHosts, extraHosts, services))
+		outboundServices := filterWaypointOutboundServices(
+			req.Push.ServicesAttachedToMesh(), wps.services, extraNamespacedHosts, extraHosts, services)
+		// For E/W gateways that also expose non-HBONE ports via the Gateway API (e.g., TLS passthrough
+		// to the Kubernetes API server), include services referenced by those gateway servers.
+		if isAmbientEastWestGateway(proxy) && proxy.MergedGateway != nil {
+			outboundServices = appendGatewayReferencedServices(req.Push, proxy, outboundServices, services)
+		}
+		ob, cs := configgen.buildOutboundClusters(cb, proxy, outboundPatcher, outboundServices)
 		cacheStats = cacheStats.merge(cs)
 		resources = append(resources, ob...)
 		// Setup inbound clusters
@@ -315,6 +322,49 @@ func deltaAwareConfigTypes(cfgs sets.Set[model.ConfigKey]) bool {
 	return true
 }
 
+// appendGatewayReferencedServices extends the outbound service list for an E/W gateway by adding
+// services that are referenced by the gateway's VirtualServices (e.g., TLS passthrough backends).
+// This ensures that the required outbound clusters exist for non-HBONE traffic the E/W gateway routes.
+// Note: we do NOT rely on ServiceAttachedToGateway / destinationsByGateway because those are only
+// populated when PILOT_FILTER_GATEWAY_CLUSTER_CONFIG=true. Instead we read VirtualServices directly.
+func appendGatewayReferencedServices(push *model.PushContext, proxy *model.Proxy, existing []*model.Service, allServices []*model.Service) []*model.Service {
+	if proxy.MergedGateway == nil {
+		return existing
+	}
+
+	// Collect all destination hostnames referenced by TLS/TCP routes on this gateway's VirtualServices.
+	gwHosts := sets.New[string]()
+	for _, gwName := range proxy.MergedGateway.GatewayNameForServer {
+		for _, vs := range push.VirtualServicesForGateway(proxy.ConfigNamespace, gwName) {
+			rule := vs.Spec.(*networking.VirtualService)
+			for _, tls := range rule.Tls {
+				for _, route := range tls.Route {
+					if route.Destination != nil {
+						gwHosts.Insert(route.Destination.Host)
+					}
+				}
+			}
+		}
+	}
+
+	if gwHosts.IsEmpty() {
+		return existing
+	}
+
+	existingSet := sets.New[string]()
+	for _, s := range existing {
+		existingSet.Insert(s.Hostname.String())
+	}
+	for _, svc := range allServices {
+		h := svc.Hostname.String()
+		if !existingSet.Contains(h) && gwHosts.Contains(h) {
+			existingSet.Insert(h)
+			existing = append(existing, svc)
+		}
+	}
+	return existing
+}
+
 // buildOutboundClusters generates all outbound (including subsets) clusters for a given proxy.
 func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, proxy *model.Proxy, cp clusterPatcher,
 	services []*model.Service,
@@ -346,8 +396,19 @@ func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, 
 
 			// We have a cache miss, so we will re-generate the cluster and later store it in the cache.
 			var lbEndpoints []*endpoint.LocalityLbEndpoints
+			var dnsWrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints
 			if clusterKey.endpointBuilder != nil {
+				// This is set only for DNS clusters.
 				lbEndpoints = clusterKey.endpointBuilder.FromServiceEndpoints()
+				if len(lbEndpoints) > 0 {
+					istioEndpoints := clusterKey.endpointBuilder.IstioEndpoints()
+					dnsWrappedLocalityLbEndpoints = &loadbalancer.WrappedLocalityLbEndpoints{
+						IstioEndpoints: istioEndpoints,
+						// For DNS clusters, we only have one locality lb endpoint
+						// with multiple LbEndpoints.
+						LocalityLbEndpoints: lbEndpoints[0],
+					}
+				}
 			}
 
 			// create default cluster
@@ -356,6 +417,7 @@ func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, 
 			if defaultCluster == nil {
 				continue
 			}
+			defaultCluster.dnsWrappedLocalityLbEndpoints = dnsWrappedLocalityLbEndpoints
 
 			// if the service uses persistent sessions, override status allows
 			// DRAINING endpoints to be kept as 'UNHEALTHY' coarse status in envoy.
