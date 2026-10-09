@@ -16,6 +16,7 @@ package chiron
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -199,7 +200,7 @@ func TestSubmitCSR(t *testing.T) {
 				cert.UsageServerAuth,
 				cert.UsageClientAuth,
 			}
-			r, err := submitCSR(client, []byte("test-pem"), "test-signer",
+			r, err := submitCSR(context.Background(), client, []byte("test-pem"), "test-signer",
 				usages, DefaulCertTTL)
 			if tc.expectFail {
 				assert.Error(t, err)
@@ -274,7 +275,7 @@ func TestReadSignedCertificate(t *testing.T) {
 			client := initFakeKubeClient(t, tc.certificateData)
 
 			// 4. Read the signed certificate
-			_, _, err := SignCSRK8s(client.Kube(), createFakeCsr(t), "fake-signer", []cert.KeyUsage{cert.UsageAny}, "fake.com",
+			_, _, err := SignCSRK8s(context.Background(), client.Kube(), createFakeCsr(t), "fake-signer", []cert.KeyUsage{cert.UsageAny}, "fake.com",
 				tc.k8sCaCertFile, true, true, 1*time.Second)
 
 			if tc.expectFail {
@@ -319,9 +320,6 @@ func initFakeKubeClient(t test.Failer, certificate []byte) kube.CLIClient {
 					continue
 				}
 				if approved(csr) {
-					// This is a pretty terrible hack, but client-go fake doesn't properly support list+watch,
-					// so any updates in between the list and watch would be missed. So give some time for the watch to start
-					time.Sleep(time.Millisecond * 25)
 					csr.Status.Certificate = certificate
 					_, err := client.Kube().CertificatesV1().CertificateSigningRequests().UpdateStatus(ctx, csr, metav1.UpdateOptions{})
 					log.Debugf("test signer sign %v: %v", csr.Name, err)

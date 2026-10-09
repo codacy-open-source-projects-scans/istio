@@ -19,7 +19,11 @@ import (
 	"strings"
 	"time"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"k8s.io/apimachinery/pkg/types"
 
 	networking "istio.io/api/networking/v1alpha3"
@@ -30,6 +34,14 @@ import (
 	"istio.io/istio/pkg/config/xds"
 	"istio.io/istio/pkg/util/sets"
 )
+
+// IsMergeOperation reports whether the operation merges the patch value into the
+// existing config. Both MERGE and MERGE_AND_REPLACE_LIST are merge operations; they
+// differ only in how repeated (list) fields are handled.
+func IsMergeOperation(operation networking.EnvoyFilter_Patch_Operation) bool {
+	return operation == networking.EnvoyFilter_Patch_MERGE ||
+		operation == networking.EnvoyFilter_Patch_MERGE_AND_REPLACE_LIST
+}
 
 // EnvoyFilterWrapper is a wrapper for the EnvoyFilter api object with pre-processed data
 type EnvoyFilterWrapper struct {
@@ -75,13 +87,24 @@ func (efw *EnvoyFilterWrapper) GetSelector() *v1beta1.WorkloadSelector {
 	return nil
 }
 
+// maxProxyVersionLen bounds the proxyVersion match expression length. Version strings are short;
+// very long patterns are expensive to compile and are treated as a non-match rather than compiled.
+// Kept in sync with the same const in pkg/config/validation/envoyfilter, which warns on it.
+const maxProxyVersionLen = 1024
+
 // EnvoyFilterConfigPatchWrapper is a wrapper over the EnvoyFilter ConfigPatch api object
 // fields are ordered such that this struct is aligned
 type EnvoyFilterConfigPatchWrapper struct {
-	Value     proto.Message
-	Match     *networking.EnvoyFilter_EnvoyConfigObjectMatch
-	ApplyTo   networking.EnvoyFilter_ApplyTo
-	Operation networking.EnvoyFilter_Patch_Operation
+	Value proto.Message
+	// TypedConfig is the decoded filter config for merge patches. It is shared across
+	// proxies and must not be mutated. It is nil when absent or decoding failed.
+	TypedConfig proto.Message
+	// TransportSocketTypedConfig is the decoded transport socket config for cluster and
+	// filter-chain merge patches, with the same sharing and nil semantics as TypedConfig.
+	TransportSocketTypedConfig proto.Message
+	Match                      *networking.EnvoyFilter_EnvoyConfigObjectMatch
+	ApplyTo                    networking.EnvoyFilter_ApplyTo
+	Operation                  networking.EnvoyFilter_Patch_Operation
 	// Pre-compile the regex from proxy version match in the match
 	ProxyVersionRegex *regexp.Regexp
 	// ProxyPrefixMatch provides a prefix match for the proxy version. The current API only allows
@@ -91,6 +114,10 @@ type EnvoyFilterConfigPatchWrapper struct {
 	Name             string
 	Namespace        string
 	FullName         string
+	// ProxyVersionNoMatch is set when the proxyVersion match expression could not be safely compiled
+	// (e.g. it exceeds maxProxyVersionLen). When true the patch matches no proxy (fail closed) rather
+	// than matching every version, which is what a nil ProxyVersionRegex would otherwise do.
+	ProxyVersionNoMatch bool
 }
 
 // wellKnownVersions defines a mapping of well known regex matches to prefix matches
@@ -171,6 +198,31 @@ func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 			log.Errorf("envoyfilter %s/%s failed to build envoy filter value: %+v", local.Namespace, local.Name, err)
 			continue
 		}
+		if IsMergeOperation(cpw.Operation) {
+			var typedConfig *anypb.Any
+			decodedConfig := &cpw.TypedConfig
+			switch value := cpw.Value.(type) {
+			case *cluster.Cluster:
+				typedConfig = value.GetTransportSocket().GetTypedConfig()
+				decodedConfig = &cpw.TransportSocketTypedConfig
+			case *listener.FilterChain:
+				typedConfig = value.GetTransportSocket().GetTypedConfig()
+				decodedConfig = &cpw.TransportSocketTypedConfig
+			case *listener.Filter:
+				typedConfig = value.GetTypedConfig()
+			case *hcm.HttpFilter:
+				typedConfig = value.GetTypedConfig()
+			case *listener.ListenerFilter:
+				typedConfig = value.GetTypedConfig()
+			}
+			if typedConfig != nil {
+				*decodedConfig, err = typedConfig.UnmarshalNew()
+				if err != nil {
+					*decodedConfig = nil
+					log.Debugf("envoyfilter %s/%s failed to decode merge typed config: %v", local.Namespace, local.Name, err)
+				}
+			}
+		}
 		if cp.Match == nil {
 			// create a match all object
 			cpw.Match = &networking.EnvoyFilter_EnvoyConfigObjectMatch{Context: networking.EnvoyFilter_ANY}
@@ -180,6 +232,10 @@ func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 			// we can workaround the performance impact of regex
 			if prefix, f := wellKnownVersions[cp.Match.Proxy.ProxyVersion]; f {
 				cpw.ProxyPrefixMatch = prefix
+			} else if len(cp.Match.Proxy.ProxyVersion) > maxProxyVersionLen {
+				// Don't compile pathologically long patterns; the compile is expensive enough to be a
+				// DoS vector against istiod. Fail closed so the patch matches no proxy.
+				cpw.ProxyVersionNoMatch = true
 			} else {
 				// pre-compile the regex for proxy version if it exists
 				// ignore the error because validation catches invalid regular expressions.
@@ -210,6 +266,11 @@ func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 func proxyMatch(proxy *Proxy, cp *EnvoyFilterConfigPatchWrapper) bool {
 	if cp.Match.Proxy == nil {
 		return true
+	}
+
+	if cp.ProxyVersionNoMatch {
+		// the proxyVersion match could not be safely compiled, so we can't evaluate it; fail closed
+		return false
 	}
 
 	if cp.ProxyPrefixMatch != "" {

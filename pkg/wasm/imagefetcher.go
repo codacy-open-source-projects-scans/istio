@@ -64,6 +64,10 @@ func (o ImageFetcherOption) String() string {
 
 type ImageFetcher struct {
 	fetchOpts []remote.Option
+	// allowInsecureHTTPDowngrade mirrors ImageFetcherOption.Insecure: whether the operator has
+	// explicitly allowlisted this registry (via WASM_INSECURE_REGISTRIES) to be accessed without
+	// transport security. This is what gates PrepareFetch's HTTPS-to-HTTP retry.
+	allowInsecureHTTPDowngrade bool
 }
 
 // ssrfProtectionTransport wraps http.RoundTripper to block SSRF via bearer realm
@@ -166,25 +170,39 @@ func NewImageFetcher(ctx context.Context, opt ImageFetcherOption) *ImageFetcher 
 		fetchOpts = append(fetchOpts, remote.WithAuthFromKeychain(&wasmKeyChain{data: opt.PullSecret}))
 	}
 
-	var transport http.RoundTripper
+	// Always clone rather than mutating the shared package-level remote.DefaultTransport.
+	t := remote.DefaultTransport.(*http.Transport).Clone()
 	if opt.Insecure {
-		t := remote.DefaultTransport.(*http.Transport).Clone()
 		// nolint: gosec
 		// This is only when a user explicitly sets a flag to enable insecure mode
 		t.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: opt.Insecure,
 		}
-		transport = t
-	} else {
-		transport = remote.DefaultTransport
 	}
+	// Block SSRF at the dial level: go-containerregistry's own CheckRedirect only rejects
+	// redirects to an IP-literal in a private/loopback/link-local range, and explicitly allows
+	// redirects to a hostname that resolves to one (e.g. metadata.google.internal). Checking the
+	// resolved IP at dial time closes that gap for every request this fetcher makes, including
+	// the bearer token fetch and any redirect hop, regardless of what the Location header names.
+	t.DialContext = wasmDialContext()
+	var transport http.RoundTripper = t
 
 	// wrap transport with SSRF protection for CVE-pending bearer realm vulnerability
 	fetchOpts = append(fetchOpts, remote.WithTransport(&ssrfProtectionTransport{inner: transport}))
 
 	return &ImageFetcher{
-		fetchOpts: append(fetchOpts, remote.WithContext(ctx)),
+		fetchOpts:                  append(fetchOpts, remote.WithContext(ctx)),
+		allowInsecureHTTPDowngrade: opt.Insecure,
 	}
+}
+
+// shouldRetryPlaintext reports whether PrepareFetch may retry a failed HTTPS fetch over
+// plaintext HTTP. The registry is untrusted input: a MITM or attacker-controlled registry
+// can trigger arbitrary error strings on the HTTPS attempt, so fetchErr alone must never be
+// sufficient to authorize a transport downgrade. Retrying is only safe for a registry the
+// operator has already, out of band, declared acceptable to speak to insecurely (allowInsecureHTTPDowngrade).
+func shouldRetryPlaintext(allowInsecureHTTPDowngrade bool, fetchErr error) bool {
+	return allowInsecureHTTPDowngrade && fetchErr != nil && strings.Contains(fetchErr.Error(), "server gave HTTP response")
 }
 
 // PrepareFetch is the entrypoint for fetching Wasm binary from Wasm Image Specification compatible images.
@@ -199,10 +217,12 @@ func (o *ImageFetcher) PrepareFetch(url string) (binaryFetcher func() ([]byte, e
 	wasmLog.Infof("fetching image %s from registry %s with tag %s", ref.Context().RepositoryStr(),
 		ref.Context().RegistryStr(), ref.Identifier())
 
-	// fallback to http based request, inspired by [helm](https://github.com/helm/helm/blob/12f1bc0acdeb675a8c50a78462ed3917fb7b2e37/pkg/registry/client.go#L594)
-	// only deal with https fallback instead of attributing all other type of errors to URL parsing error
+	// Fallback to a plaintext HTTP request, inspired by helm's registry client
+	// (https://github.com/helm/helm/blob/12f1bc0acdeb675a8c50a78462ed3917fb7b2e37/pkg/registry/client.go#L594).
+	// Only retried when shouldRetryPlaintext allows it - i.e. for a registry the operator has
+	// already allowlisted as insecure, never on the base of the registry's response alone.
 	desc, err := remote.Get(ref, o.fetchOpts...)
-	if err != nil && strings.Contains(err.Error(), "server gave HTTP response") {
+	if shouldRetryPlaintext(o.allowInsecureHTTPDowngrade, err) {
 		wasmLog.Infof("fetching image with plain text from %s", url)
 		ref, err = name.ParseReference(url, name.Insecure)
 		if err == nil {

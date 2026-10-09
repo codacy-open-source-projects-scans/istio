@@ -20,6 +20,7 @@ import (
 	"sync"
 	"testing"
 
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
 	"istio.io/istio/pilot/pkg/features"
@@ -31,6 +32,7 @@ import (
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
@@ -229,13 +231,99 @@ func TestDeltaEDS(t *testing.T) {
 	// delete svc, only send eds for this service
 	s.MemRegistry.RemoveService(edsIncSvc)
 
+	// service deletion pushes and EDS update for the service with empty endpoints
 	resp = ads.ExpectResponse()
-	if len(resp.RemovedResources) != 1 || resp.RemovedResources[0] != "outbound|8080||"+edsIncSvc {
-		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
-	}
-	if len(resp.Resources) != 0 {
+	if len(resp.Resources) != 1 || resp.Resources[0].Name != "outbound|8080||"+edsIncSvc {
 		t.Fatalf("received unexpected eds resource %v", resp.Resources)
 	}
+	cla := &endpoint.ClusterLoadAssignment{}
+	if err := resp.Resources[0].Resource.UnmarshalTo(cla); err != nil {
+		t.Fatalf("invalid eds push: %s", err)
+	}
+	if len(cla.Endpoints) > 0 {
+		t.Fatalf("received non-empty endpoints for service: %v", cla)
+	}
+	if len(resp.RemovedResources) != 0 {
+		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
+	}
+}
+
+func TestDeltaEDSIgnoresSkippedConfigs(t *testing.T) {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	s.MemRegistry.AddHTTPService("eds-1.default.svc.cluster.local", "10.0.0.1", 80)
+	s.MemRegistry.AddHTTPService("eds-2.default.svc.cluster.local", "10.0.0.2", 80)
+	s.EnsureSynced(t)
+
+	ads := s.ConnectDeltaADS().WithType(v3.EndpointType).WithNodeType(model.Waypoint)
+	clusters := []string{
+		"outbound|80||eds-1.default.svc.cluster.local",
+		"outbound|80||eds-2.default.svc.cluster.local",
+	}
+	ads.RequestResponseAck(&discovery.DeltaDiscoveryRequest{ResourceNamesSubscribe: clusters})
+
+	s.Discovery.Push(&model.PushRequest{
+		ConfigsUpdated: sets.New(
+			model.ConfigKey{Kind: kind.Endpoints, Name: "eds-1.default.svc.cluster.local", Namespace: "default"},
+			model.ConfigKey{Kind: kind.VirtualService, Name: "unrelated", Namespace: "default"},
+		),
+	}, true)
+
+	resp := ads.ExpectResponse()
+	assert.Equal(t, slices.Map(resp.Resources, func(r *discovery.Resource) string { return r.Name }), clusters[:1])
+}
+
+func TestDeltaWorkloadAddressOnlyUpdate(t *testing.T) {
+	test.SetForTest(t, &features.ScopedAddressPushes, true)
+	store := newTestAmbientStore()
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{AmbientIndex: store})
+	s.MemRegistry.AddHTTPService(edsIncSvc, edsIncVip, 8080)
+	s.EnsureSynced(t)
+
+	ads := s.ConnectDeltaADS().WithType(v3.EndpointType).WithNodeType(model.Router)
+	ads.RequestResponseAck(&discovery.DeltaDiscoveryRequest{
+		ResourceNamesSubscribe: []string{"outbound|8080||" + edsIncSvc},
+	})
+	ads.Request(&discovery.DeltaDiscoveryRequest{
+		TypeUrl:                v3.WorkloadType,
+		ResourceNamesSubscribe: []string{"*"},
+	})
+	resp := ads.ExpectEmptyResponse()
+	assert.Equal(t, resp.TypeUrl, v3.WorkloadType)
+	ads.Request(&discovery.DeltaDiscoveryRequest{TypeUrl: resp.TypeUrl, ResponseNonce: resp.Nonce})
+
+	wl := &model.WorkloadInfo{Workload: &workloadapi.Workload{
+		Uid:       "Kubernetes//Pod/default/x",
+		Namespace: "default",
+		Name:      "x",
+	}}
+	store.AddWorkloadInfo(wl)
+	s.Discovery.ConfigUpdate(&model.PushRequest{
+		AddressesUpdated: sets.New(wl.ResourceName()),
+		ConfigsUpdated:   sets.New(model.ConfigKey{Kind: kind.Address, Name: wl.ResourceName()}),
+	})
+	resp = ads.ExpectResponse()
+	assert.Equal(t, resp.TypeUrl, v3.WorkloadType)
+	assert.Equal(t, len(resp.Resources), 1)
+	assert.Equal(t, resp.Resources[0].Name, wl.ResourceName())
+	got := &workloadapi.Workload{}
+	assert.NoError(t, resp.Resources[0].Resource.UnmarshalTo(got))
+	assert.Equal(t, got, wl.Workload)
+	assert.Equal(t, len(resp.RemovedResources), 0)
+	ads.Request(&discovery.DeltaDiscoveryRequest{TypeUrl: resp.TypeUrl, ResponseNonce: resp.Nonce})
+	// Address-only pushes must not produce an EDS response on the same connection.
+	ads.ExpectNoResponse()
+
+	store.RemoveWorkloadInfo(wl)
+	s.Discovery.ConfigUpdate(&model.PushRequest{
+		AddressesUpdated: sets.New(wl.ResourceName()),
+		ConfigsUpdated:   sets.New(model.ConfigKey{Kind: kind.Address, Name: wl.ResourceName()}),
+	})
+	resp = ads.ExpectResponse()
+	assert.Equal(t, resp.TypeUrl, v3.WorkloadType)
+	assert.Equal(t, len(resp.Resources), 0)
+	assert.Equal(t, resp.RemovedResources, []string{wl.ResourceName()})
+	ads.Request(&discovery.DeltaDiscoveryRequest{TypeUrl: resp.TypeUrl, ResponseNonce: resp.Nonce})
+	ads.ExpectNoResponse()
 }
 
 func TestDeltaReconnectRequests(t *testing.T) {
@@ -285,7 +373,7 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	}
 
 	// A push should get a response
-	s.Discovery.ConfigUpdate(&model.PushRequest{Full: true, Forced: true})
+	s.Discovery.ConfigUpdate(&model.PushRequest{Forced: true})
 	ads.ExpectResponse()
 
 	// Close the connection
@@ -294,7 +382,6 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	// Service is removed while connection is closed
 	s.MemRegistry.RemoveService("adsupdate.example.com")
 	s.Discovery.ConfigUpdate(&model.PushRequest{
-		Full:           true,
 		ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: "adsupdate.example.com", Namespace: "default"}),
 	})
 	s.EnsureSynced(t)

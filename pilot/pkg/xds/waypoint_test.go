@@ -26,15 +26,21 @@ import (
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	upstream "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	networking "istio.io/api/networking/v1alpha3"
+	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xds"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/jwt"
+	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
@@ -408,6 +414,41 @@ spec:
 	notApp := xdstest.ExtractHTTPConnectionManager(t,
 		xdstest.ExtractFilterChain(model.BuildSubsetKey(model.TrafficDirectionInboundVIP, "http", "not-app.com", 80), l))
 	assert.Equal(t, sets.New(slices.Map(notApp.HttpFilters, (*hcm.HttpFilter).GetName)...).Contains("envoy.filters.http.jwt_authn"), false)
+}
+
+func TestWaypointRequestAuthRemoteJWKSCluster(t *testing.T) {
+	test.SetForTest(t, &features.JwksFetchMode, jwt.Envoy)
+	requestAuthn := `apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: jwt-on-waypoint
+  namespace: default
+spec:
+  targetRefs:
+  - group: networking.istio.io
+    kind: ServiceEntry
+    name: app
+  jwtRules:
+  - issuer: example.ietf.org
+    jwksUri: http://jwks.example.com/jwks`
+	jwksServiceEntry := `apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: jwks
+  namespace: default
+spec:
+  hosts: [jwks.example.com]
+  ports:
+  - number: 80
+    name: http
+    protocol: HTTP
+  resolution: DNS`
+	d, proxy := setupWaypointTest(t,
+		waypointGateway, waypointSvc, waypointInstance,
+		appServiceEntry, jwksServiceEntry, requestAuthn)
+
+	clusters := xdstest.ExtractClusters(d.Clusters(proxy))
+	assert.Equal(t, clusters["outbound|80||jwks.example.com"] != nil, true)
 }
 
 func TestCrossNamespaceWaypointRequestAuth(t *testing.T) {
@@ -1210,4 +1251,39 @@ spec:
 			}
 		})
 	}
+}
+
+func TestWaypointScopedAddressPush(t *testing.T) {
+	d, _ := setupWaypointTest(t,
+		waypointGateway, waypointSvc, waypointInstance, appServiceEntry)
+
+	ads := d.ConnectADS().WithType(v3.ListenerType).
+		WithID("waypoint~3.0.0.1~waypoint-pod.default~default.svc.cluster.local")
+	ads.RequestResponseAck(t, nil)
+
+	// Workload churn unrelated to any waypoint (pods scaling, nodes recycling, ...) only
+	// produces Address updates; the waypoint's config doesn't reference it, so its
+	// listeners must not be rebuilt.
+	clienttest.NewWriter[*networkingclient.WorkloadEntry](t, d.KubeClient()).Create(&networkingclient.WorkloadEntry{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "default"},
+		Spec:       networking.WorkloadEntry{Address: "9.9.9.9"},
+	})
+	ads.ExpectNoResponse(t)
+
+	// A service attaching to this waypoint arrives through the same Address update path and
+	// must still trigger a listener rebuild.
+	clienttest.NewWriter[*networkingclient.ServiceEntry](t, d.KubeClient()).Create(&networkingclient.ServiceEntry{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "app2",
+			Namespace: "default",
+			Labels:    map[string]string{label.IoIstioUseWaypoint.Name: "waypoint"},
+		},
+		Spec: networking.ServiceEntry{
+			Hosts:      []string{"app2.com"},
+			Addresses:  []string{"1.2.3.5"},
+			Ports:      []*networking.ServicePort{{Number: 80, Name: "http", Protocol: "HTTP"}},
+			Resolution: networking.ServiceEntry_STATIC,
+		},
+	})
+	ads.ExpectResponse(t)
 }

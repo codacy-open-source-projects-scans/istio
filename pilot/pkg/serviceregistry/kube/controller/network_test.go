@@ -15,8 +15,8 @@
 package controller
 
 import (
-	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,7 +26,6 @@ import (
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvr"
@@ -34,6 +33,7 @@ import (
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 func TestNetworkUpdateTriggers(t *testing.T) {
@@ -50,36 +50,14 @@ func TestNetworkUpdateTriggers(t *testing.T) {
 		t.Fatal("did not expect any gateways yet")
 	}
 
-	notifyCh := make(chan struct{}, 10)
-	var (
-		gwMu sync.Mutex
-		gws  []model.NetworkGateway
-	)
-	setGws := func(v []model.NetworkGateway) {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		gws = v
-	}
-	getGws := func() []model.NetworkGateway {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		return gws
-	}
-
-	c.AppendNetworkGatewayHandler(func() {
-		setGws(c.NetworkGateways())
-		notifyCh <- struct{}{}
-	})
+	// Poll the controller's reported state rather than counting notify events.
+	// Counting events races with the informer queue: a SetNetworks call can fire
+	// before the Service Adds are drained, producing a partial notification first
+	// and the full one once the queue catches up. State polling does not care
+	// about the order or how many partial notifications fire.
 	expectGateways := func(t *testing.T, expectedGws int) {
-		// wait for a notification
-		// We may get up to 3 since we are creating 2 services, though sometimes it is collapsed into a single event depending no timing
-		for range 3 {
-			assert.ChannelHasItem(t, notifyCh)
-			if n := len(getGws()); n == expectedGws {
-				return
-			}
-		}
-		t.Errorf("expected %d gateways but got %v", expectedGws, getGws())
+		assert.EventuallyEqual(t, func() int { return len(c.NetworkGateways()) }, expectedGws,
+			retry.Timeout(30*time.Second), retry.BackoffDelay(5*time.Millisecond))
 	}
 
 	t.Run("add meshnetworks", func(t *testing.T) {
@@ -242,4 +220,61 @@ func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher
 			}},
 		},
 	}})
+}
+
+func TestGatewayResourceHBONEListener(t *testing.T) {
+	test.SetForTest(t, &features.MultiNetworkGatewayAPI, true)
+	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
+		ClusterID:    constants.DefaultClusterName,
+		DomainSuffix: "cluster.local",
+		CRDs:         []schema.GroupVersionResource{gvr.KubernetesGateway},
+	})
+
+	passthroughMode := k8sv1.TLSModePassthrough
+	ipType := k8sv1.IPAddressType
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).CreateOrUpdate(&k8sv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "eastwest-hbone",
+			Namespace: "istio-system",
+			Labels:    map[string]string{label.TopologyNetwork.Name: "nw2"},
+		},
+		Spec: k8sv1.GatewaySpec{
+			GatewayClassName: "istio",
+			Addresses:        []k8sv1.GatewaySpecAddress{{Type: &ipType, Value: "1.2.3.4"}},
+			Listeners: []k8sv1.Listener{
+				{
+					Name: "mtls",
+					TLS: &k8sv1.ListenerTLSConfig{
+						Mode: &passthroughMode,
+						Options: map[k8sv1.AnnotationKey]k8sv1.AnnotationValue{
+							constants.ListenerModeOption: constants.ListenerModeAutoPassthrough,
+						},
+					},
+					Port: 15443,
+				},
+				{
+					Name:     "hbone",
+					Protocol: "HBONE",
+					Port:     15008,
+				},
+			},
+		},
+	})
+
+	assert.EventuallyEqual(t, func() int { return len(c.NetworkGateways()) }, 2,
+		retry.Timeout(30*time.Second), retry.BackoffDelay(5*time.Millisecond))
+
+	var mtls, hbone int
+	for _, gw := range c.NetworkGateways() {
+		switch {
+		case gw.Port == 15443 && gw.HBONEPort == 0:
+			mtls++
+		case gw.HBONEPort == 15008 && gw.Port == 0:
+			hbone++
+		default:
+			t.Fatalf("unexpected gateway %+v: an HBONE listener must set HBONEPort only", gw)
+		}
+	}
+	assert.Equal(t, mtls, 1)
+	assert.Equal(t, hbone, 1)
 }

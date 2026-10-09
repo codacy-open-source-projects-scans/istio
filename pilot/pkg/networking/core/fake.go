@@ -126,7 +126,7 @@ func NewConfigGenTest(t test.Failer, opts TestOptions) *ConfigGenTest {
 	configs := getConfigs(t, opts)
 	cc := opts.ConfigController
 	if cc == nil {
-		cc = memory.NewController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
+		cc = memory.NewController(collections.PilotGatewayAPI(), true)
 	}
 	controllers := []model.ConfigStoreController{cc}
 	if opts.CreateConfigStore != nil {
@@ -179,7 +179,8 @@ func NewConfigGenTest(t test.Failer, opts TestOptions) *ConfigGenTest {
 		mc,
 		env.Watcher,
 		serviceentry.WithClusterID(opts.ClusterID),
-		serviceentry.WithKRTDebugger(krt.GlobalDebugHandler))
+		serviceentry.WithKRTDebugger(krt.GlobalDebugHandler),
+	)
 	// TODO allow passing in registry, for k8s, mem registry
 	serviceDiscovery.AddRegistry(se)
 	msd := memregistry.NewServiceDiscovery(opts.Services...)
@@ -247,8 +248,6 @@ func (f *ConfigGenTest) Run() {
 	retry.UntilOrFail(f.t, f.store.HasSynced, retry.Delay(time.Millisecond))
 	retry.UntilOrFail(f.t, f.Registry.HasSynced, retry.Delay(time.Millisecond))
 	retry.UntilOrFail(f.t, f.virtualServiceController.HasSynced, retry.Delay(time.Millisecond))
-
-	f.ServiceEntryRegistry.ResyncEDS()
 }
 
 // SetupProxy initializes a proxy for the current environment. This should generally be used when creating
@@ -288,9 +287,9 @@ func (f *ConfigGenTest) SetupProxy(p *model.Proxy) *model.Proxy {
 
 	// Initialize data structures
 	pc := f.PushContext()
-	p.SetSidecarScope(pc)
 	p.SetServiceTargets(f.env.ServiceDiscovery)
 	p.SetGatewaysForProxy(pc)
+	p.SetSidecarScope(pc)
 	p.DiscoverIPMode()
 	return p
 }

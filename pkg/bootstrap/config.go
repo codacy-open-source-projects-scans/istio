@@ -128,6 +128,8 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 		option.XdsType(xdsType),
 		option.MetadataDiscovery(mDiscovery),
 		option.MetricsLocalhostAccessOnly(cfg.Metadata.ProxyConfig.ProxyMetadata),
+		option.SecureMetricsPort(cfg.Metadata.EnvoySecureMetricsPort),
+		option.SecureMergedMetricsPort(cfg.Metadata.EnvoySecureMergedMetricsPort),
 	)
 
 	// Add GCPProjectNumber to access in bootstrap template.
@@ -203,6 +205,10 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 
 	if features.EnvoyStatusPortEnableProxyProtocol {
 		opts = append(opts, option.EnvoyStatusPortEnableProxyProtocol(true))
+	}
+
+	if cfg.Metadata.EnableSelfDiscovery {
+		opts = append(opts, option.EnableSelfDiscovery(true))
 	}
 
 	proxyOpts, err := getProxyConfigOptions(cfg.Metadata)
@@ -322,7 +328,7 @@ func getStatsOptions(meta *model.BootstrapNodeMetadata) []option.Instance {
 		d, err := time.ParseDuration(v)
 		if err == nil {
 			statsFlushInterval = d
-			options = append(options, option.EnvoyStatsFlushInterval(statsFlushInterval))
+			options = append(options, option.EnvoyStatsFlushInterval(durationpb.New(statsFlushInterval)))
 		} else {
 			log.Warnf("Failed to parse stats flush interval %v: %v", v, err)
 		}
@@ -335,8 +341,7 @@ func getStatsOptions(meta *model.BootstrapNodeMetadata) []option.Instance {
 		} else if statsEvictionInterval%statsFlushInterval != 0 {
 			log.Warnf("StatsEvictionInterval must be a multiple of the StatsFlushInterval")
 		} else {
-			duration := &durationpb.Duration{Seconds: int64(statsEvictionInterval.Seconds())}
-			options = append(options, option.EnvoyStatsEvictionInterval(duration))
+			options = append(options, option.EnvoyStatsEvictionInterval(durationpb.New(statsEvictionInterval)))
 		}
 	}
 
@@ -358,19 +363,26 @@ func getNodeMetadataOptions(node *model.Node, policy string) []option.Instance {
 		option.RuntimeFlags(extractRuntimeFlags(node.Metadata.ProxyConfig, policy)),
 		option.EnvoyStatusPort(node.Metadata.EnvoyStatusPort),
 		option.EnvoyPrometheusPort(node.Metadata.EnvoyPrometheusPort))
-	// Default value of max connections is the maximum integer value.
+	// Resolve the global downstream connection limit. Precedence (highest to lowest):
+	// 1. ProxyConfig.ConnectionSettings.GlobalDownstreamConnectionLimit (new API)
+	// 2. ISTIO_META_GLOBAL_DOWNSTREAM_MAX_CONNECTIONS proxy metadata
+	// 3. overload.global_downstream_max_connections runtime flag (deprecated)
+	// 4. math.MaxInt32 (effectively unlimited)
 	globalDownstreamMaxConnections := math.MaxInt32
-	// If proxy metadata is set, use it to set the global downstream max connections.
-	// If not set, use the default value of max connections.
-	// TODO: Consider moving this to proxy config A
-	metadataExists := false
-	if node.Metadata.ProxyConfig.ProxyMetadata != nil {
-		if maxConnections, err := strconv.Atoi(node.Metadata.ProxyConfig.ProxyMetadata[GlobalDownstreamMaxConnections]); err == nil {
-			globalDownstreamMaxConnections = maxConnections
-			metadataExists = true
+	resolved := false
+	if cs := node.Metadata.ProxyConfig.ConnectionSettings; cs != nil {
+		if v := cs.GetGlobalDownstreamConnectionLimit(); v != nil && v.GetValue() > 0 {
+			globalDownstreamMaxConnections = int(v.GetValue())
+			resolved = true
 		}
 	}
-	if !metadataExists {
+	if !resolved && node.Metadata.ProxyConfig.ProxyMetadata != nil {
+		if maxConnections, err := strconv.Atoi(node.Metadata.ProxyConfig.ProxyMetadata[GlobalDownstreamMaxConnections]); err == nil {
+			globalDownstreamMaxConnections = maxConnections
+			resolved = true
+		}
+	}
+	if !resolved {
 		// If the runtime flag overload.global_downstream_max_connections is set, honor it
 		// for backwards compatibility. This will be removed in a future release.
 		globalDownstreamMaxConnectionsRuntime := globalDownstreamMaxConnectionsRuntimeFlag(node.Metadata.ProxyConfig)
@@ -393,6 +405,8 @@ func extractRuntimeFlags(cfg *model.NodeMetaProxyConfig, policy string) map[stri
 		"envoy.deprecated_features:envoy.config.listener.v3.Listener.hidden_envoy_deprecated_use_original_dst": true,
 		"envoy.reloadable_features.http_reject_path_with_fragment":                                             false,
 		"envoy.reloadable_features.fixed_heap_use_allocated":                                                   true,
+		// Disable due to https://github.com/envoyproxy/envoy/issues/45212
+		"envoy.reloadable_features.coalesce_lb_rebuilds_on_batch_update": false,
 	}
 	if policy == common_features.FIPS_140_2 {
 		// This flag limits google_grpc client in Envoy to TLSv1.2 as the maximum version.
@@ -633,24 +647,26 @@ func extractAttributesMetadata(envVars []string, plat platform.Environment, meta
 
 // MetadataOptions for constructing node metadata.
 type MetadataOptions struct {
-	Envs                        []string
-	Platform                    platform.Environment
-	InstanceIPs                 []string
-	StsPort                     int
-	ID                          string
-	ProxyConfig                 *meshAPI.ProxyConfig
-	PilotSubjectAltName         []string
-	CredentialSocketExists      bool
-	CustomCredentialsFileExists bool
-	XDSRootCert                 string
-	OutlierLogPath              string
-	annotationFilePath          string
-	EnvoyStatusPort             int
-	EnvoyPrometheusPort         int
-	ExitOnZeroActiveConnections bool
-	MetadataDiscovery           *bool
-	EnvoySkipDeprecatedLogs     bool
-	WorkloadIdentitySocketFile  string
+	Envs                         []string
+	Platform                     platform.Environment
+	InstanceIPs                  []string
+	StsPort                      int
+	ID                           string
+	ProxyConfig                  *meshAPI.ProxyConfig
+	PilotSubjectAltName          []string
+	CredentialSocketExists       bool
+	CustomCredentialsFileExists  bool
+	XDSRootCert                  string
+	OutlierLogPath               string
+	annotationFilePath           string
+	EnvoyStatusPort              int
+	EnvoyPrometheusPort          int
+	EnvoySecureMetricsPort       int
+	EnvoySecureMergedMetricsPort int
+	ExitOnZeroActiveConnections  bool
+	MetadataDiscovery            *bool
+	EnvoySkipDeprecatedLogs      bool
+	WorkloadIdentitySocketFile   string
 }
 
 const (
@@ -669,8 +685,8 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 	untypedMeta := map[string]any{}
 
 	for k, v := range options.ProxyConfig.GetProxyMetadata() {
-		if strings.HasPrefix(k, IstioMetaPrefix) {
-			untypedMeta[strings.TrimPrefix(k, IstioMetaPrefix)] = v
+		if after, ok := strings.CutPrefix(k, IstioMetaPrefix); ok {
+			untypedMeta[after] = v
 		}
 	}
 
@@ -684,6 +700,11 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 			log.Warnf("Env variable %s [%s] failed json unmarshal: %v", key, val, err)
 		}
 	}, untypedMeta)
+
+	// DNS_PROXY_ADDR is not ISTIO_META_*-prefixed. Read the process env directly (pilot-agent uses os.Environ() for options.Envs).
+	if v, ok := os.LookupEnv("DNS_PROXY_ADDR"); ok && v != "" {
+		untypedMeta["DNS_PROXY_ADDR"] = v
+	}
 
 	j, err := json.Marshal(untypedMeta)
 	if err != nil {
@@ -705,6 +726,8 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 	}
 	meta.EnvoyStatusPort = options.EnvoyStatusPort
 	meta.EnvoyPrometheusPort = options.EnvoyPrometheusPort
+	meta.EnvoySecureMetricsPort = options.EnvoySecureMetricsPort
+	meta.EnvoySecureMergedMetricsPort = options.EnvoySecureMergedMetricsPort
 	meta.ExitOnZeroActiveConnections = model.StringBool(options.ExitOnZeroActiveConnections)
 	if options.MetadataDiscovery == nil {
 		meta.MetadataDiscovery = nil

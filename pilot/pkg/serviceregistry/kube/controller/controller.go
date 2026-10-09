@@ -98,7 +98,8 @@ var (
 	// currently missing pods. This helps distinguish transient errors from permanent ones
 	endpointsWithNoPods = monitoring.NewSum(
 		"pilot_k8s_endpoints_with_no_pods",
-		"Endpoints that does not have any corresponding pods.")
+		"Endpoints that does not have any corresponding pods.",
+	)
 
 	endpointsPendingPodUpdate = monitoring.NewGauge(
 		"pilot_k8s_endpoints_pending_pod",
@@ -392,11 +393,15 @@ func (c *Controller) Network(endpointIP string, labels labels.Instance) network.
 	return ""
 }
 
-func (c *Controller) Cleanup() error {
+// Cleanup releases resources held by the controller. removeShard must be false if this
+// controller has already been superseded by a newer registry for the same cluster (e.g. a
+// credential-rotation swap) - the old and new registries share a ShardKey, so removing it here
+// would wipe out endpoints the new registry already populated (istio.io/istio#61043).
+func (c *Controller) Cleanup(removeShard bool) error {
 	if err := queue.WaitForClose(c.queue, 30*time.Second); err != nil {
 		log.Warnf("queue for removed kube registry %q may not be done processing: %v", c.Cluster(), err)
 	}
-	if c.opts.XDSUpdater != nil {
+	if removeShard && c.opts.XDSUpdater != nil {
 		c.opts.XDSUpdater.RemoveShard(model.ShardKeyFromRegistry(c))
 	}
 
@@ -458,7 +463,7 @@ func (c *Controller) deleteService(svc *model.Service) {
 		c.NotifyGatewayHandlers()
 		// TODO trigger push via handler
 		// networks are different, we need to update all eds endpoints
-		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
+		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
 	}
 
 	shard := model.ShardKeyFromRegistry(c)
@@ -491,14 +496,13 @@ func (c *Controller) recomputeServiceForPod(pod *v1.Pod) {
 			c.opts.XDSUpdater.EDSCacheUpdate(shard, string(hostname), svc.Namespace, endpoints)
 		}
 		cu.Insert(model.ConfigKey{
-			Kind:      kind.ServiceEntry,
+			Kind:      kind.Endpoints,
 			Name:      string(hostname),
 			Namespace: svc.Namespace,
 		})
 	}
 	if len(cu) > 0 {
 		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
-			Full:           false,
 			ConfigsUpdated: cu,
 			Reason:         model.NewReasonStats(model.EndpointUpdate),
 		})
@@ -506,11 +510,11 @@ func (c *Controller) recomputeServiceForPod(pod *v1.Pod) {
 }
 
 func (c *Controller) addOrUpdateService(pre, curr *v1.Service, currConv *model.Service, event model.Event, updateEDSCache bool) {
-	needsFullPush := false
+	networksChanged := false
 	// First, process nodePort gateway service, whose externalIPs specified
 	// and loadbalancer gateway service
 	if currConv.Attributes.ClusterExternalAddresses.Len() > 0 {
-		needsFullPush = c.extractGatewaysFromService(currConv)
+		networksChanged = c.extractGatewaysFromService(currConv)
 	} else if isNodePortGatewayService(curr) {
 		// We need to know which services are using node selectors because during node events,
 		// we have to update all the node port services accordingly.
@@ -519,18 +523,18 @@ func (c *Controller) addOrUpdateService(pre, curr *v1.Service, currConv *model.S
 		// only add when it is nodePort gateway service
 		c.nodeSelectorsForServices[currConv.Hostname] = nodeSelector
 		c.Unlock()
-		needsFullPush = c.updateServiceNodePortAddresses(currConv)
+		networksChanged = c.updateServiceNodePortAddresses(currConv)
 	}
 
 	c.Lock()
 	prevConv := c.servicesMap[currConv.Hostname]
 	c.servicesMap[currConv.Hostname] = currConv
 	c.Unlock()
-	// This full push needed to update all endpoints, even though we do a full push on service add/update
-	// as that full push is only triggered for the specific service.
-	if needsFullPush {
+	// This forced push is needed to update all endpoints when networks change, even though we push on
+	// service add/update, as that push is only triggered for the specific service.
+	if networksChanged {
 		// networks are different, we need to update all eds endpoints
-		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
+		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
 	}
 
 	shard := model.ShardKeyFromRegistry(c)
@@ -594,7 +598,6 @@ func (c *Controller) onNodeEvent(_, node *v1.Node, event model.Event) error {
 	// update all related services
 	if updatedNeeded && c.updateServiceNodePortAddresses() {
 		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
-			Full:   true,
 			Reason: model.NewReasonStats(model.ServiceUpdate),
 			Forced: true,
 		})
@@ -652,7 +655,8 @@ func registerHandlers[T controllers.ComparableObject](c *Controller,
 					return handler(ptr.Empty[T](), obj, model.EventDelete)
 				})
 			},
-		})
+		},
+	)
 }
 
 // HasSynced returns true after the initial state synchronization
@@ -921,7 +925,7 @@ func (c *Controller) GetProxyServiceTargets(proxy *model.Proxy) []model.ServiceT
 		// attempt to read the real pod.
 		out, err := c.GetProxyServiceTargetsFromMetadata(proxy)
 		if err != nil {
-			log.Errorf("failed to get proxy service targets from metadata: %v", err)
+			log.Warnf("failed to get proxy service targets from metadata: %v", err)
 		}
 		if len(out) == 0 {
 			proxyNoSvcTargetFromMetadata.Increment()
@@ -989,11 +993,12 @@ func (c *Controller) workloadInstanceHandler(si *model.WorkloadInstance, event m
 
 	// this is from a workload entry. Store it in separate index so that
 	// the InstancesByPort can use these as well as the k8s pods.
+	var previous *model.WorkloadInstance
 	switch event {
 	case model.EventDelete:
-		c.workloadInstancesIndex.Delete(si)
+		previous = c.workloadInstancesIndex.Delete(si)
 	default: // add or update
-		c.workloadInstancesIndex.Insert(si)
+		previous = c.workloadInstancesIndex.Insert(si)
 	}
 
 	// find the workload entry's service by label selector
@@ -1011,6 +1016,13 @@ func (c *Controller) workloadInstanceHandler(si *model.WorkloadInstance, event m
 		return kube.ServiceHostname(e.Name, e.Namespace, c.opts.DomainSuffix)
 	})
 	c.endpoints.pushEDS(matchedHostnames, si.Namespace)
+
+	// we should trigger a proxy update if any service has selected this workload or
+	// if the labels have changed, as this may affect which services select this workload.
+	labelsChanged := previous != nil && !previous.Endpoint.Labels.Equals(si.Endpoint.Labels)
+	if c.opts.XDSUpdater != nil && (len(matchedServices) > 0 || labelsChanged) {
+		c.opts.XDSUpdater.ProxyUpdate(c.Cluster(), si.Endpoint.FirstAddressOrNil())
+	}
 }
 
 func (c *Controller) onSystemNamespaceEvent(_, ns *v1.Namespace, ev model.Event) error {

@@ -26,11 +26,15 @@ import (
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
 	headerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/header/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	meshapi "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/core/route/retry"
+	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pilot/test/xdstest"
@@ -1940,6 +1944,63 @@ func TestSelectVirtualService(t *testing.T) {
 	}
 }
 
+// BenchmarkSelectVirtualServices isolates the cost of selectVirtualServices, which
+// buildSidecarOutboundHTTPRouteConfig currently runs only after the RDS cache lookup (on a miss), so that a
+// cache hit never pays for it. This measures what a hit would additionally cost if the filtering were moved
+// earlier so the same filtered list could be used for both the cache key and the miss-path build.
+func BenchmarkSelectVirtualServices(b *testing.B) {
+	for _, n := range []int{100, 1000} {
+		servicesByName, virtualServices := buildSelectVSBenchInput(n, false)
+		b.Run(fmt.Sprintf("exact-match/%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				selectVirtualServices(virtualServices, servicesByName)
+			}
+		})
+	}
+	for _, n := range []int{100, 1000} {
+		servicesByName, virtualServices := buildSelectVSBenchInput(n, true)
+		b.Run(fmt.Sprintf("wildcard-vs-hosts/%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				selectVirtualServices(virtualServices, servicesByName)
+			}
+		})
+	}
+}
+
+// buildSelectVSBenchInput builds n services and n VirtualServices, mirroring the shape of the
+// "virtualservice"/"gateways" benchmark fixtures used in pilot/pkg/xds/bench_test.go: one VirtualService per
+// service, each with a single host. When wildcardVS is true, every VirtualService host is instead the
+// wildcard "*.host.example", which matches every service and forces selectVirtualServices onto its slow path
+// (looping over all service hosts) instead of the O(1) exact-match lookup.
+func buildSelectVSBenchInput(n int, wildcardVS bool) (map[host.Name]*model.Service, []*config.Config) {
+	servicesByName := make(map[host.Name]*model.Service, n)
+	virtualServices := make([]*config.Config, 0, n)
+	for i := 0; i < n; i++ {
+		hostname := fmt.Sprintf("random-%d.host.example", i)
+		svc := buildHTTPService(hostname, visibility.Public, "1.2.3.4", "default", 80)
+		servicesByName[svc.Hostname] = svc
+
+		vsHost := hostname
+		if wildcardVS {
+			vsHost = "*.host.example"
+		}
+		spec := &networking.VirtualService{
+			Hosts: []string{vsHost},
+			Http: []*networking.HTTPRoute{{
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: hostname},
+					Weight:      100,
+				}},
+			}},
+		}
+		virtualServices = append(virtualServices, &config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: fmt.Sprintf("vs-%d", i), Namespace: "default"},
+			Spec: spec,
+		})
+	}
+	return servicesByName, virtualServices
+}
+
 func testSidecarRDSVHosts(t *testing.T, services []*model.Service,
 	sidecarConfig *config.Config, virtualServices []*config.Config, routeName string,
 	expectedHosts map[string]map[string]bool, expectedRoutes int, registryOnly bool,
@@ -2033,4 +2094,258 @@ func buildHTTPService(hostname string, v visibility.Instance, ip, namespace stri
 
 	service.Ports = Ports
 	return service
+}
+
+func TestInboundHTTPRouteConfig(t *testing.T) {
+	svc := buildHTTPService("service-A.default.svc.cluster.local", visibility.Public, "", "default", 8080)
+
+	cases := []struct {
+		name          string
+		proxy         *model.Proxy
+		meshConfig    *meshapi.MeshConfig
+		validateRoute bool
+		expectedRetry *route.RetryPolicy
+	}{
+		{
+			name:          "sidecar",
+			proxy:         &model.Proxy{Type: model.SidecarProxy},
+			validateRoute: false,
+			expectedRetry: &route.RetryPolicy{
+				NumRetries: wrapperspb.UInt32(2),
+				RetryOn:    "reset-before-request",
+			},
+		},
+		{
+			name:  "sidecar with mesh wide inbound retry policy",
+			proxy: &model.Proxy{Type: model.SidecarProxy},
+			meshConfig: func() *meshapi.MeshConfig {
+				m := mesh.DefaultMeshConfig()
+				m.DefaultInboundHttpRetryPolicy = &networking.HTTPRetry{Attempts: 4, RetryOn: "reset"}
+				return m
+			}(),
+			validateRoute: false,
+			expectedRetry: &route.RetryPolicy{
+				NumRetries: wrapperspb.UInt32(4),
+				RetryOn:    "reset",
+			},
+		},
+		{
+			name:  "sidecar with inbound retries disabled mesh wide",
+			proxy: &model.Proxy{Type: model.SidecarProxy},
+			meshConfig: func() *meshapi.MeshConfig {
+				m := mesh.DefaultMeshConfig()
+				m.DefaultInboundHttpRetryPolicy = &networking.HTTPRetry{}
+				return m
+			}(),
+			validateRoute: false,
+			expectedRetry: nil,
+		},
+		{
+			name:          "waypoint",
+			proxy:         &model.Proxy{Type: model.Waypoint},
+			validateRoute: true,
+			expectedRetry: retry.DefaultPolicy(),
+		},
+		{
+			name:  "waypoint ignores mesh wide inbound retry policy",
+			proxy: &model.Proxy{Type: model.Waypoint},
+			meshConfig: func() *meshapi.MeshConfig {
+				m := mesh.DefaultMeshConfig()
+				m.DefaultInboundHttpRetryPolicy = &networking.HTTPRetry{}
+				return m
+			}(),
+			validateRoute: true,
+			expectedRetry: retry.DefaultPolicy(),
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cg := NewConfigGenTest(t, TestOptions{MeshConfig: tt.meshConfig})
+			proxy := cg.SetupProxy(tt.proxy)
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+
+			cc := inboundChainConfig{
+				telemetryMetadata: telemetry.FilterChainMetadata{InstanceHostname: svc.Hostname},
+				port:              model.ServiceInstancePort{ServicePort: &model.Port{Port: 8080}, TargetPort: 8080},
+				clusterName:       model.BuildInboundSubsetKey(8080),
+				hbone:             lb.node.IsWaypointProxy(),
+			}
+			routeCfg := buildSidecarInboundHTTPRouteConfig(svc, lb, cc)
+			if tt.validateRoute {
+				xdstest.ValidateRouteConfiguration(t, routeCfg)
+			}
+
+			for _, vh := range routeCfg.VirtualHosts {
+				for _, r := range vh.Routes {
+					if a, e := r.GetRoute().RetryPolicy, tt.expectedRetry; !proto.Equal(a, e) {
+						t.Errorf("retry policy mismatch got: %v want: %v", a, e)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestWaypointInboundRouteHashPolicy(t *testing.T) {
+	hostname := "helloworld.default.svc.cluster.local"
+	svc := buildHTTPService(hostname, visibility.Public, "", "default", 5000)
+
+	cases := []struct {
+		name           string
+		configs        []config.Config
+		expectHash     bool
+		expectedCookie string
+	}{
+		{
+			name:       "no destination rule",
+			configs:    nil,
+			expectHash: false,
+		},
+		{
+			name: "destination rule with consistentHash cookie",
+			configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "helloworld-dr",
+						Namespace:        "default",
+					},
+					Spec: &networking.DestinationRule{
+						Host: hostname,
+						TrafficPolicy: &networking.TrafficPolicy{
+							LoadBalancer: &networking.LoadBalancerSettings{
+								LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+									ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+										HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+											HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+												Name: "user-session",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectHash:     true,
+			expectedCookie: "user-session",
+		},
+		{
+			name: "destination rule with consistentHash header",
+			configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "helloworld-dr",
+						Namespace:        "default",
+					},
+					Spec: &networking.DestinationRule{
+						Host: hostname,
+						TrafficPolicy: &networking.TrafficPolicy{
+							LoadBalancer: &networking.LoadBalancerSettings{
+								LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+									ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+										HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpHeaderName{
+											HttpHeaderName: "x-session-id",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectHash: true,
+		},
+		{
+			name: "destination rule without consistentHash",
+			configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "helloworld-dr",
+						Namespace:        "default",
+					},
+					Spec: &networking.DestinationRule{
+						Host: hostname,
+						TrafficPolicy: &networking.TrafficPolicy{
+							LoadBalancer: &networking.LoadBalancerSettings{
+								LbPolicy: &networking.LoadBalancerSettings_Simple{
+									Simple: networking.LoadBalancerSettings_ROUND_ROBIN,
+								},
+							},
+						},
+					},
+				},
+			},
+			expectHash: false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cg := NewConfigGenTest(t, TestOptions{
+				Services: []*model.Service{svc},
+				Configs:  tt.configs,
+			})
+			proxy := cg.SetupProxy(&model.Proxy{Type: model.Waypoint})
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+
+			cc := inboundChainConfig{
+				telemetryMetadata: telemetry.FilterChainMetadata{InstanceHostname: svc.Hostname},
+				port:              model.ServiceInstancePort{ServicePort: &model.Port{Port: 5000}, TargetPort: 5000},
+				clusterName:       model.BuildInboundSubsetKey(5000),
+				hbone:             true,
+			}
+			routeCfg := buildSidecarInboundHTTPRouteConfig(svc, lb, cc)
+			xdstest.ValidateRouteConfiguration(t, routeCfg)
+
+			for _, vh := range routeCfg.VirtualHosts {
+				for _, r := range vh.Routes {
+					hp := r.GetRoute().HashPolicy
+					if tt.expectHash {
+						if len(hp) == 0 {
+							t.Fatalf("expected hash_policy on waypoint inbound route but got none")
+						}
+						if tt.expectedCookie != "" {
+							cookie := hp[0].GetCookie()
+							if cookie == nil {
+								t.Fatalf("expected cookie hash policy but got %v", hp[0].PolicySpecifier)
+							}
+							if cookie.Name != tt.expectedCookie {
+								t.Errorf("expected cookie name %q, got %q", tt.expectedCookie, cookie.Name)
+							}
+						}
+					} else if len(hp) != 0 {
+						t.Fatalf("expected no hash_policy on waypoint inbound route but got %v", hp)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestWaypointInboundRouteHashPolicyNilService(t *testing.T) {
+	cg := NewConfigGenTest(t, TestOptions{})
+	proxy := cg.SetupProxy(&model.Proxy{Type: model.Waypoint})
+	lb := NewListenerBuilder(proxy, cg.PushContext())
+
+	cc := inboundChainConfig{
+		telemetryMetadata: telemetry.FilterChainMetadata{InstanceHostname: "unknown.default.svc.cluster.local"},
+		port:              model.ServiceInstancePort{ServicePort: &model.Port{Port: 8080}, TargetPort: 8080},
+		clusterName:       model.BuildInboundSubsetKey(8080),
+		hbone:             true,
+	}
+	routeCfg := buildSidecarInboundHTTPRouteConfig(nil, lb, cc)
+	xdstest.ValidateRouteConfiguration(t, routeCfg)
+
+	for _, vh := range routeCfg.VirtualHosts {
+		for _, r := range vh.Routes {
+			if hp := r.GetRoute().HashPolicy; len(hp) != 0 {
+				t.Fatalf("expected no hash_policy when svc is nil, got %v", hp)
+			}
+		}
+	}
 }

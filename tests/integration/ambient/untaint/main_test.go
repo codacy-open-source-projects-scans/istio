@@ -24,8 +24,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/tests/integration/security/util/cert"
 )
@@ -40,6 +42,7 @@ func TestMain(m *testing.M) {
 	// nolint: staticcheck
 	framework.
 		NewSuite(m).
+		Label(label.Full).
 		RequireMinVersion(24).
 		Setup(func(t resource.Context) error {
 			t.Settings().Ambient = true
@@ -88,12 +91,12 @@ func taintNodes(t resource.Context) error {
 Outer:
 	for _, node := range nodes.Items {
 		for _, taint := range node.Spec.Taints {
-			if taint.Key == "cni.istio.io/not-ready" {
+			if taint.Key == features.NodeUntaintTaintName {
 				continue Outer
 			}
 		}
 		node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{
-			Key:    "cni.istio.io/not-ready",
+			Key:    features.NodeUntaintTaintName,
 			Value:  "true",
 			Effect: corev1.TaintEffectNoSchedule,
 		})
@@ -119,7 +122,7 @@ func untaintNodes(t resource.Context) {
 	for _, node := range nodes.Items {
 		var taints []corev1.Taint
 		for _, taint := range node.Spec.Taints {
-			if taint.Key == "cni.istio.io/not-ready" {
+			if taint.Key == features.NodeUntaintTaintName {
 				continue
 			}
 			taints = append(taints, taint)

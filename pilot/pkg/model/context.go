@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"net"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +50,7 @@ import (
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/util/identifier"
 	netutil "istio.io/istio/pkg/util/net"
@@ -189,6 +189,12 @@ func (e *Environment) PushContext() *PushContext {
 	return e.pushContext
 }
 
+// PushContextReady reports whether the current PushContext has completed
+// initialization. Suitable for use with WaitForCacheSync.
+func (e *Environment) PushContextReady() bool {
+	return e.PushContext().InitDone.Load()
+}
+
 // GetDiscoveryAddress parses the DiscoveryAddress specified via MeshConfig.
 func (e *Environment) GetDiscoveryAddress() (host.Name, string, error) {
 	proxyConfig := mesh.DefaultProxyConfig()
@@ -303,6 +309,14 @@ type XdsDeltaResourceGenerator interface {
 	GenerateDeltas(proxy *Proxy, req *PushRequest, w *WatchedResource) (Resources, DeletedResources, XdsLogDetails, bool, error)
 }
 
+// LocalServiceInfo identifies the local service associated with a proxy: the service's
+// hostname, namespace, and the port used to model the proxy's self-discovery local_cluster.
+type LocalServiceInfo struct {
+	Name      string
+	Namespace string
+	Port      int
+}
+
 // Proxy contains information about an specific instance of a proxy (envoy sidecar, gateway,
 // etc). The Proxy is initialized when a sidecar connects to Pilot, and populated from
 // 'node' info in the protocol as well as data extracted from registries.
@@ -364,6 +378,16 @@ type Proxy struct {
 	// ServiceTargets will maintain a list entry for each Service-port, so if we have 2 services each with 3 ports, we
 	// would have 6 entries.
 	ServiceTargets []ServiceTarget
+
+	// LocalService identifies the local service associated with the proxy. It is populated in
+	// SetServiceTargets from the first entry in ServiceTargets, or the zero value if there is none.
+	// Carrying the port here avoids re-deriving it from ServiceTargets when building the
+	// self-discovery local_cluster, and lets incremental pushes detect port changes.
+	LocalService LocalServiceInfo
+
+	// PrevLocalService is the value of LocalService prior to the most recent SetServiceTargets call,
+	// used to detect local-service transitions during incremental pushes.
+	PrevLocalService LocalServiceInfo
 
 	// Istio version associated with the Proxy
 	IstioVersion *IstioVersion
@@ -460,6 +484,7 @@ var NodeTypes = [...]NodeType{SidecarProxy, Router, Waypoint, Ztunnel}
 //
 // Listener generation code will still use the SidecarScope object directly
 // as it needs the set of services for each listener port.
+// For routers and ambient east-west gateways, SetGatewaysForProxy must be called first to select gateway VirtualServices.
 func (node *Proxy) SetSidecarScope(ps *PushContext) {
 	sidecarScope := node.SidecarScope
 
@@ -578,7 +603,7 @@ func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
 	node.PrevMergedGateway = &PrevMergedGateway{
 		ContainsAutoPassthroughGateways: prevMergedGateway.ContainsAutoPassthroughGateways,
 		AutoPassthroughSNIHosts:         prevMergedGateway.GetAutoPassthroughGatewaySNIHosts(),
-		GatewayNameForServer:            prevMergedGateway.GatewayNameForServer,
+		GatewayNames:                    prevMergedGateway.GatewayNames,
 	}
 }
 
@@ -597,17 +622,26 @@ func (node *Proxy) SetServiceTargets(serviceDiscovery ServiceDiscovery) {
 	instances := serviceDiscovery.GetProxyServiceTargets(node)
 
 	// Keep service instances in order of creation/hostname.
-	sort.SliceStable(instances, func(i, j int) bool {
-		if instances[i].Service != nil && instances[j].Service != nil {
-			if !instances[i].Service.CreationTime.Equal(instances[j].Service.CreationTime) {
-				return instances[i].Service.CreationTime.Before(instances[j].Service.CreationTime)
+	slices.SortStableFunc(instances, func(a, b ServiceTarget) int {
+		if a.Service != nil && b.Service != nil {
+			if c := a.Service.CreationTime.Compare(b.Service.CreationTime); c != 0 {
+				return c
 			}
 			// Additionally, sort by hostname just in case services created automatically at the same second.
-			return instances[i].Service.Hostname < instances[j].Service.Hostname
+			return strings.Compare(string(a.Service.Hostname), string(b.Service.Hostname))
 		}
-		return true
+		return -1
 	})
 
+	node.PrevLocalService = node.LocalService
+	node.LocalService = LocalServiceInfo{}
+	if len(instances) > 0 {
+		node.LocalService = LocalServiceInfo{
+			Name:      string(instances[0].Service.Hostname),
+			Namespace: instances[0].Service.Attributes.Namespace,
+			Port:      instances[0].Port.Port,
+		}
+	}
 	node.ServiceTargets = instances
 }
 
@@ -865,7 +899,9 @@ func conflictWithReservedListener(proxy *Proxy, push *PushContext, bind string, 
 	// bind == wildcard
 	// or bind unspecified, but protocol is HTTP
 	if proxy.Metadata != nil {
-		conflictWithStaticListener = proxy.Metadata.EnvoyStatusPort == port || proxy.Metadata.EnvoyPrometheusPort == port
+		conflictWithStaticListener = proxy.Metadata.EnvoyStatusPort == port || proxy.Metadata.EnvoyPrometheusPort == port ||
+			(proxy.Metadata.EnvoySecureMetricsPort != 0 && proxy.Metadata.EnvoySecureMetricsPort == port) ||
+			(proxy.Metadata.EnvoySecureMergedMetricsPort != 0 && proxy.Metadata.EnvoySecureMergedMetricsPort == port)
 	}
 	if push != nil {
 		conflictWithVirtualListener = int(push.Mesh.ProxyListenPort) == port || int(push.Mesh.ProxyInboundListenPort) == port
@@ -966,10 +1002,9 @@ func (node *Proxy) ShallowCloneWatchedResources() map[string]*WatchedResource {
 	return maps.Clone(node.WatchedResources)
 }
 
-// DeepCloneWatchedResources clones the watched resources
-func (node *Proxy) DeepCloneWatchedResources() map[string]WatchedResource {
-	node.RLock()
-	defer node.RUnlock()
+// DeepCloneWatchedResourcesLocked clones the watched resources.
+// The caller must hold the proxy read or write lock.
+func (node *Proxy) DeepCloneWatchedResourcesLocked() map[string]WatchedResource {
 	m := make(map[string]WatchedResource, len(node.WatchedResources))
 	for k, v := range node.WatchedResources {
 		m[k] = *v

@@ -60,6 +60,7 @@ func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
 		RequireMultiPrimary().
+		Label(label.Full).
 		// Requires two CPs with specific names to be configured.
 		Label(label.CustomSetup).
 		// We are deploying two isolated environments, which CNI doesn't support.
@@ -264,7 +265,7 @@ func TestCustomResourceScoping(t *testing.T) {
 				},
 			}
 			for _, tc := range testCases {
-				t.NewSubTestf(tc.name).Run(func(t framework.TestContext) {
+				t.NewSubTestf("%s", tc.name).Run(func(t framework.TestContext) {
 					tc.from[0].CallOrFail(t, echo.CallOptions{
 						Address: apps1.External.All[0].Address(),
 						HTTP: echo.HTTP{

@@ -19,12 +19,15 @@ import (
 	"net/netip"
 	"reflect"
 	"testing"
+	"time"
 
 	matcher "github.com/cncf/xds/go/xds/type/matcher/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	header_mutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,14 +36,17 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/listenertest"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
+	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/network"
@@ -529,6 +535,7 @@ func TestListenerBuilderPatchListeners(t *testing.T) {
 			lb := &ListenerBuilder{
 				node:                    tt.proxy,
 				push:                    cg.PushContext(),
+				envoyFilterWrapper:      cg.PushContext().EnvoyFilters(tt.proxy),
 				gatewayListeners:        tt.fields.GatewayListeners,
 				inboundListeners:        tt.fields.InboundListeners,
 				outboundListeners:       tt.fields.OutboundListeners,
@@ -1224,6 +1231,82 @@ func TestWaypointInternalMultiNetworkAddresses(t *testing.T) {
 	}
 }
 
+func TestWaypointHTTPFilterTLSExchange(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+
+	testCases := []struct {
+		name                    string
+		enableMultiNetwork      bool
+		enableTLSProxyHTTPStats bool
+		wantFilter              bool
+	}{
+		{
+			name:                    "enabled",
+			enableMultiNetwork:      true,
+			enableTLSProxyHTTPStats: true,
+			wantFilter:              true,
+		},
+		{
+			name:                    "multi-network disabled",
+			enableMultiNetwork:      false,
+			enableTLSProxyHTTPStats: true,
+			wantFilter:              false,
+		},
+		{
+			name:                    "TLS proxy HTTP metrics disabled",
+			enableMultiNetwork:      true,
+			enableTLSProxyHTTPStats: false,
+			wantFilter:              false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableAmbientMultiNetwork, tc.enableMultiNetwork)
+			test.SetForTest(t, &features.EnableAmbientTLSProxyHTTPMetrics, tc.enableTLSProxyHTTPStats)
+
+			svc := &model.Service{
+				Hostname: "svc.default.svc.cluster.local",
+				Attributes: model.ServiceAttributes{
+					Name:      "svc",
+					Namespace: "default",
+				},
+				Ports: model.PortList{{
+					Name:     "http",
+					Port:     80,
+					Protocol: protocol.HTTP,
+				}},
+			}
+			svc.ClusterVIPs.SetAddressesFor("cluster-1", []string{"10.0.0.1"})
+
+			cg := NewConfigGenTest(t, TestOptions{ClusterID: "cluster-1"})
+			proxy := cg.SetupProxy(&model.Proxy{
+				Type:            model.Waypoint,
+				ConfigNamespace: "default",
+				Metadata: &model.NodeMetadata{
+					ClusterID: "cluster-1",
+				},
+			})
+			lb := &ListenerBuilder{push: cg.PushContext(), node: proxy}
+
+			l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+			chainName := model.BuildSubsetKey(model.TrafficDirectionInboundVIP, "http", svc.Hostname, 80)
+			filterChain := xdstest.ExtractFilterChain(chainName, l)
+			if filterChain == nil {
+				t.Fatalf("expected HTTP filter chain %q", chainName)
+			}
+			_, httpFilters := xdstest.ExtractFilterNames(t, filterChain)
+			gotFilter := slices.Contains(httpFilters, "set_tls_filter_exchange")
+			if gotFilter != tc.wantFilter {
+				t.Fatalf("set_tls_filter_exchange present = %v, want %v; filters: %v", gotFilter, tc.wantFilter, httpFilters)
+			}
+			if tc.wantFilter && httpFilters[0] != "set_tls_filter_exchange" {
+				t.Fatalf("set_tls_filter_exchange must be first; filters: %v", httpFilters)
+			}
+		})
+	}
+}
+
 func TestWaypointInternalServiceInfoNilFallback(t *testing.T) {
 	test.SetForTest(t, &features.EnableAmbient, true)
 	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
@@ -1399,6 +1482,64 @@ func extractIPMatcherFromListener(t *testing.T, l *listener.Listener) *matcher.I
 	return ipMatcher
 }
 
+// TestWaypointInternalHeadlessServiceNoEmptyRanges verifies that a service
+// with no addresses (the shape headless services take on IPv6 clusters,
+// where constants.UnspecifiedIP gets filtered out by FilterAddressesByIPFamily)
+// does not produce an IPMatcher_IPRangeMatcher with an empty Ranges slice.
+// An empty Ranges violates the proto's repeated.min_items=1 rule and is
+// rejected by envoy. See https://github.com/istio/istio/issues/60310.
+func TestWaypointInternalHeadlessServiceNoEmptyRanges(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+
+	cg := NewConfigGenTest(t, TestOptions{})
+
+	// Headless service: no ClusterVIPs, no AutoAllocated address, no
+	// DefaultAddress. svcAddresses in buildWaypointInternal will be empty.
+	svc := &model.Service{
+		Hostname: host.Name("headless.default.svc.cluster.local"),
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+		},
+		Ports: model.PortList{
+			&model.Port{
+				Name:     "http",
+				Port:     80,
+				Protocol: protocol.HTTP,
+			},
+		},
+	}
+
+	proxy := &model.Proxy{
+		Type:            model.Waypoint,
+		ConfigNamespace: "default",
+		Metadata: &model.NodeMetadata{
+			ClusterID: "cluster-1",
+			Network:   "network-a",
+		},
+	}
+	proxy = cg.SetupProxy(proxy)
+
+	lb := &ListenerBuilder{
+		push: cg.PushContext(),
+		node: proxy,
+	}
+
+	l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+	if l == nil {
+		t.Fatal("expected listener from buildWaypointInternal")
+	}
+
+	// If an IPMatcher exists, none of its RangeMatchers may have empty Ranges.
+	if ipMatcher := extractIPMatcherFromListener(t, l); ipMatcher != nil {
+		for i, rm := range ipMatcher.RangeMatchers {
+			if len(rm.Ranges) == 0 {
+				t.Fatalf("IPMatcher.RangeMatchers[%d].Ranges is empty; envoy rejects this (proto min_items=1). "+
+					"Headless services must elide the IPRangeMatcher entry entirely.", i)
+			}
+		}
+	}
+}
+
 func TestPreserveHeader(t *testing.T) {
 	cg := NewConfigGenTest(t, TestOptions{
 		MeshConfig: &meshconfig.MeshConfig{
@@ -1444,6 +1585,347 @@ func TestPreserveHeader(t *testing.T) {
 				authzBuilder:       &authz.Builder{},
 			}
 			assert.NoError(t, tt.isExpected(lb.buildHTTPConnectionManager(tt.opts)))
+		})
+	}
+}
+
+const sidecarXFCCFilterName = "istio.sidecar.xfcc_client_identity"
+
+func TestSidecarXFCCClientIdentityFilter(t *testing.T) {
+	cg := NewConfigGenTest(t, TestOptions{})
+	push := cg.PushContext()
+
+	cases := []struct {
+		name       string
+		proxy      *model.Proxy
+		opts       *httpListenerOpts
+		isExpected func(*hcm.HttpConnectionManager) error
+	}{
+		{
+			name: "hbone + APPEND_FORWARD",
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_APPEND_FORWARD,
+				},
+			},
+			isExpected: expectXFCCAction(core.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD),
+		},
+		{
+			name: "hbone + SANITIZE_SET",
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_SANITIZE_SET,
+				},
+			},
+			isExpected: expectXFCCAction(core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD),
+		},
+		{
+			name: "hbone + SANITIZE",
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_SANITIZE,
+				},
+			},
+			isExpected: expectNoXFCC(),
+		},
+		{
+			name: "hbone + FORWARD_ONLY",
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_FORWARD_ONLY,
+				},
+			},
+			isExpected: expectNoXFCC(),
+		},
+		{
+			name: "non-hbone + APPEND_FORWARD",
+			opts: &httpListenerOpts{
+				hbone: false,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_APPEND_FORWARD,
+				},
+			},
+			isExpected: expectNoXFCC(),
+		},
+		{
+			name: "hbone + APPEND_FORWARD + outbound",
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarOutbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_APPEND_FORWARD,
+				},
+			},
+			isExpected: expectNoXFCC(),
+		},
+		{
+			name:  "hbone + APPEND_FORWARD + Router",
+			proxy: &model.Proxy{Type: model.Router},
+			opts: &httpListenerOpts{
+				hbone: true,
+				class: istionetworking.ListenerClassSidecarInbound,
+				connectionManager: &hcm.HttpConnectionManager{
+					ForwardClientCertDetails: hcm.HttpConnectionManager_APPEND_FORWARD,
+				},
+			},
+			isExpected: expectNoXFCC(),
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := cg.SetupProxy(tt.proxy)
+			lb := &ListenerBuilder{
+				push:               push,
+				node:               proxy,
+				authzCustomBuilder: &authz.Builder{},
+				authzBuilder:       &authz.Builder{},
+			}
+			assert.NoError(t, tt.isExpected(lb.buildHTTPConnectionManager(tt.opts)))
+		})
+	}
+}
+
+// expectNoXFCC returns a check that fails if the XFCC synthesis filter is present.
+func expectNoXFCC() func(*hcm.HttpConnectionManager) error {
+	return func(connMgr *hcm.HttpConnectionManager) error {
+		if findXFCCFilter(connMgr) != nil {
+			return fmt.Errorf("did not expect %q filter, but it was added", sidecarXFCCFilterName)
+		}
+		return nil
+	}
+}
+
+// expectXFCCAction returns a check that fails unless the XFCC synthesis filter is
+// present and its request header mutation uses the given append action.
+func expectXFCCAction(want core.HeaderValueOption_HeaderAppendAction) func(*hcm.HttpConnectionManager) error {
+	return func(connMgr *hcm.HttpConnectionManager) error {
+		filter := findXFCCFilter(connMgr)
+		if filter == nil {
+			return fmt.Errorf("expected %q filter, but it was not added", sidecarXFCCFilterName)
+		}
+		hm := &header_mutationv3.HeaderMutation{}
+		if err := filter.GetTypedConfig().UnmarshalTo(hm); err != nil {
+			return fmt.Errorf("failed to unmarshal %q typed config: %v", sidecarXFCCFilterName, err)
+		}
+		muts := hm.GetMutations().GetRequestMutations()
+		if len(muts) != 1 {
+			return fmt.Errorf("expected exactly 1 request mutation, got %d", len(muts))
+		}
+		opt := muts[0].GetAppend()
+		if opt == nil {
+			return fmt.Errorf("expected an append mutation on the XFCC header")
+		}
+		if got := opt.GetHeader().GetKey(); got != "x-forwarded-client-cert" {
+			return fmt.Errorf("expected header key x-forwarded-client-cert, got %q", got)
+		}
+		if got := opt.GetAppendAction(); got != want {
+			return fmt.Errorf("expected append action %v, got %v", want, got)
+		}
+		return nil
+	}
+}
+
+func findXFCCFilter(connMgr *hcm.HttpConnectionManager) *hcm.HttpFilter {
+	for _, f := range connMgr.GetHttpFilters() {
+		if f.GetName() == sidecarXFCCFilterName {
+			return f
+		}
+	}
+	return nil
+}
+
+func TestVirtualOutboundListenerAllowAnyDynamicDNS(t *testing.T) {
+	meshCfg := mesh.DefaultMeshConfig()
+	meshCfg.OutboundTrafficPolicy = &meshconfig.MeshConfig_OutboundTrafficPolicy{
+		Mode: meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS,
+	}
+	listeners := buildListeners(t, TestOptions{
+		Services:   testServices,
+		MeshConfig: meshCfg,
+	}, nil)
+
+	vo := xdstest.ExtractListener(model.VirtualOutboundListenerName, listeners)
+	if vo == nil {
+		t.Fatal("didn't find virtual outbound listener")
+	}
+
+	listenertest.VerifyListener(t, vo, listenertest.ListenerTest{
+		Filters: []string{wellknown.HTTPInspector},
+		FilterChains: []listenertest.FilterChainTest{
+			{Name: model.VirtualOutboundBlackholeFilterChainName},
+			{
+				Name:           model.VirtualOutboundCatchAllTCPFilterChainName + "-http",
+				NetworkFilters: []string{wellknown.HTTPConnectionManager},
+				HTTPFilters:    []string{"envoy.filters.http.dynamic_forward_proxy"},
+				ValidateHCM: func(t test.Failer, h *hcm.HttpConnectionManager) {
+					rc := h.GetRouteConfig()
+					if rc == nil || len(rc.VirtualHosts) == 0 || len(rc.VirtualHosts[0].Routes) == 0 {
+						t.Fatalf("expected catch-all route in HCM route config")
+					}
+					cluster := rc.VirtualHosts[0].Routes[0].GetRoute().GetCluster()
+					assert.Equal(t, cluster, util.AllowAnyDynamicDNSCluster)
+				},
+			},
+			{
+				Name:           model.VirtualOutboundCatchAllTCPFilterChainName,
+				NetworkFilters: []string{wellknown.TCPProxy},
+			},
+		},
+		TotalMatch: true,
+	})
+}
+
+func TestDFPHTTPFilterInjectedInOutboundHCM(t *testing.T) {
+	meshCfg := mesh.DefaultMeshConfig()
+	meshCfg.OutboundTrafficPolicy = &meshconfig.MeshConfig_OutboundTrafficPolicy{
+		Mode: meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS,
+	}
+	listeners := buildListeners(t, TestOptions{
+		Services:   testServices,
+		MeshConfig: meshCfg,
+	}, nil)
+
+	for _, l := range listeners {
+		if l.Name == model.VirtualOutboundListenerName || l.Name == model.VirtualInboundListenerName {
+			continue
+		}
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				if f.Name != wellknown.HTTPConnectionManager {
+					continue
+				}
+				hcmCfg := &hcm.HttpConnectionManager{}
+				if err := f.GetTypedConfig().UnmarshalTo(hcmCfg); err != nil {
+					t.Fatalf("failed to unmarshal HCM: %v", err)
+				}
+				foundDFP := false
+				for _, hf := range hcmCfg.HttpFilters {
+					if hf.Name == "envoy.filters.http.dynamic_forward_proxy" {
+						foundDFP = true
+						break
+					}
+				}
+				if !foundDFP {
+					t.Errorf("listener %s chain %s: expected DFP HTTP filter in outbound HCM", l.Name, fc.Name)
+				}
+			}
+		}
+	}
+}
+
+func TestBuildHTTPConnectionManagerWithConnectionSettings(t *testing.T) {
+	tests := []struct {
+		name          string
+		cs            *meshconfig.ProxyConfig_ConnectionSettings
+		nodeType      model.NodeType
+		pathNormalize *meshconfig.MeshConfig_ProxyPathNormalization
+		verify        func(t *testing.T, cm *hcm.HttpConnectionManager)
+	}{
+		{
+			name: "EDGE profile on gateway applies all defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile: meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+			},
+			nodeType: model.Router,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				assert.Equal(t, int64(300), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, int64(300), cm.RequestTimeout.GetSeconds())
+				assert.Equal(t, int64(3600), cm.CommonHttpProtocolOptions.IdleTimeout.GetSeconds())
+				assert.Equal(t, true, cm.MergeSlashes)
+				assert.Equal(t, hcm.HttpConnectionManager_UNESCAPE_AND_REDIRECT, cm.PathWithEscapedSlashesAction)
+				assert.Equal(t, uint32(100), cm.Http2ProtocolOptions.MaxConcurrentStreams.GetValue())
+				assert.Equal(t, core.HttpProtocolOptions_REJECT_REQUEST, cm.CommonHttpProtocolOptions.HeadersWithUnderscoresAction)
+			},
+		},
+		{
+			name: "EDGE profile on sidecar does not apply defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile: meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+			},
+			nodeType: model.SidecarProxy,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// StreamIdleTimeout should be the default 0s, not the EDGE 300s
+				assert.Equal(t, time.Duration(0), cm.StreamIdleTimeout.AsDuration())
+				assert.Equal(t, (*core.Http2ProtocolOptions)(nil), cm.Http2ProtocolOptions)
+			},
+		},
+		{
+			name: "explicit values on sidecar are applied",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile:               meshconfig.ProxyConfig_ConnectionSettings_SIDECAR,
+				HttpStreamIdleTimeout: durationpb.New(600 * time.Second),
+				HttpMergeSlashes:      &wrapperspb.BoolValue{Value: true},
+			},
+			nodeType: model.SidecarProxy,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				assert.Equal(t, int64(600), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, true, cm.MergeSlashes)
+			},
+		},
+		{
+			name: "explicit overrides on gateway take precedence over EDGE defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile:               meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+				HttpStreamIdleTimeout: durationpb.New(120 * time.Second),
+				HttpMergeSlashes:      &wrapperspb.BoolValue{Value: false},
+			},
+			nodeType: model.Router,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// Explicit override
+				assert.Equal(t, int64(120), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, false, cm.MergeSlashes)
+				// EDGE defaults still applied for unset fields
+				assert.Equal(t, int64(3600), cm.CommonHttpProtocolOptions.IdleTimeout.GetSeconds())
+				assert.Equal(t, uint32(100), cm.Http2ProtocolOptions.MaxConcurrentStreams.GetValue())
+			},
+		},
+		{
+			name: "ConnectionSettings MergeSlashes=false overrides MeshConfig MERGE_SLASHES",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				HttpMergeSlashes: &wrapperspb.BoolValue{Value: false},
+			},
+			nodeType: model.SidecarProxy,
+			pathNormalize: &meshconfig.MeshConfig_ProxyPathNormalization{
+				Normalization: meshconfig.MeshConfig_ProxyPathNormalization_MERGE_SLASHES,
+			},
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// MeshConfig sets MergeSlashes=true, but ConnectionSettings overrides to false
+				assert.Equal(t, false, cm.MergeSlashes)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := mesh.DefaultMeshConfig()
+			mc.DefaultConfig.ConnectionSettings = tt.cs
+			if tt.pathNormalize != nil {
+				mc.PathNormalization = tt.pathNormalize
+			}
+			cg := NewConfigGenTest(t, TestOptions{MeshConfig: mc})
+			proxy := cg.SetupProxy(nil)
+			proxy.Type = tt.nodeType
+			proxy.Metadata.ProxyConfig = nil // Force fallback to mesh default
+			push := cg.PushContext()
+			lb := &ListenerBuilder{
+				push:               push,
+				node:               proxy,
+				connectionSettings: resolveConnectionSettings(proxy, push),
+				authzCustomBuilder: &authz.Builder{},
+				authzBuilder:       &authz.Builder{},
+			}
+			cm := lb.buildHTTPConnectionManager(&httpListenerOpts{})
+			tt.verify(t, cm)
 		})
 	}
 }

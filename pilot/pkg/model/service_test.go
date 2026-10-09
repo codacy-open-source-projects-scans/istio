@@ -15,21 +15,84 @@
 package model
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/google/go-cmp/cmp"
 	fuzz "github.com/google/gofuzz"
 
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/workloadapi"
 )
+
+func TestNewAddressInfo(t *testing.T) {
+	workload := &workloadapi.Workload{Uid: "workload"}
+	workloadAddress := &workloadapi.Address{
+		Type: &workloadapi.Address_Workload{Workload: workload},
+	}
+	serviceAddress := &workloadapi.Address{
+		Type: &workloadapi.Address_Service{Service: &workloadapi.Service{Name: "service"}},
+	}
+
+	for name, tt := range map[string]struct {
+		address               *workloadapi.Address
+		wantMarshaledWorkload *workloadapi.Workload
+	}{
+		"workload": {address: workloadAddress, wantMarshaledWorkload: workload},
+		"service":  {address: serviceAddress},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := NewAddressInfo(tt.address)
+			wantAddress := protoconv.MessageToAnyDeterministic(tt.address)
+			assert.Equal(t, got.Marshaled, wantAddress)
+			assert.Equal(t, got.Version, strconv.FormatUint(xxhash.Sum64(wantAddress.Value), 16))
+
+			if tt.wantMarshaledWorkload == nil {
+				assert.Equal(t, got.MarshaledWorkload, nil)
+				return
+			}
+			assert.Equal(t, got.MarshaledWorkload, protoconv.MessageToAnyDeterministic(tt.wantMarshaledWorkload))
+		})
+	}
+}
+
+// The pre-marshaled bytes back Equals and Version, so two builds of the same workload must
+// produce identical bytes. Workload.services is a map, which only holds if map keys are sorted.
+func TestNewAddressInfoStable(t *testing.T) {
+	mk := func() *workloadapi.Address {
+		svcs := make(map[string]*workloadapi.PortList, 6)
+		for i := range 6 {
+			svcs["ns/svc-"+strconv.Itoa(i)+".ns.svc.cluster.local"] = &workloadapi.PortList{
+				Ports: []*workloadapi.Port{{ServicePort: 80, TargetPort: 8080}},
+			}
+		}
+		return &workloadapi.Address{Type: &workloadapi.Address_Workload{Workload: &workloadapi.Workload{
+			Uid: "cluster/ns/wl", Name: "wl", Namespace: "ns", Services: svcs,
+		}}}
+	}
+	first := NewAddressInfo(mk())
+	for range 200 {
+		got := NewAddressInfo(mk())
+		assert.Equal(t, got.Marshaled.Value, first.Marshaled.Value)
+		assert.Equal(t, got.MarshaledWorkload.Value, first.MarshaledWorkload.Value)
+		assert.Equal(t, got.Version, first.Version)
+		a := WorkloadInfo{Workload: first.GetWorkload(), MarshaledAddress: first.Marshaled}
+		b := WorkloadInfo{Workload: got.GetWorkload(), MarshaledAddress: got.Marshaled}
+		assert.Equal(t, a.Equals(&b), true)
+	}
+}
 
 func TestGetByPort(t *testing.T) {
 	ports := PortList{{
@@ -504,6 +567,76 @@ func TestServicesEqual(t *testing.T) {
 			shouldEq: false,
 			name:     "different mesh external setting",
 		},
+		{
+			first: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-1": {80: 30080}},
+				},
+			},
+			other: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-1": {80: 30081}},
+				},
+			},
+			shouldEq: false,
+			name:     "different cluster external ports",
+		},
+		{
+			first: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-1": {80: 30080}},
+				},
+			},
+			other: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-2": {80: 30080}},
+				},
+			},
+			shouldEq: false,
+			name:     "cluster external ports under a different cluster",
+		},
+		{
+			first: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-1": {80: 30080}},
+				},
+			},
+			other: &Service{
+				Attributes: ServiceAttributes{
+					ClusterExternalPorts: map[cluster.ID]map[uint32]uint32{"cluster-1": {80: 30080}},
+				},
+			},
+			shouldEq: true,
+			name:     "matching cluster external ports",
+		},
+		{
+			first: &Service{
+				Attributes: ServiceAttributes{
+					PassthroughTargetPorts: map[uint32]uint32{80: 8080},
+				},
+			},
+			other: &Service{
+				Attributes: ServiceAttributes{
+					PassthroughTargetPorts: map[uint32]uint32{80: 8081},
+				},
+			},
+			shouldEq: false,
+			name:     "different passthrough target ports",
+		},
+		{
+			first: &Service{
+				Attributes: ServiceAttributes{
+					PassthroughTargetPorts: map[uint32]uint32{80: 8080},
+				},
+			},
+			other: &Service{
+				Attributes: ServiceAttributes{
+					PassthroughTargetPorts: map[uint32]uint32{80: 8080},
+				},
+			},
+			shouldEq: true,
+			name:     "matching passthrough target ports",
+		},
 	}
 
 	for _, testCase := range cases {
@@ -576,6 +709,7 @@ func TestGetAllAddresses(t *testing.T) {
 		name                   string
 		service                *Service
 		ipMode                 IPMode
+		nodeType               NodeType
 		dualStackEnabled       bool
 		ambientEnabled         bool
 		autoAllocationEnabled  bool
@@ -681,6 +815,34 @@ func TestGetAllAddresses(t *testing.T) {
 			expectedExtraAddresses: []string{},
 		},
 		{
+			name: "IPv4 mode, waypoint proxy, auto-allocation enabled, expected both auto-allocated addresses",
+			service: &Service{
+				DefaultAddress:           "0.0.0.0",
+				AutoAllocatedIPv4Address: "240.240.0.1",
+				AutoAllocatedIPv6Address: "2001:2::f0f0:e351",
+			},
+			ipMode:                 IPv4,
+			nodeType:               Waypoint,
+			ambientEnabled:         true,
+			autoAllocationEnabled:  true,
+			expectedAddresses:      []string{"240.240.0.1", "2001:2::f0f0:e351"},
+			expectedExtraAddresses: []string{"2001:2::f0f0:e351"},
+		},
+		{
+			name: "IPv6 mode, waypoint proxy, auto-allocation enabled, expected both auto-allocated addresses",
+			service: &Service{
+				DefaultAddress:           "0.0.0.0",
+				AutoAllocatedIPv4Address: "240.240.0.1",
+				AutoAllocatedIPv6Address: "2001:2::f0f0:e351",
+			},
+			ipMode:                 IPv6,
+			nodeType:               Waypoint,
+			ambientEnabled:         true,
+			autoAllocationEnabled:  true,
+			expectedAddresses:      []string{"240.240.0.1", "2001:2::f0f0:e351"},
+			expectedExtraAddresses: []string{"2001:2::f0f0:e351"},
+		},
+		{
 			name: "IPv6 mode, auto-allocation enabled, expected auto-allocated address",
 			service: &Service{
 				DefaultAddress:           "0.0.0.0",
@@ -783,7 +945,7 @@ func TestGetAllAddresses(t *testing.T) {
 			if tc.ambientEnabled {
 				test.SetForTest(t, &features.EnableAmbient, true)
 			}
-			proxy := &Proxy{Metadata: &NodeMetadata{ClusterID: "id"}, ipMode: tc.ipMode}
+			proxy := &Proxy{Metadata: &NodeMetadata{ClusterID: "id"}, ipMode: tc.ipMode, Type: tc.nodeType}
 			if tc.autoAllocationEnabled {
 				proxy.Metadata.DNSCapture = true
 				proxy.Metadata.DNSAutoAllocate = true
@@ -1068,6 +1230,72 @@ func BenchmarkEndpointDeepCopy(b *testing.B) {
 	}
 }
 
+func TestSupportsUnhealthyEndpoints(t *testing.T) {
+	svcAny := &Service{
+		Attributes: ServiceAttributes{K8sAttributes: K8sAttributes{TrafficDistribution: TrafficDistributionAny}},
+	}
+	svcPreferClose := &Service{
+		Attributes: ServiceAttributes{K8sAttributes: K8sAttributes{TrafficDistribution: TrafficDistributionPreferSameZone}},
+	}
+
+	tests := []struct {
+		name                 string
+		svc                  *Service
+		globalSendUnhealthy  bool
+		defaultSendUnhealthy bool
+		wantSupports         bool
+		wantForces           bool
+	}{
+		{
+			name:         "both flags off, TrafficDistributionAny",
+			svc:          svcAny,
+			wantSupports: false,
+			wantForces:   false,
+		},
+		{
+			name:                 "DefaultSendUnhealthyEndpoints=true",
+			svc:                  svcAny,
+			defaultSendUnhealthy: true,
+			wantSupports:         true,
+			wantForces:           false,
+		},
+		{
+			name:                "GlobalSendUnhealthyEndpoints=true",
+			svc:                 svcAny,
+			globalSendUnhealthy: true,
+			wantSupports:        true,
+			wantForces:          true,
+		},
+		{
+			name:         "TrafficDistribution != Any forces unhealthy regardless of flags",
+			svc:          svcPreferClose,
+			wantSupports: true,
+			wantForces:   true,
+		},
+		{
+			name:                 "nil service with DefaultSendUnhealthy",
+			svc:                  nil,
+			defaultSendUnhealthy: true,
+			wantSupports:         true,
+			wantForces:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetAtomicBoolForTest(t, features.GlobalSendUnhealthyEndpoints, tt.globalSendUnhealthy)
+			test.SetAtomicBoolForTest(t, features.DefaultSendUnhealthyEndpoints, tt.defaultSendUnhealthy)
+
+			if got := tt.svc.SupportsUnhealthyEndpoints(); got != tt.wantSupports {
+				t.Errorf("SupportsUnhealthyEndpoints() = %v, want %v", got, tt.wantSupports)
+			}
+			if got := tt.svc.ForcesSupportUnhealthyEndpoints(); got != tt.wantForces {
+				t.Errorf("ForcesSupportUnhealthyEndpoints() = %v, want %v", got, tt.wantForces)
+			}
+		})
+	}
+}
+
 func TestGetTrafficDistribution(t *testing.T) {
 	preferClose := "PreferClose"
 
@@ -1135,6 +1363,132 @@ func TestGetTrafficDistribution(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("GetTrafficDistribution() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestInfoEqualsPointers(t *testing.T) {
+	t.Run("service", func(t *testing.T) {
+		var nilInfo *ServiceInfo
+		assert.Equal(t, nilInfo.Equals(nil), true)
+		assert.Equal(t, nilInfo.Equals(&ServiceInfo{}), false)
+
+		first := &ServiceInfo{Service: &workloadapi.Service{Namespace: "ns", Hostname: "svc.example.com"}}
+		second := &ServiceInfo{Service: &workloadapi.Service{Namespace: "ns", Hostname: "svc.example.com"}}
+		assert.Equal(t, first.Equals(second), true)
+		second.Scope = Global
+		assert.Equal(t, first.Equals(second), false)
+	})
+
+	t.Run("workload", func(t *testing.T) {
+		var nilInfo *WorkloadInfo
+		assert.Equal(t, nilInfo.Equals(nil), true)
+		assert.Equal(t, nilInfo.Equals(&WorkloadInfo{}), false)
+
+		first := &WorkloadInfo{Workload: &workloadapi.Workload{Uid: "cluster0//Pod/ns/pod"}}
+		second := &WorkloadInfo{Workload: &workloadapi.Workload{Uid: "cluster0//Pod/ns/pod"}}
+		assert.Equal(t, first.Equals(second), true)
+		second.Source.Kind = kind.Pod
+		assert.Equal(t, first.Equals(second), false)
+	})
+}
+
+func TestServiceInfoWaypointConditions(t *testing.T) {
+	base := func() ServiceInfo {
+		return ServiceInfo{
+			Service: &workloadapi.Service{Hostname: "foo.ns.svc.cluster.local"},
+			Source:  TypedObject{Kind: kind.Service},
+		}
+	}
+	canaryErr := &StatusMessage{Reason: "WaypointNotReady", Message: "waypoint ns/canary is not ready"}
+
+	t.Run("primary bound with canary error stays bound and surfaces the error", func(t *testing.T) {
+		si := base()
+		si.Waypoint = WaypointBindingStatus{ResourceName: "ns/primary", Error: canaryErr}
+		got := si.GetConditions(nil)[WaypointBound]
+		if got == nil || !got.Status {
+			t.Fatalf("want WaypointBound=true, got %+v", got)
+		}
+		if !strings.Contains(got.Message, canaryErr.Message) {
+			t.Fatalf("canary error not surfaced in WaypointBound message: %q", got.Message)
+		}
+	})
+
+	t.Run("primary failure reports not bound", func(t *testing.T) {
+		si := base()
+		si.Waypoint = WaypointBindingStatus{Error: canaryErr}
+		got := si.GetConditions(nil)[WaypointBound]
+		if got == nil || got.Status {
+			t.Fatalf("want WaypointBound=false, got %+v", got)
+		}
+	})
+}
+
+func TestServiceInfoVisibilityCondition(t *testing.T) {
+	cases := []struct {
+		name       string
+		sourceKind kind.Kind
+		configured bool
+		visibility workloadapi.Service_Visibility
+		// wantReason is the expected VisibilityApplied condition Reason; "" means the condition
+		// must not be set (pruned): non-ServiceEntry sources, or the feature unconfigured.
+		wantReason string
+	}{
+		{
+			name:       "ServiceEntry PUBLIC",
+			sourceKind: kind.ServiceEntry,
+			configured: true,
+			visibility: workloadapi.Service_PUBLIC,
+			wantReason: VisibilityPublic,
+		},
+		{
+			name:       "ServiceEntry NAMESPACE",
+			sourceKind: kind.ServiceEntry,
+			configured: true,
+			visibility: workloadapi.Service_NAMESPACE,
+			wantReason: VisibilityNamespace,
+		},
+		{
+			// Feature unconfigured: the dataplane stays PUBLIC (legacy) and we write no condition.
+			name:       "ServiceEntry unconfigured",
+			sourceKind: kind.ServiceEntry,
+			configured: false,
+			visibility: workloadapi.Service_PUBLIC,
+			wantReason: "",
+		},
+		{
+			// The Source.Kind gate wins for a Kubernetes Service even if the flag were somehow set.
+			name:       "kube Service",
+			sourceKind: kind.Service,
+			configured: true,
+			visibility: workloadapi.Service_PUBLIC,
+			wantReason: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			si := ServiceInfo{
+				Service: &workloadapi.Service{
+					Name:       "svc",
+					Namespace:  "ns",
+					Hostname:   "svc.example.com",
+					Visibility: tc.visibility,
+				},
+				Source:               TypedObject{Kind: tc.sourceKind},
+				VisibilityConfigured: tc.configured,
+			}
+			got := si.GetConditions(nil)[VisibilityApplied]
+			if tc.wantReason == "" {
+				if got != nil {
+					t.Fatalf("expected no VisibilityApplied condition, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("expected VisibilityApplied condition, got none")
+			}
+			assert.Equal(t, got.Status, true)
+			assert.Equal(t, got.Reason, tc.wantReason)
 		})
 	}
 }

@@ -16,11 +16,16 @@ package core
 
 import (
 	"math"
+	"strconv"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	matcher "github.com/envoyproxy/go-control-plane/envoy/config/common/matcher/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	clientsidewrr "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/client_side_weighted_round_robin/v3"
 	proxyprotocol "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/proxy_protocol/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	matchertype "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -53,7 +58,15 @@ func (cb *ClusterBuilder) applyTrafficPolicy(service *model.Service, opts buildC
 	cb.applyConnectionPool(opts.mesh, opts.mutable, connectionPool, retryBudget)
 	if opts.direction != model.TrafficDirectionInbound {
 		applyOutlierDetection(service, opts.mutable.cluster, outlierDetection)
-		applyLoadBalancer(service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality, cb.proxyLabels, opts.mesh, opts.mutable.dnsWrappedLocalityLbEndpoints)
+		if outlierDetection != nil && len(outlierDetection.OutlierDetectionHttpErrorCodes) > 0 {
+			applyOutlierDetectionErrorCodes(opts.mutable, outlierDetection.OutlierDetectionHttpErrorCodes)
+		}
+		enableSelfDiscovery := cb.proxyMetadata != nil && bool(cb.proxyMetadata.EnableSelfDiscovery)
+		applyLoadBalancer(
+			service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality,
+			cb.proxyLabels, opts.mesh, opts.mutable.dnsWrappedLocalityLbEndpoints,
+			cb.proxyType, cb.proxyID, enableSelfDiscovery,
+		)
 		if opts.clusterMode != SniDnatClusterMode {
 			autoMTLSEnabled := opts.mesh.GetEnableAutoMtls().Value
 			tls, mtlsCtxType := cb.buildUpstreamTLSSettings(tls, opts.serviceAccounts, opts.istioMtlsSni,
@@ -66,6 +79,39 @@ func (cb *ClusterBuilder) applyTrafficPolicy(service *model.Service, opts buildC
 	if opts.mutable.cluster.GetType() == cluster.Cluster_ORIGINAL_DST {
 		opts.mutable.cluster.LbPolicy = cluster.Cluster_CLUSTER_PROVIDED
 	}
+}
+
+// applyDefaultTrafficPolicy overlays the resolved DestinationRule policy on top of the
+// mesh-wide MeshConfig.DefaultTrafficPolicy baseline, per block. A DR that sets a
+// connectionPool / outlierDetection block overrides that whole block; an unset block
+// inherits the mesh baseline. Returns policy unchanged when no mesh baseline is set.
+func applyDefaultTrafficPolicy(meshDefault *meshconfig.MeshConfig_DefaultTrafficPolicy,
+	policy *networking.TrafficPolicy,
+) *networking.TrafficPolicy {
+	defaultConnPool := meshDefault.GetConnectionPool()
+	defaultOutlier := meshDefault.GetOutlierDetection()
+	if defaultConnPool == nil && defaultOutlier == nil {
+		return policy
+	}
+	needConnPool := defaultConnPool != nil && policy.GetConnectionPool() == nil
+	needOutlier := defaultOutlier != nil && policy.GetOutlierDetection() == nil
+	if !needConnPool && !needOutlier {
+		return policy
+	}
+	// Copy so we never mutate the cached DestinationRule policy. portLevelSettings are
+	// already resolved for this port by the caller, so dropping them here is safe.
+	if policy == nil {
+		policy = &networking.TrafficPolicy{}
+	} else {
+		policy = model.ShallowCopyTrafficPolicy(policy)
+	}
+	if needConnPool {
+		policy.ConnectionPool = defaultConnPool
+	}
+	if needOutlier {
+		policy.OutlierDetection = defaultOutlier
+	}
+	return policy
 }
 
 // selectTrafficPolicyComponents returns the components of TrafficPolicy that should be used for given port.
@@ -106,6 +152,7 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 	var maxRequestsPerConnection uint32
 	var maxConcurrentStreams uint32
 	var maxConnectionDuration *durationpb.Duration
+	var connectionKeepalive *networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive
 
 	if settings.Http != nil {
 		if settings.Http.Http2MaxRequests > 0 {
@@ -123,6 +170,7 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		idleTimeout = settings.Http.IdleTimeout
 		maxRequestsPerConnection = uint32(settings.Http.MaxRequestsPerConnection)
 		maxConcurrentStreams = uint32(settings.Http.MaxConcurrentStreams)
+		connectionKeepalive = settings.Http.GetHttp2KeepAlive()
 	}
 
 	cb.applyDefaultConnectionPool(mc.cluster)
@@ -147,7 +195,7 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		Thresholds: []*cluster.CircuitBreakers_Thresholds{threshold},
 	}
 
-	if maxConnectionDuration != nil || idleTimeout != nil || maxRequestsPerConnection > 0 || maxConcurrentStreams > 0 {
+	if maxConnectionDuration != nil || idleTimeout != nil || maxRequestsPerConnection > 0 || maxConcurrentStreams > 0 || connectionKeepalive != nil {
 		if mc.httpProtocolOptions == nil {
 			mc.httpProtocolOptions = &http.HttpProtocolOptions{}
 		}
@@ -169,6 +217,12 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		http2ProtocolOptions := options.GetExplicitHttpConfig().GetHttp2ProtocolOptions()
 		if http2ProtocolOptions != nil && maxConcurrentStreams > 0 {
 			http2ProtocolOptions.MaxConcurrentStreams = &wrapperspb.UInt32Value{Value: maxConcurrentStreams}
+		}
+		if http2ProtocolOptions != nil && connectionKeepalive != nil {
+			http2ProtocolOptions.ConnectionKeepalive = &core.KeepaliveSettings{
+				Interval: connectionKeepalive.Interval,
+				Timeout:  connectionKeepalive.Timeout,
+			}
 		}
 	}
 	if settings.Http != nil && settings.Http.UseClientProtocol {
@@ -198,6 +252,7 @@ func applyRetryBudget(
 
 	thresholds.RetryBudget = &cluster.CircuitBreakers_Thresholds_RetryBudget{
 		BudgetPercent:       percent,
+		BudgetInterval:      retryBudget.BudgetInterval,
 		MinRetryConcurrency: retryConcurrency,
 	}
 }
@@ -264,20 +319,37 @@ func applyLoadBalancer(
 	locality *core.Locality,
 	proxyLabels map[string]string,
 	meshConfig *meshconfig.MeshConfig,
-	wrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints,
+	wrappedLocalityLbEndpoints []*loadbalancer.WrappedLocalityLbEndpoints,
+	proxyType model.NodeType,
+	proxyID string,
+	enableSelfDiscovery bool,
 ) {
 	// DFP clusters (DYNAMIC_DNS ServiceEntries) use CLUSTER_PROVIDED LB policy
 	if c.LbPolicy == cluster.Cluster_CLUSTER_PROVIDED {
 		return
 	}
-	// Disable panic threshold when SendUnhealthyEndpoints is enabled as enabling it "may" send traffic to unready
+	if c.CommonLbConfig == nil {
+		c.CommonLbConfig = &cluster.Cluster_CommonLbConfig{}
+	}
+	// If HealthyPanicThreshold is unset, disable it when service supports unhealthy endpoints as enabling it "may" send traffic to unready
 	// end points when load balancer is in panic mode.
-	if svc.SupportsUnhealthyEndpoints() {
+	if c.CommonLbConfig.HealthyPanicThreshold == nil && svc.SupportsUnhealthyEndpoints() {
 		c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: 0}
 	}
-	// Use locality lb settings from load balancer settings if present, else use mesh wide locality lb settings
-	localityLbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(meshConfig.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), svc)
-	applyLocalityLoadBalancer(locality, proxyLabels, c, wrappedLocalityLbEndpoints, localityLbSetting, forceFailover)
+	lbSettings := loadbalancer.GetEffectiveLbSetting(
+		meshConfig.GetLocalityLbSetting(),
+		meshConfig.GetZoneAwareLbSetting(),
+		lb,
+		svc,
+	)
+	if lbSettings == nil {
+		// No effective locality/zone-aware setting; fall back to the default locality LB cluster config.
+		lbSettings = loadbalancer.LocalityLBSettings{}
+	}
+	lbSettings.ApplyToCluster(
+		c, wrappedLocalityLbEndpoints, locality, proxyLabels,
+		proxyType == model.Waypoint, proxyID, enableSelfDiscovery,
+	)
 
 	if c.GetType() == cluster.Cluster_ORIGINAL_DST {
 		c.LbPolicy = cluster.Cluster_CLUSTER_PROVIDED
@@ -287,6 +359,15 @@ func applyLoadBalancer(
 	// Redis protocol must be defaulted with MAGLEV to benefit from client side sharding.
 	if features.EnableRedisFilter && port != nil && port.Protocol == protocol.Redis {
 		c.LbPolicy = cluster.Cluster_MAGLEV
+		return
+	}
+
+	// Backend utilization is part of the lb_policy oneof, so it is mutually exclusive with
+	// simple and consistentHash. It is configured through the extension based
+	// `load_balancing_policy` rather than the `lb_policy` enum, so handle it before the
+	// simple LB policies and return early.
+	if lb.GetBackendUtilization() != nil {
+		applyBackendUtilizationLoadBalancer(c, lb.GetBackendUtilization())
 		return
 	}
 
@@ -309,38 +390,6 @@ func applyLoadBalancer(
 	}
 
 	ApplyRingHashLoadBalancer(c, lb)
-}
-
-func applyLocalityLoadBalancer(
-	locality *core.Locality,
-	proxyLabels map[string]string,
-	c *cluster.Cluster,
-	wrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints,
-	localityLB *networking.LocalityLoadBalancerSetting,
-	failover bool,
-) {
-	// Failover should only be applied with outlier detection, or traffic will never failover.
-	// Conversely, because the default mesh config enables LocalityLbSetting (Enabled:true),
-	// enabling outlier detection in a DestinationRule will automatically activate locality LB
-	// failover behavior even when no explicit localityLbSetting is configured in the DR.
-	enableFailover := failover || c.OutlierDetection != nil
-	// set locality weighted lb config when locality lb is enabled, otherwise it will influence the result of LBPolicy like `least request`
-	if features.EnableLocalityWeightedLbConfig ||
-		(enableFailover && (localityLB.GetFailover() != nil || localityLB.GetFailoverPriority() != nil)) ||
-		localityLB.GetDistribute() != nil {
-		c.CommonLbConfig.LocalityConfigSpecifier = &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
-			LocalityWeightedLbConfig: &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
-		}
-	}
-
-	if c.LoadAssignment != nil {
-		var wrapped []*loadbalancer.WrappedLocalityLbEndpoints
-		if wrappedLocalityLbEndpoints != nil {
-			wrapped = []*loadbalancer.WrappedLocalityLbEndpoints{wrappedLocalityLbEndpoints}
-		}
-		loadbalancer.ApplyLocalityLoadBalancer(c.LoadAssignment,
-			wrapped, locality, proxyLabels, localityLB, enableFailover)
-	}
 }
 
 // applySimpleDefaultLoadBalancer will set the DefaultLBPolicy and create an LbConfig if used in LoadBalancerSettings
@@ -474,6 +523,16 @@ func applyOutlierDetection(service *model.Service, c *cluster.Cluster, outlier *
 		}
 		out.EnforcingConsecutive_5Xx = &wrapperspb.UInt32Value{Value: v}
 	}
+	if e := outlier.FailurePercentageThreshold; e != nil {
+		v := e.GetValue()
+
+		out.FailurePercentageThreshold = &wrapperspb.UInt32Value{Value: v}
+
+		if v > 0 {
+			v = 100
+		}
+		out.EnforcingFailurePercentage = &wrapperspb.UInt32Value{Value: v}
+	}
 	if e := outlier.ConsecutiveGatewayErrors; e != nil {
 		v := e.GetValue()
 
@@ -513,13 +572,102 @@ func applyOutlierDetection(service *model.Service, c *cluster.Cluster, outlier *
 	// FIXME: we can't distinguish between it being unset or being explicitly set to 0
 	minHealthPercent := outlier.MinHealthPercent
 	if minHealthPercent >= 0 {
-		// When we are sending unhealthy endpoints, we should disable Panic Threshold. Otherwise
+		// This service requires that we send unhealthy endpoints, we should disable Panic Threshold. Otherwise
 		// Envoy will send traffic to "Unready" pods when the percentage of healthy hosts fall
 		// below minimum health percentage.
-		if service.SupportsUnhealthyEndpoints() {
+		if service.ForcesSupportUnhealthyEndpoints() {
 			minHealthPercent = 0
 		}
+		if c.CommonLbConfig == nil {
+			c.CommonLbConfig = &cluster.Cluster_CommonLbConfig{}
+		}
 		c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: float64(minHealthPercent)}
+	}
+}
+
+// applyOutlierDetectionErrorCodes sets the HttpProtocolOptions.OutlierDetection.ErrorMatcher
+// on the cluster based on the outlier_detection_http_error_codes field in DestinationRule.
+// When set, Envoy treats only the specified HTTP status codes as outlier detection failures,
+// replacing the default 5xx-only behavior.
+func applyOutlierDetectionErrorCodes(mc *clusterWrapper, codes []uint32) {
+	if mc.httpProtocolOptions == nil {
+		mc.httpProtocolOptions = &http.HttpProtocolOptions{}
+	}
+	rules := make([]*matcher.MatchPredicate, 0, len(codes))
+	for _, code := range codes {
+		rules = append(rules, &matcher.MatchPredicate{
+			Rule: &matcher.MatchPredicate_HttpResponseHeadersMatch{
+				HttpResponseHeadersMatch: &matcher.HttpHeadersMatch{
+					Headers: []*route.HeaderMatcher{{
+						Name: ":status",
+						HeaderMatchSpecifier: &route.HeaderMatcher_StringMatch{
+							StringMatch: &matchertype.StringMatcher{
+								MatchPattern: &matchertype.StringMatcher_Exact{
+									Exact: strconv.Itoa(int(code)),
+								},
+							},
+						},
+					}},
+				},
+			},
+		})
+	}
+	var predicate *matcher.MatchPredicate
+	if len(rules) == 1 {
+		predicate = rules[0]
+	} else {
+		predicate = &matcher.MatchPredicate{
+			Rule: &matcher.MatchPredicate_OrMatch{
+				OrMatch: &matcher.MatchPredicate_MatchSet{Rules: rules},
+			},
+		}
+	}
+	mc.httpProtocolOptions.OutlierDetection = &http.HttpProtocolOptions_OutlierDetection{
+		ErrorMatcher: predicate,
+	}
+}
+
+// applyBackendUtilizationLoadBalancer configures the cluster to use Envoy's
+// client_side_weighted_round_robin load balancing policy, which weights endpoints based on the
+// utilization they report through ORCA load reports.
+//
+// Unlike the simple and consistent hash policies, this one has no `lb_policy` enum value and must
+// be configured through the extension based `load_balancing_policy` field.
+// TODO(wbpcode): We should consider to migrate all load balancing policies to use the extension based
+// `load_balancing_policy` field because the legacy `lb_policy` enum will be deprecated.
+func applyBackendUtilizationLoadBalancer(c *cluster.Cluster, bu *networking.LoadBalancerSettings_BackendUtilizationLB) {
+	// Envoy rejects a cluster that combines `load_balancing_policy` with any of the partial
+	// `common_lb_config` fields, so drop them. `zone_aware_lb_config` and
+	// `locality_weighted_lb_config` share the `locality_config_specifier` oneof, while
+	// `consistent_hashing_lb_config` is a separate field.
+	if c.CommonLbConfig != nil {
+		c.CommonLbConfig.LocalityConfigSpecifier = nil
+		c.CommonLbConfig.ConsistentHashingLbConfig = nil
+	}
+
+	cswrr := &clientsidewrr.ClientSideWeightedRoundRobin{
+		BlackoutPeriod:                     bu.GetWeightStabilizationPeriod(),
+		WeightExpirationPeriod:             bu.GetWeightExpirationPeriod(),
+		WeightUpdatePeriod:                 bu.GetWeightUpdatePeriod(),
+		MetricNamesForComputingUtilization: bu.GetMetricNamesForComputingUtilization(),
+		// Envoy defaults this to 1.0 while the Istio API defaults it to 0 (disabled), so it must
+		// always be set explicitly.
+		ErrorUtilizationPenalty: &wrapperspb.FloatValue{Value: float32(bu.GetErrorUtilizationPenaltyPercent()) / 100.0},
+	}
+
+	// `lb_policy` is ignored by Envoy whenever `load_balancing_policy` is set, but it is an enum
+	// defaulting to ROUND_ROBIN, so set it explicitly to avoid any confusion.
+	c.LbPolicy = cluster.Cluster_LOAD_BALANCING_POLICY_CONFIG
+	c.LbConfig = nil
+	c.LoadBalancingPolicy = &cluster.LoadBalancingPolicy{
+		Policies: []*cluster.LoadBalancingPolicy_Policy{
+			{
+				TypedExtensionConfig: &core.TypedExtensionConfig{
+					Name:        wellknown.EnvoyClientSideWeightedRoundRobinLbPolicy,
+					TypedConfig: protoconv.MessageToAny(cswrr),
+				},
+			},
+		},
 	}
 }
 

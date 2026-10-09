@@ -55,7 +55,7 @@ spec:
         - -d
         - 15090,15021,15020
         - --log_output_level=default:info
-        image: registry.istio.io/testing/proxyTest:latest
+        image: registry.istio.io/testing/proxyv2:latest
         name: istio-init
         resources:
           limits:
@@ -130,11 +130,6 @@ spec:
             resourceFieldRef:
               divisor: "1"
               resource: limits.memory
-        - name: GOMAXPROCS
-          valueFrom:
-            resourceFieldRef:
-              divisor: "1"
-              resource: limits.cpu
         - name: ISTIO_META_CLUSTER_ID
           value: Kubernetes
         - name: ISTIO_META_NODE_NAME

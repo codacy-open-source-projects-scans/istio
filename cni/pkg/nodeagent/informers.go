@@ -32,6 +32,7 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/monitoring"
+	"istio.io/istio/pkg/slices"
 )
 
 var (
@@ -137,7 +138,7 @@ func (s *InformerHandlers) GetPodIfAmbientEnabled(podName, podNamespace string) 
 	if pod == nil {
 		return nil, fmt.Errorf("failed to find pod %v", ns)
 	}
-	if s.enablementSelector.Matches(pod.Labels, pod.Annotations, ns.Labels) {
+	if s.enablementSelector.Matches(pod, ns.Labels) {
 		return pod, nil
 	}
 	return nil, nil
@@ -288,7 +289,7 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 		oldPod := event.Old.(*corev1.Pod)
 		isEnrolled := util.PodFullyEnrolled(currentPod)
 		isPartiallyEnrolled := util.PodPartiallyEnrolled(currentPod)
-		matchesSelector := s.enablementSelector.Matches(currentPod.Labels, currentPod.Annotations, ns.Labels)
+		matchesSelector := s.enablementSelector.Matches(currentPod, ns.Labels)
 		namespaceExcluded := s.isNamespaceExcluded(currentPod.Namespace)
 		shouldBeEnabled := matchesSelector && !namespaceExcluded
 		isTerminated := kube.CheckPodTerminal(currentPod)
@@ -327,6 +328,21 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 				return err
 			}
 			return nil
+		}
+
+		// Self-heal the host probe ipset for an already-enrolled pod whose probe IP just
+		// (re)appeared. Gate on an actual IP change versus the
+		// previous event so that the many status updates unrelated to networking (pod
+		// conditions, container statuses, etc.) don't each trigger a redundant ipset
+		// syscall. Re-asserting only when the IPs change, still self-heals it.
+		if isEnrolled && shouldBeEnabled && !isTerminated {
+			podIPs := util.GetPodIPsIfPresent(currentPod)
+			if len(podIPs) > 0 && !slices.EqualUnordered(podIPs, util.GetPodIPsIfPresent(oldPod)) {
+				if err := s.dataplane.SyncHostProbeIPSet(currentPod, podIPs); err != nil {
+					log.Warnf("failed to sync host probe ipset for enrolled pod, will retry: %v", err)
+					return err
+				}
+			}
 		}
 
 		if !changeNeeded || isTerminated {
@@ -385,7 +401,7 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 		// pod information from the triggering event.
 		if util.PodFullyEnrolled(latestEventPod) ||
 			util.PodPartiallyEnrolled(latestEventPod) ||
-			s.enablementSelector.Matches(latestEventPod.Labels, latestEventPod.Annotations, ns.Labels) {
+			s.enablementSelector.Matches(latestEventPod, ns.Labels) {
 			log.Debugf("pod is deleted and was or should be captured, removing from ztunnel")
 			if err := s.dataplane.RemovePodFromMesh(s.ctx, latestEventPod, true); err != nil {
 				log.Warnf("Unable to send pod to ztunnel for removal. Will retry. RemovePodFrmMesh returned: %v", err)

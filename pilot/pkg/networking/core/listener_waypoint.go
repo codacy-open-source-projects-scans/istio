@@ -76,6 +76,18 @@ const (
 	downstreamSourceHeader        = "x-istio-source"
 	downstreamOriginNetworkHeader = "x-forwarded-network"
 
+	// downstreamSourceWaypoint indicates the request was emitted by a waypoint, so L7 policies
+	// have already been applied. The receiving E/W gateway can skip the waypoint hop.
+	downstreamSourceWaypoint = "waypoint"
+	// downstreamSourceGateway indicates the request was emitted by an ingress gateway. The
+	// receiving E/W gateway honors the per-service IngressUseWaypoint setting to decide whether
+	// to insert the waypoint or route directly to the service.
+	downstreamSourceGateway = "gateway"
+	// downstreamSourceSidecar indicates the request was emitted by a sidecar proxy. The
+	// receiving E/W gateway treats this as L7-not-yet-applied (matcher OnNoMatch) and inserts
+	// the waypoint as it would for a ztunnel-originated request.
+	downstreamSourceSidecar = "sidecar"
+
 	// xfccClientIdentityAnnotation opts a waypoint in to synthesizing an
 	// x-forwarded-client-cert entry from the ztunnel-provided source workload
 	// identity. When set to "true" on the Gateway (propagated to the waypoint
@@ -96,7 +108,7 @@ func xfccIncludeClientIdentityEnabled(node *model.Proxy) bool {
 }
 
 func (lb *ListenerBuilder) serviceForHostname(name host.Name) *model.Service {
-	return lb.push.ServiceForHostname(lb.node, name)
+	return lb.node.SidecarScope.GetService(name)
 }
 
 func (lb *ListenerBuilder) buildEastWestTLSPassthroughListeners() []*listener.Listener {
@@ -267,15 +279,25 @@ func (lb *ListenerBuilder) buildHCMConnectTerminateChain(routes []*route.Route) 
 		// If we put them as a network filter, we get poor logs and cannot return an error at the CONNECT level
 		filters = authzBuilder.BuildTCPRulesAsHTTPFilter()
 	}
+	// TODO: Remove in 1.32
+	pre1_29_2 := !lb.node.VersionGreaterOrEqual(&model.IstioVersion{Major: 1, Minor: 29, Patch: 2})
+	connectAuthorityFilter := xdsfilters.ConnectAuthorityFilter
+	if pre1_29_2 {
+		connectAuthorityFilter = xdsfilters.ConnectAuthorityFilterPre1_29_2
+	}
 	filters = append(filters,
 		xdsfilters.GenerateWaypointDownstreamMetadataFilter(),
-		xdsfilters.ConnectAuthorityFilter)
+		connectAuthorityFilter)
 
 	// This filter checks whether the request went through a waypoint already and thefore whether L7 policies have
 	// been applied already. We put that information into filter state for later use when we decide whether to
 	// send the request to a waypoint or skip it.
 	if features.EnableAmbientMultiNetwork && isAmbientEastWestGateway(lb.node) {
-		filters = append(filters, xdsfilters.RequestSourceFilter)
+		requestSourceFilter := xdsfilters.RequestSourceFilter
+		if pre1_29_2 {
+			requestSourceFilter = xdsfilters.RequestSourceFilterPre1_29_2
+		}
+		filters = append(filters, requestSourceFilter)
 	}
 
 	// Filters needed to propagate the tunnel metadata to the inner streams.
@@ -348,20 +370,22 @@ func (lb *ListenerBuilder) buildWaypointInboundConnectTerminate() *listener.List
 	return lb.buildConnectTerminateListener(routes)
 }
 
-func (lb *ListenerBuilder) findServiceWaypoint(svc *model.Service) host.Name {
+// findServiceWaypoint returns the waypoint for the given service, and whether it should
+// be used for from-ingress traffic.
+func (lb *ListenerBuilder) findServiceWaypoint(svc *model.Service) (host.Name, bool) {
 	ws := lb.push.ServicesWithWaypoint(svc.Attributes.Namespace + "/" + string(svc.Hostname))
 	if len(ws) == 0 {
-		return ""
+		return "", false
 	}
 	if len(ws) > 1 {
 		log.Warnf("unexpected multiple waypoint services for %s", svc.Hostname)
 	}
 	waypoint := ws[0]
-	return host.Name(waypoint.WaypointHostname)
+	return host.Name(waypoint.WaypointHostname), waypoint.IngressUseWaypoint
 }
 
 // This is the regular waypoint flow, where we terminate the tunnel, and then re-encap.
-func (lb *ListenerBuilder) buildWaypointInternal(wls []model.WorkloadInfo, svcs []*model.Service) *listener.Listener {
+func (lb *ListenerBuilder) buildWaypointInternal(wls []*model.WorkloadInfo, svcs []*model.Service) *listener.Listener {
 	isAmbientEastWestGateway := isAmbientEastWestGateway(lb.node)
 	ipMatcher := &matcher.IPMatcher{}
 	svcHostnameMap := &matcher.Matcher_MatcherTree_MatchMap{
@@ -416,8 +440,9 @@ func (lb *ListenerBuilder) buildWaypointInternal(wls []model.WorkloadInfo, svcs 
 
 	for _, svc := range svcs {
 		var waypoint host.Name
+		var ingressUseWaypoint bool
 		if isAmbientEastWestGateway && features.EnableAmbientMultiNetwork {
-			waypoint = lb.findServiceWaypoint(svc)
+			waypoint, ingressUseWaypoint = lb.findServiceWaypoint(svc)
 		}
 
 		svcAddresses := sets.SortedList(sets.New(append(
@@ -457,6 +482,9 @@ func (lb *ListenerBuilder) buildWaypointInternal(wls []model.WorkloadInfo, svcs 
 			if len(svcAddresses) > 0 && features.EnableAmbientMultiNetwork && !isAmbientEastWestGateway {
 				filters = []*listener.Filter{getOrigDstSfs(origDst, false)}
 			}
+			if isAmbientEastWestGateway {
+				cc.policyService = nil
+			}
 			tcpChain = &listener.FilterChain{
 				Filters: append(slices.Clone(filters), lb.buildWaypointNetworkFilters(svc, cc)...),
 				Name:    cc.clusterName,
@@ -491,8 +519,17 @@ func (lb *ListenerBuilder) buildWaypointInternal(wls []model.WorkloadInfo, svcs 
 					// this loop would generate a cluster and corresponding filter chain for the waypoint service.
 					waypointClusterName := model.BuildSubsetKey(model.TrafficDirectionInboundVIP, "tcp", waypoint, hbonePort)
 
+					// x-istio-source dispatch:
+					//   "waypoint" - L7 policies already applied upstream; skip the waypoint.
+					//   "gateway"  - request came from an ingress gateway; honor the ingress-use-waypoint
+					//   no match   - assume L7 has not been processed and send to the waypoint
 					m := match.NewRequestSource()
-					m.Map["waypoint"] = match.ToChain(tcpChain.Name)
+					m.Map[downstreamSourceWaypoint] = match.ToChain(tcpChain.Name)
+					if ingressUseWaypoint {
+						m.Map[downstreamSourceGateway] = match.ToChain(waypointClusterName)
+					} else {
+						m.Map[downstreamSourceGateway] = match.ToChain(tcpChain.Name)
+					}
 					m.OnNoMatch = match.ToChain(waypointClusterName)
 
 					requestSourceMatcher := match.ToMatcher(m.BuildMatcher())
@@ -554,7 +591,10 @@ func (lb *ListenerBuilder) buildWaypointInternal(wls []model.WorkloadInfo, svcs 
 				delete(svcHostnameMap.Map, authorityKey)
 			}
 		}
-		if len(portMapper.Map) > 0 {
+		// Skip the IP-range matcher when there are no addresses; envoy
+		// rejects an empty Ranges (proto min_items=1). Mirrors the
+		// svcHostnameMap guard above. See https://github.com/istio/istio/issues/60310.
+		if len(portMapper.Map) > 0 && len(svcAddresses) > 0 {
 			ranges := slices.Map(svcAddresses, func(vip string) *xds.CidrRange {
 				cidr := util.ConvertAddressToCidr(vip)
 				return &xds.CidrRange{
@@ -830,6 +870,35 @@ func buildConnectForwarder(push *model.PushContext, proxy *model.Proxy, class is
 	return l
 }
 
+func buildSetTLSFilterExchangeHTTPFilter() *hcm.HttpFilter {
+	setTLSFilterExchange := &sfs.Config{
+		OnRequestHeaders: []*sfsvalue.FilterStateValue{{
+			Key: &sfsvalue.FilterStateValue_ObjectKey{
+				ObjectKey: "istio.peer_metadata.enable_tls_filter_exchange",
+			},
+			FactoryKey: "envoy.bool",
+			Value: &sfsvalue.FilterStateValue_FormatString{
+				FormatString: &core.SubstitutionFormatString{
+					Format: &core.SubstitutionFormatString_TextFormatSource{
+						TextFormatSource: &core.DataSource{
+							Specifier: &core.DataSource_InlineString{
+								InlineString: "true",
+							},
+						},
+					},
+				},
+			},
+			SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+		}},
+	}
+	return &hcm.HttpFilter{
+		Name: "set_tls_filter_exchange",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(setTLSFilterExchange),
+		},
+	}
+}
+
 // buildWaypointHTTPFilters augments the common chain of Waypoint-bound HTTP filters.
 // Authn/authz filters are prepended. Telemetry filters are appended.
 func (lb *ListenerBuilder) buildWaypointHTTPFilters(svc *model.Service) (pre []*hcm.HttpFilter, post []*hcm.HttpFilter) {
@@ -848,6 +917,9 @@ func (lb *ListenerBuilder) buildWaypointHTTPFilters(svc *model.Service) (pre []*
 		model.ListenerInfo{Class: cls}.WithService(svc),
 		model.FilterChainTypeHTTP,
 	)
+	if features.EnableAmbientMultiNetwork && features.EnableAmbientTLSProxyHTTPMetrics {
+		pre = append(pre, buildSetTLSFilterExchangeHTTPFilter())
+	}
 	// TODO: how to deal with ext-authz? It will be in the ordering twice
 	// TODO policies here will need to be different per-chain (service attached)
 	// If the waypoint has opted in via annotation, synthesize XFCC from the
@@ -959,7 +1031,7 @@ func (lb *ListenerBuilder) buildWaypointNetworkFilters(svc *model.Service, fcc i
 
 		if len(routes) == 1 {
 			route := routes[0]
-			service := lb.push.ServiceForHostname(lb.node, host.Name(route.Destination.Host))
+			service := lb.node.SidecarScope.GetService(host.Name(route.Destination.Host))
 			clusterName := lb.getWaypointDestinationCluster(route.Destination, service, fcc.port.Port)
 			tcpProxy.ClusterSpecifier = &tcp.TcpProxy_Cluster{Cluster: clusterName}
 		} else if len(routes) > 1 {
@@ -967,7 +1039,7 @@ func (lb *ListenerBuilder) buildWaypointNetworkFilters(svc *model.Service, fcc i
 				WeightedClusters: &tcp.TcpProxy_WeightedCluster{},
 			}
 			for _, route := range routes {
-				service := lb.push.ServiceForHostname(lb.node, host.Name(route.Destination.Host))
+				service := lb.node.SidecarScope.GetService(host.Name(route.Destination.Host))
 				if route.Weight > 0 {
 					clusterName := lb.getWaypointDestinationCluster(route.Destination, service, fcc.port.Port)
 					clusterSpecifier.WeightedClusters.Clusters = append(clusterSpecifier.WeightedClusters.Clusters, &tcp.TcpProxy_WeightedCluster_ClusterWeight{
@@ -981,7 +1053,7 @@ func (lb *ListenerBuilder) buildWaypointNetworkFilters(svc *model.Service, fcc i
 
 		// Conditionally build SNI DFP for wildcard hosts with Dynamic DNS resolution
 		if svcHostname.IsWildCarded() && svc.Resolution == model.DynamicDNS {
-			sniDFPFilter = buildSNIDFPFilter(fcc.port.Port, svc)
+			sniDFPFilter = buildSNIDFPFilter(fcc.port.Port, svc, util.SelectDNSLookupFamily(lb.node.IPAddresses))
 		}
 	}
 
@@ -1284,7 +1356,7 @@ func portToSubset(service *model.Service, port int, destination *networking.Dest
 // NB: Un-typed SAN validation is ignored when typed is used, so only typed version must be used with this function.
 func buildCommonConnectTLSContext(proxy *model.Proxy, push *model.PushContext) *tls.CommonTlsContext {
 	ctx := &tls.CommonTlsContext{}
-	security.ApplyToCommonTLSContext(ctx, proxy, nil, "", nil, true, nil)
+	security.ApplyToCommonTLSContext(ctx, proxy, nil, "", nil, true, nil, false)
 	aliases := authn.TrustDomainsForValidation(push.Mesh)
 	validationCtx := ctx.GetCombinedValidationContext().DefaultValidationContext
 	if len(aliases) > 0 {

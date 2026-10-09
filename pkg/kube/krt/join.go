@@ -54,7 +54,7 @@ func (j *join[T]) GetKey(k string) *T {
 	return nil
 }
 
-func (j *join[T]) List() []T {
+func (j *join[T]) ListFiltered(filter func(T) bool) []T {
 	var res []T
 	if j.uncheckedOverlap {
 		first := true
@@ -63,7 +63,7 @@ func (j *join[T]) List() []T {
 			seen = sets.New[string]()
 		}
 		for _, c := range j.collections {
-			objs := c.List()
+			objs := c.ListFiltered(filter)
 			// As an optimization, take the first (non-empty) result as-is without copying
 			if len(objs) > 0 && first {
 				res = objs
@@ -91,7 +91,7 @@ func (j *join[T]) List() []T {
 	var found sets.String
 	first := true
 	for _, c := range j.collections {
-		objs := c.List()
+		objs := c.ListFiltered(filter)
 		// As an optimization, take the first (non-empty) result as-is without copying
 		if len(objs) > 0 && first {
 			res = objs
@@ -112,10 +112,6 @@ func (j *join[T]) List() []T {
 		}
 	}
 	return res
-}
-
-func (j *join[T]) Register(f func(o Event[T])) HandlerRegistration {
-	return registerHandlerAsBatched(j, f)
 }
 
 func (j *join[T]) RegisterBatch(f func(o []Event[T]), runExistingState bool) HandlerRegistration {
@@ -308,10 +304,19 @@ func (j *join[T]) name() string { return j.collectionName }
 func (j *join[T]) uid() collectionUID { return j.id }
 
 // nolint: unused // (not true, its to implement an interface)
-func (j *join[I]) dump() CollectionDump {
-	// Dump should not be used on join; instead its preferred to enroll each individual collection. Maybe reconsider
-	// in the future if there is a need
-	return CollectionDump{}
+func (j *join[T]) dump() CollectionDump {
+	inputs := map[string]InputDump{}
+	for _, c := range j.collections {
+		for _, input := range c.ListFiltered(nil) {
+			inputs[string(getTypedKey(input))] = InputDump{}
+		}
+	}
+
+	return CollectionDump{
+		Outputs: eraseMap(slices.GroupUnique(j.ListFiltered(nil), getTypedKey)),
+		Inputs:  inputs,
+		Synced:  j.HasSynced(),
+	}
 }
 
 // nolint: unused // (not true)
@@ -374,7 +379,7 @@ func JoinCollection[T any](cs []Collection[T], opts ...CollectionOption) Collect
 	}
 	synced := make(chan struct{})
 	c := slices.Map(cs, func(e Collection[T]) internalCollection[T] {
-		return e.(internalCollection[T])
+		return e.internal()
 	})
 	if o.stop == nil {
 		panic("no stop channel")
@@ -411,7 +416,7 @@ func JoinCollection[T any](cs []Collection[T], opts ...CollectionOption) Collect
 			close(synced)
 			log.Infof("%v synced", o.name)
 		}()
-		return j
+		return newCollection[T](j)
 	}
 
 	// Checked mode: set up centralized event handling with conflict resolution
@@ -451,5 +456,5 @@ func JoinCollection[T any](cs []Collection[T], opts ...CollectionOption) Collect
 		}
 	}()
 
-	return j
+	return newCollection[T](j)
 }

@@ -44,6 +44,9 @@ func (o ObjectWithCluster[T]) ResourceName() string {
 	if o.Object == nil {
 		return ""
 	}
+	if rn, ok := any(o.Object).(ResourceNamer); ok {
+		return rn.ResourceName()
+	}
 	return GetKey(*o.Object)
 }
 
@@ -92,6 +95,14 @@ func GetKey[O any](a O) string {
 	arn, ok := any(a).(ResourceNamer)
 	if ok {
 		return arn.ResourceName()
+	}
+	// Collections are keyed by their name, so that a collection replacing another one under the same
+	// name is an update of a single entry rather than a delete plus an add of two unrelated entries.
+	// Names must therefore be unique within any collection that holds collections. Identity is still
+	// compared by uid; see Equal.
+	anm, ok := any(a).(namer)
+	if ok {
+		return anm.name()
 	}
 	auid, ok := any(a).(uidable)
 	if ok {
@@ -146,7 +157,7 @@ func GetApplyConfigKey[O any](a O) *string {
 	}
 	val := reflect.ValueOf(a)
 
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		val = val.Elem()
 	}
 	if val.Kind() != reflect.Struct {

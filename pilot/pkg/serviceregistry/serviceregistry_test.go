@@ -81,7 +81,7 @@ func setupTest(t *testing.T) (model.ConfigStoreController, kubernetes.Interface,
 			MeshServiceController: aggregate.NewController(aggregate.Options{MeshHolder: meshWatcher}),
 		},
 	)
-	configController := memory.NewController(memory.Make(collections.Pilot))
+	configController := memory.NewController(collections.Pilot, false)
 
 	stop := istiotest.NewStop(t)
 	go configController.Run(stop)
@@ -256,11 +256,11 @@ func TestWorkloadInstances(t *testing.T) {
 		createEndpoints(t, kube, service.Name, namespace, []v1.EndpointPort{{Name: "http", Port: 80}}, []string{pod.Status.PodIP})
 		fx.WaitOrFail(t, "eds")
 		// Endpoint update is triggered since its a brand new service
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.EndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.EndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.EndpointUpdate, ev)
 		}
 		// headless service update must trigger nds push, so we trigger a full push.
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.HeadlessEndpointUpdate, ev)
 		}
 
@@ -281,11 +281,11 @@ func TestWorkloadInstances(t *testing.T) {
 		createEndpoints(t, kube, service.Name, namespace, []v1.EndpointPort{{Name: "tcp", Port: 70}}, []string{pod.Status.PodIP})
 		fx.WaitOrFail(t, "eds")
 		// Endpoint update is triggered since its a brand new service
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.EndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.EndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.EndpointUpdate, ev)
 		}
 		// headless service update must trigger nds push, so we trigger a full push.
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.HeadlessEndpointUpdate, ev)
 		}
 		instances := []EndpointResponse{{
@@ -507,7 +507,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 		makeIstioObject(t, store, workloadEntry)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -595,7 +595,7 @@ func TestWorkloadInstances(t *testing.T) {
 		}
 		makeIstioObject(t, store, we1)
 		makeIstioObject(t, store, we2)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -700,7 +700,7 @@ func TestWorkloadInstances(t *testing.T) {
 		}
 		makeIstioObject(t, store, we1)
 		makeIstioObject(t, store, we2)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -741,11 +741,31 @@ func TestWorkloadInstances(t *testing.T) {
 		expectServiceEndpoints(t, fx, expectedSvc, 80, instances)
 	})
 
+	t.Run("Service selects WorkloadEntry: proxy push on selection change", func(t *testing.T) {
+		store, kube, fx := setupTest(t)
+		makeService(t, kube, service)
+		fx.WaitOrFail(t, "service")
+
+		// The Service selects the WorkloadEntry, so the workload's own proxy has a new service
+		// target and must recompute.
+		makeIstioObject(t, store, workloadEntry)
+		fx.MatchOrFail(t, xdsfake.Event{Type: "proxy", ID: "2.3.4.5"})
+
+		// Labels change so the Service no longer selects it: the proxy must drop the target.
+		unselected := workloadEntry.DeepCopy()
+		unselected.Spec = &networking.WorkloadEntry{
+			Address: "2.3.4.5",
+			Labels:  map[string]string{"app": "not-selected"},
+		}
+		makeIstioObject(t, store, unselected)
+		fx.MatchOrFail(t, xdsfake.Event{Type: "proxy", ID: "2.3.4.5"})
+	})
+
 	t.Run("Service selects WorkloadEntry: wle occur earlier", func(t *testing.T) {
 		store, kube, fx := setupTest(t)
 		makeIstioObject(t, store, workloadEntry)
-		// 	Other than proxy update, no event pushed when workload entry created as no service entry
-		fx.WaitOrFail(t, "proxy")
+		// No event is pushed when the workload entry is created: no service entry, and no Kubernetes
+		// Service selects it yet, so nothing about it has changed for any proxy.
 		fx.AssertEmpty(t, 40*time.Millisecond)
 
 		makeService(t, kube, service)
@@ -787,8 +807,8 @@ func TestWorkloadInstances(t *testing.T) {
 		store, kube, fx := setupTest(t)
 		makeIstioObject(t, store, workloadEntry)
 
-		// 	Other than proxy update, no event pushed when workload entry created as no service entry
-		fx.WaitOrFail(t, "proxy")
+		// No event is pushed when the workload entry is created: no service entry, and no Kubernetes
+		// Service selects it yet, so nothing about it has changed for any proxy.
 		fx.AssertEmpty(t, 200*time.Millisecond)
 
 		makePod(t, kube, pod)
@@ -1160,7 +1180,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 		instances := []EndpointResponse{{
 			Address: "2.3.4.5",
 			Port:    80,
@@ -1268,7 +1288,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 		expectedSvc := &model.Service{
 			Hostname: "service.namespace.svc.cluster.local",
 			Ports: []*model.Port{

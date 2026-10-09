@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayalpha "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gateway "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayx "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
@@ -144,14 +143,23 @@ type Inputs struct {
 	Gateways             krt.Collection[*gatewayv1.Gateway]
 	HTTPRoutes           krt.Collection[*gatewayv1.HTTPRoute]
 	GRPCRoutes           krt.Collection[*gatewayv1.GRPCRoute]
-	TCPRoutes            krt.Collection[*gatewayalpha.TCPRoute]
+	TCPRoutes            krt.Collection[*gatewayv1.TCPRoute]
 	TLSRoutes            krt.Collection[*gatewayv1.TLSRoute]
 	ListenerSets         krt.Collection[*gatewayv1.ListenerSet]
 	ReferenceGrants      krt.Collection[*gateway.ReferenceGrant]
+	Backends             krt.Collection[*gatewayx.XBackend]
 	BackendTrafficPolicy krt.Collection[*gatewayx.XBackendTrafficPolicy]
 	BackendTLSPolicies   krt.Collection[*gatewayv1.BackendTLSPolicy]
 	ServiceEntries       krt.Collection[*networkingclient.ServiceEntry]
 	InferencePools       krt.Collection[*inferencev1.InferencePool]
+}
+
+// FeatureFlags is a snapshot of the feature flags taken when the controller is built. Route
+// conversion runs on krt goroutines that are not joined on shutdown, so it reads these rather
+// than the globals, and agrees with the collections the flags selected.
+type FeatureFlags struct {
+	EnableAlphaGatewayAPI              bool
+	EnableGatewayAPIInferenceExtension bool
 }
 
 var _ model.GatewayController = &Controller{}
@@ -164,6 +172,10 @@ func NewController(
 ) *Controller {
 	stop := make(chan struct{})
 	opts := krt.NewOptionsBuilder(stop, "gateway", options.KrtDebugger)
+	flags := FeatureFlags{
+		EnableAlphaGatewayAPI:              features.EnableAlphaGatewayAPI,
+		EnableGatewayAPIInferenceExtension: features.EnableGatewayAPIInferenceExtension,
+	}
 
 	tw := revisions.NewTagWatcher(kc, options.Revision, options.SystemNamespace)
 	c := &Controller{
@@ -204,21 +216,22 @@ func NewController(
 		GRPCRoutes:         buildClient[*gatewayv1.GRPCRoute](c, kc, gvr.GRPCRoute, opts, "informer/GRPCRoutes"),
 		BackendTLSPolicies: buildClient[*gatewayv1.BackendTLSPolicy](c, kc, gvr.BackendTLSPolicy, opts, "informer/BackendTLSPolicies"),
 		TLSRoutes:          buildClient[*gatewayv1.TLSRoute](c, kc, gvr.TLSRoute, opts, "informer/TLSRoutes"),
+		TCPRoutes:          buildClient[*gatewayv1.TCPRoute](c, kc, gvr.TCPRoute, opts, "informer/TCPRoutes"),
 		ListenerSets:       buildClient[*gatewayv1.ListenerSet](c, kc, gvr.ListenerSet, opts, "informer/ListenerSet"),
 
 		ReferenceGrants: buildClient[*gateway.ReferenceGrant](c, kc, gvr.ReferenceGrant, opts, "informer/ReferenceGrants"),
 		ServiceEntries:  buildClient[*networkingclient.ServiceEntry](c, kc, gvr.ServiceEntry, opts, "informer/ServiceEntries"),
 	}
-	if features.EnableAlphaGatewayAPI {
-		inputs.TCPRoutes = buildClient[*gatewayalpha.TCPRoute](c, kc, gvr.TCPRoute, opts, "informer/TCPRoutes")
+	if flags.EnableAlphaGatewayAPI {
 		inputs.BackendTrafficPolicy = buildClient[*gatewayx.XBackendTrafficPolicy](c, kc, gvr.XBackendTrafficPolicy, opts, "informer/XBackendTrafficPolicy")
+		inputs.Backends = buildClient[*gatewayx.XBackend](c, kc, gvr.XBackend, opts, "informer/XBackend")
 	} else {
 		// If disabled, still build a collection but make it always empty
-		inputs.TCPRoutes = krt.NewStaticCollection[*gatewayalpha.TCPRoute](nil, nil, opts.WithName("disable/TCPRoutes")...)
 		inputs.BackendTrafficPolicy = krt.NewStaticCollection[*gatewayx.XBackendTrafficPolicy](nil, nil, opts.WithName("disable/XBackendTrafficPolicy")...)
+		inputs.Backends = krt.NewStaticCollection[*gatewayx.XBackend](nil, nil, opts.WithName("disable/XBackend")...)
 	}
 
-	if features.EnableGatewayAPIInferenceExtension {
+	if flags.EnableGatewayAPIInferenceExtension {
 		inputs.InferencePools = buildClient[*inferencev1.InferencePool](c, kc, gvr.InferencePool, opts, "informer/InferencePools")
 	} else {
 		// If disabled, still build a collection but make it always empty
@@ -240,9 +253,17 @@ func NewController(
 	status.RegisterStatus(c.status, GatewayClassStatus, GetStatus, c.tagWatcher.AccessUnprotected())
 
 	ReferenceGrants := gatewaycommon.BuildReferenceGrants(gatewaycommon.ReferenceGrantsCollection(inputs.ReferenceGrants, opts))
+	GatewayListenerConflicts := gatewaycommon.GatewayListenerConflictCollection(
+		inputs.Gateways,
+		inputs.ListenerSets,
+		inputs.Namespaces,
+		gatewaycommon.FetchGatewayClassFetcher(GatewayClasses),
+		opts,
+	)
 	ListenerSetStatus, ListenerSets := ListenerSetCollection(
 		inputs.ListenerSets,
 		inputs.Gateways,
+		GatewayListenerConflicts,
 		GatewayClasses,
 		inputs.Namespaces,
 		ReferenceGrants,
@@ -253,13 +274,13 @@ func NewController(
 		c.tagWatcher,
 		opts,
 	)
-	status.RegisterStatus(c.status, ListenerSetStatus, GetStatus, c.tagWatcher.AccessUnprotected())
 
 	// GatewaysStatus is not fully complete until its join with route attachments to report attachedRoutes.
 	// Do not register yet.
 	GatewaysStatus, Gateways := GatewayCollection(
 		inputs.Gateways,
 		ListenerSets,
+		GatewayListenerConflicts,
 		GatewayClasses,
 		inputs.Namespaces,
 		ReferenceGrants,
@@ -294,7 +315,7 @@ func NewController(
 		controllers.WithReconciler(c.reconcileShadowService(kc, InferencePools, inputs.Services)),
 		controllers.WithMaxAttempts(5))
 
-	if features.EnableGatewayAPIInferenceExtension {
+	if flags.EnableGatewayAPIInferenceExtension {
 		status.RegisterStatus(c.status, InferencePoolStatus, GetStatus, c.tagWatcher.AccessUnprotected())
 	}
 
@@ -306,8 +327,12 @@ func NewController(
 		DomainSuffix:    c.domainSuffix,
 		Services:        inputs.Services,
 		Namespaces:      inputs.Namespaces,
+		GatewayClasses:  inputs.GatewayClasses,
+		Gateways:        inputs.Gateways,
 		ServiceEntries:  inputs.ServiceEntries,
+		Backends:        inputs.Backends,
 		InferencePools:  inputs.InferencePools,
+		Flags:           flags,
 		internalContext: c.gatewayContext,
 	}
 	tcpRoutes := TCPRouteCollection(
@@ -357,6 +382,7 @@ func NewController(
 	DestinationRules := DestinationRuleCollection(
 		inputs.BackendTrafficPolicy,
 		inputs.BackendTLSPolicies,
+		inputs.Backends,
 		AncestorsIndex,
 		references,
 		c.domainSuffix,
@@ -367,6 +393,9 @@ func NewController(
 
 	GatewayFinalStatus := FinalGatewayStatusCollection(GatewaysStatus, RouteAttachments, RouteAttachmentsIndex, opts)
 	status.RegisterStatus(c.status, GatewayFinalStatus, GetStatus, c.tagWatcher.AccessUnprotected())
+
+	ListenerSetFinalStatus := FinalListenerSetStatusCollection(ListenerSetStatus, RouteAttachments, RouteAttachmentsIndex, opts)
+	status.RegisterStatus(c.status, ListenerSetFinalStatus, GetStatus, c.tagWatcher.AccessUnprotected())
 
 	// Merge HTTP and gRPC base VirtualServices together so routes on the same
 	// gateway+hostname are combined into a single VirtualService, allowing
@@ -621,7 +650,6 @@ func pushXds[T any](xds model.XDSUpdater, f func(T) model.ConfigKey) func(events
 			return
 		}
 		xds.ConfigUpdate(&model.PushRequest{
-			Full:           true,
 			ConfigsUpdated: cu,
 			Reason:         model.NewReasonStats(model.ConfigUpdate),
 		})

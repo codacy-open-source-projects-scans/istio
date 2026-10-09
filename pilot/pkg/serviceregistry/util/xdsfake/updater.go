@@ -24,6 +24,7 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // NewFakeXDS creates a XdsUpdater reporting events via a channel.
@@ -65,8 +66,8 @@ func (fx *Updater) ConfigUpdate(req *model.PushRequest) {
 	if fx.SplitEvents {
 		for _, n := range names {
 			event := "xds"
-			if req.Full {
-				event += " full"
+			if req.Forced {
+				event += " forced"
 			}
 			select {
 			case fx.Events <- Event{Type: event, ID: n}:
@@ -76,8 +77,8 @@ func (fx *Updater) ConfigUpdate(req *model.PushRequest) {
 	} else {
 		id := strings.Join(names, ",")
 		event := "xds"
-		if req.Full {
-			event += " full"
+		if req.Forced {
+			event += " forced"
 		}
 		select {
 		case fx.Events <- Event{Type: event, ID: id, Reason: req.Reason}:
@@ -169,6 +170,16 @@ func (fx *Updater) RemoveShard(shardKey model.ShardKey) {
 	}
 	if fx.Delegate != nil {
 		fx.Delegate.RemoveShard(shardKey)
+	}
+}
+
+func (fx *Updater) PruneShard(shardKey model.ShardKey, keep map[string]sets.String) {
+	select {
+	case fx.Events <- Event{Type: "pruneShard", ID: shardKey.String()}:
+	default:
+	}
+	if fx.Delegate != nil {
+		fx.Delegate.PruneShard(shardKey, keep)
 	}
 }
 

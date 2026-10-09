@@ -88,12 +88,14 @@ type EndpointBuilder struct {
 	mtlsChecker *mtlsChecker
 
 	canonicalServiceForMeshExternal bool
+	isSelfDiscoveryCluster          bool
+	supportsUnhealthyEndpoints      bool
 }
 
 func NewEndpointBuilder(clusterName string, proxy *model.Proxy, push *model.PushContext) EndpointBuilder {
 	dir, subsetName, hostname, port := model.ParseSubsetKey(clusterName)
 
-	svc := push.ServiceForHostname(proxy, hostname)
+	svc := proxy.SidecarScope.GetService(hostname)
 	var dr *model.ConsolidatedDestRule
 	if svc != nil {
 		dr = proxy.SidecarScope.DestinationRule(model.TrafficDirectionOutbound, proxy, svc.Hostname)
@@ -132,7 +134,10 @@ func NewCDSEndpointBuilder(
 		dir:        dir,
 
 		canonicalServiceForMeshExternal: features.CanonicalServiceForMeshExternalServiceEntry,
+		isSelfDiscoveryCluster:          clusterName == util.SelfDiscoveryCluster,
 	}
+
+	b.supportsUnhealthyEndpoints = supportsUnhealthyEndpoints(service, b.DestinationRule(), port, subsetName)
 	b.populateSubsetInfo()
 	b.populateFailoverPriorityLabels()
 	if features.EnableAmbientMultiNetwork {
@@ -161,6 +166,9 @@ func (b *EndpointBuilder) WithSubset(subset string) *EndpointBuilder {
 	subsetBuilder := *b
 	subsetBuilder.subsetName = subset
 	subsetBuilder.populateSubsetInfo()
+	subsetBuilder.supportsUnhealthyEndpoints = supportsUnhealthyEndpoints(
+		subsetBuilder.service, subsetBuilder.DestinationRule(), subsetBuilder.port, subsetBuilder.subsetName,
+	)
 	return &subsetBuilder
 }
 
@@ -174,13 +182,26 @@ func (b *EndpointBuilder) populateSubsetInfo() {
 }
 
 func (b *EndpointBuilder) populateFailoverPriorityLabels() {
+	if b.isSelfDiscoveryCluster {
+		return
+	}
+
 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
-	if enableFailover {
-		lbSetting, _ := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
-		if lbSetting != nil && lbSetting.Distribute == nil &&
-			len(lbSetting.FailoverPriority) > 0 && (lbSetting.Enabled == nil || lbSetting.Enabled.Value) {
-			b.failoverPriorityLabels = util.GetFailoverPriorityLabels(b.proxy.Labels, lbSetting.FailoverPriority)
-		}
+	if !enableFailover {
+		return
+	}
+	lbSettings := loadbalancer.GetEffectiveLbSetting(
+		b.push.Mesh.GetLocalityLbSetting(),
+		b.push.Mesh.GetZoneAwareLbSetting(),
+		lb,
+		b.service,
+	)
+	if lbSettings == nil {
+		return
+	}
+	failoverPriority := lbSettings.FailoverPriorityLabels()
+	if len(failoverPriority) > 0 {
+		b.failoverPriorityLabels = util.GetFailoverPriorityLabels(b.proxy.Labels, failoverPriority)
 	}
 }
 
@@ -202,6 +223,26 @@ func (b *EndpointBuilder) DestinationRule() *v1alpha3.DestinationRule {
 		return dr
 	}
 	return nil
+}
+
+// supportsUnhealthyEndpoints returns whether unhealthy endpoints should be included in EDS for this cluster.
+// When DefaultSendUnhealthyEndpoints is enabled, unhealthy endpoints are excluded if the DestinationRule
+// configures OutlierDetection.MinHealthPercent > 0, since Envoy's panic threshold would otherwise route
+// traffic to unhealthy pods.
+func supportsUnhealthyEndpoints(service *model.Service, dr *v1alpha3.DestinationRule, port int, subsetName string) bool {
+	if service.ForcesSupportUnhealthyEndpoints() {
+		return true
+	}
+	if !service.SupportsUnhealthyEndpoints() {
+		return false
+	}
+	if dr != nil {
+		policy := getSubsetTrafficPolicy(dr, &model.Port{Port: port}, subsetName)
+		if policy != nil && policy.OutlierDetection != nil && policy.OutlierDetection.MinHealthPercent > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *EndpointBuilder) Type() string {
@@ -279,6 +320,17 @@ func (b *EndpointBuilder) WriteHash(h hash.Hash) {
 		h.WriteString(b.proxyView.String())
 	}
 	h.Write(Separator)
+
+	if b.isSelfDiscoveryCluster {
+		h.WriteString(b.proxy.Metadata.WorkloadName)
+		h.Write(Separator)
+		h.WriteString(b.proxy.Labels["pod-template-hash"])
+		h.Write(Separator)
+		h.WriteString(b.proxy.Labels["rollouts-pod-template-hash"])
+		h.Write(Separator)
+		h.WriteString(strconv.Itoa(b.port))
+		h.Write(Separator)
+	}
 }
 
 func (b *EndpointBuilder) Cacheable() bool {
@@ -290,7 +342,7 @@ func (b *EndpointBuilder) Cacheable() bool {
 
 func (b *EndpointBuilder) DependentConfigs() []model.ConfigHash {
 	drs := b.destinationRule.GetFrom()
-	configs := make([]model.ConfigHash, 0, len(drs)+1)
+	configs := make([]model.ConfigHash, 0, len(drs)+2)
 	if b.destinationRule != nil {
 		for _, dr := range drs {
 			configs = append(configs, model.ConfigKey{
@@ -300,10 +352,17 @@ func (b *EndpointBuilder) DependentConfigs() []model.ConfigHash {
 		}
 	}
 	if b.service != nil {
-		configs = append(configs, model.ConfigKey{
-			Kind: kind.ServiceEntry,
-			Name: string(b.service.Hostname), Namespace: b.service.Attributes.Namespace,
-		}.HashCode())
+		configs = append(
+			configs,
+			model.ConfigKey{
+				Kind: kind.ServiceEntry,
+				Name: string(b.service.Hostname), Namespace: b.service.Attributes.Namespace,
+			}.HashCode(),
+			model.ConfigKey{
+				Kind: kind.Endpoints,
+				Name: string(b.service.Hostname), Namespace: b.service.Attributes.Namespace,
+			}.HashCode(),
+		)
 	}
 
 	// For now, this matches clusterCache's DependentConfigs. If adding anything here, we may need to add them there.
@@ -320,6 +379,17 @@ type LocalityEndpoints struct {
 func (e *LocalityEndpoints) append(ep *model.IstioEndpoint, le *endpoint.LbEndpoint) {
 	e.istioEndpoints = append(e.istioEndpoints, ep)
 	e.llbEndpoints.LbEndpoints = append(e.llbEndpoints.LbEndpoints, le)
+}
+
+// IstioEndpoints returns the IstioEndpoints backing this locality group, in the same order as
+// LbEndpoints().LbEndpoints, so callers can safely correlate the two by index.
+func (e *LocalityEndpoints) IstioEndpoints() []*model.IstioEndpoint {
+	return e.istioEndpoints
+}
+
+// LbEndpoints returns the envoy LocalityLbEndpoints for this locality group.
+func (e *LocalityEndpoints) LbEndpoints() *endpoint.LocalityLbEndpoints {
+	return &e.llbEndpoints
 }
 
 func (e *LocalityEndpoints) refreshWeight() {
@@ -353,12 +423,19 @@ func (b *EndpointBuilder) FromServiceEndpoints() []*endpoint.LocalityLbEndpoints
 	return ExtractEnvoyEndpoints(b.generate(svcEps, false))
 }
 
-// IstioEndpoints returns IstioEndpoints from the PushContext's snapshotted ServiceIndex.
-func (b *EndpointBuilder) IstioEndpoints() []*model.IstioEndpoint {
+// FromServiceEndpointsByLocality builds the same locality groups as FromServiceEndpoints, but
+// keeps each group's IstioEndpoints paired with its LocalityLbEndpoints (same order and length)
+// instead of discarding them. Used for CDS DNS clusters, whose endpoints may span more than one
+// locality, so per-locality failover priority can be computed without misaligning indices across
+// locality groups.
+func (b *EndpointBuilder) FromServiceEndpointsByLocality() []*LocalityEndpoints {
 	if b == nil {
 		return nil
 	}
-	return b.push.ServiceEndpointsByPort(b.service, b.port, b.subsetLabels)
+	svcEps := b.push.ServiceEndpointsByPort(b.service, b.port, b.subsetLabels)
+	// don't use the pre-computed endpoints for CDS to preserve previous behavior
+	// CDS is always toServiceWaypoint=false. We do not yet support calling waypoints for CDS (DNS type)
+	return b.generate(svcEps, false)
 }
 
 // BuildClusterLoadAssignment converts the shards for this EndpointBuilder's Service
@@ -411,6 +488,10 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 	}
 
 	l := b.createClusterLoadAssignment(localityLbEndpoints)
+	// if this is the self-discovery cluster we can and should avoid applying loadbalancers
+	if b.isSelfDiscoveryCluster {
+		return l
+	}
 
 	// If locality aware routing is enabled, prioritize endpoints or set their lb weight.
 	// Failover should only be enabled when there is an outlier detection, otherwise Envoy
@@ -419,20 +500,31 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 	// outlier detection in a DestinationRule will automatically activate locality LB failover
 	// even when no explicit localityLbSetting is configured in the DR.
 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
-	lbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
-	enableFailover = enableFailover || forceFailover
-	if lbSetting != nil {
-		// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
-		l = util.CloneClusterLoadAssignment(l)
-		wrappedLocalityLbEndpoints := make([]*loadbalancer.WrappedLocalityLbEndpoints, len(localityLbEndpoints))
-		for i := range localityLbEndpoints {
-			wrappedLocalityLbEndpoints[i] = &loadbalancer.WrappedLocalityLbEndpoints{
-				IstioEndpoints:      localityLbEndpoints[i].istioEndpoints,
-				LocalityLbEndpoints: l.Endpoints[i],
-			}
-		}
-		loadbalancer.ApplyLocalityLoadBalancer(l, wrappedLocalityLbEndpoints, b.locality, b.proxy.Labels, lbSetting, enableFailover)
+	lbSettings := loadbalancer.GetEffectiveLbSetting(
+		b.push.Mesh.GetLocalityLbSetting(),
+		b.push.Mesh.GetZoneAwareLbSetting(),
+		lb,
+		b.service,
+	)
+	if lbSettings == nil {
+		return l
 	}
+	// Zone-aware LB relies on a self-discovery local_cluster, which waypoints never configure,
+	// so it is meaningless there. Skip it for waypoints (they fall back to locality LB only if
+	// one is configured, but the two settings are mutually exclusive so there is none here).
+	if lbSettings.IsZoneAware() && b.proxy.Type == model.Waypoint {
+		return l
+	}
+	// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
+	l = util.CloneClusterLoadAssignment(l)
+	wrappedLocalityLbEndpoints := make([]*loadbalancer.WrappedLocalityLbEndpoints, len(localityLbEndpoints))
+	for i := range localityLbEndpoints {
+		wrappedLocalityLbEndpoints[i] = &loadbalancer.WrappedLocalityLbEndpoints{
+			IstioEndpoints:      localityLbEndpoints[i].istioEndpoints,
+			LocalityLbEndpoints: l.Endpoints[i],
+		}
+	}
+	lbSettings.ApplyToLoadAssignment(l, wrappedLocalityLbEndpoints, b.locality, b.proxy.Labels, enableFailover)
 	return l
 }
 
@@ -546,7 +638,7 @@ func (b *EndpointBuilder) filterIstioEndpoint(ep *model.IstioEndpoint) bool {
 	// Filter out unhealthy endpoints, unless the service needs them.
 	// This is used to let envoy know about the amount of health endpoints in a cluster.
 	// This is used to let envoy know about the amount of health endpoints in a cluster.
-	if !b.service.SupportsUnhealthyEndpoints() && ep.HealthStatus == model.UnHealthy {
+	if !b.supportsUnhealthyEndpoints && ep.HealthStatus == model.UnHealthy {
 		return false
 	}
 	// Filter out terminating endpoints -- we never need these. Even in "send unhealthy mode", there is no need
@@ -569,6 +661,28 @@ func (b *EndpointBuilder) filterIstioEndpoint(ep *model.IstioEndpoint) bool {
 	// we filter it out.
 	if b.serviceInfo != nil && b.serviceInfo.Scope != model.Global && b.clusterID != ep.Locality.ClusterID {
 		return false
+	}
+
+	// If this is the self discovery cluster, then we only need endpoints from the same workload and the same region.
+	if b.isSelfDiscoveryCluster {
+		if b.proxy.Metadata.WorkloadName != ep.WorkloadName {
+			return false
+		}
+
+		// In kubernetes it's better if we only include endpoints from the same ReplicaSet,
+		// since we can expect balanced traffic distribution across the pods in the same ReplicaSet,
+		// but not across multiple ReplicaSets in a Deployment.
+		if b.proxy.Labels["pod-template-hash"] != ep.Labels["pod-template-hash"] {
+			return false
+		}
+		if b.proxy.Labels["rollouts-pod-template-hash"] != ep.Labels["rollouts-pod-template-hash"] {
+			return false
+		}
+
+		locality := util.ConvertLocality(ep.Locality.Label)
+		if b.locality != nil && b.locality.Region != locality.Region {
+			return false
+		}
 	}
 
 	return true
@@ -708,22 +822,7 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 	}
 	util.AppendLbEndpointMetadata(meta, ep.Metadata)
 
-	tunnel := supportTunnel(b, e)
-	// Only send HBONE if its necessary. If they support legacy mTLS and do not explicitly PreferHBONE, we will use legacy mTLS.
-	// However, waypoints (TrafficDirectionInboundVIP) do not support legacy mTLS, so do not allow opting out of that case.
-	supportsMtls := e.TLSMode == model.IstioMutualTLSModeLabel
-	if supportsMtls && !features.PreferHBONESend && b.dir != model.TrafficDirectionInboundVIP {
-		tunnel = false
-	}
-	if b.proxy.Metadata.DisableHBONESend {
-		tunnel = false
-	}
-	// Waypoints always use HBONE
-	if toServiceWaypoint {
-		tunnel = true
-	}
-
-	if tunnel {
+	if useTunnel(b, e, toServiceWaypoint) {
 		// Currently, Envoy cannot support tunneling to multiple IP families.
 		// TODO(https://github.com/envoyproxy/envoy/issues/36318)
 		address, port := e.Addresses[0], int(e.EndpointPort)
@@ -808,6 +907,38 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 	return ep
 }
 
+func usesTunnel(lbEp *endpoint.LbEndpoint) bool {
+	if lbEp == nil || lbEp.Metadata == nil || lbEp.Metadata.FilterMetadata == nil {
+		return false
+	}
+	if t, exists := lbEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey]; exists && t != nil {
+		val, exists := t.GetFields()[model.TunnelLabelShortName]
+		return exists && val.GetStringValue() == model.TunnelHTTP
+	}
+	return false
+}
+
+func useTunnel(b *EndpointBuilder, e *model.IstioEndpoint, toWaypoint bool) bool {
+	// Only send HBONE if its necessary. If they support legacy mTLS and do not
+	// explicitly PreferHBONE, we will use legacy mTLS. However, waypoints
+	// (TrafficDirectionInboundVIP) do not support legacy mTLS, so do not allow
+	// opting out of that case.
+	if toWaypoint {
+		return true
+	}
+
+	if b.proxy.Metadata.DisableHBONESend {
+		return false
+	}
+
+	supportsMtls := e.TLSMode == model.IstioMutualTLSModeLabel
+	if supportsMtls && !features.PreferHBONESend && b.dir != model.TrafficDirectionInboundVIP {
+		return false
+	}
+
+	return supportTunnel(b, e)
+}
+
 func supportTunnel(b *EndpointBuilder, e *model.IstioEndpoint) bool {
 	if b.proxy.IsProxylessGrpc() {
 		// Proxyless client cannot handle tunneling, even if the server can
@@ -826,15 +957,7 @@ func supportTunnel(b *EndpointBuilder, e *model.IstioEndpoint) bool {
 		return true
 	}
 
-	// Otherwise has ambient enabled. Note: this is a synthetic label, not existing in the real Pod.
-	// Check all addresses and return true if there is any IP address that supports tunneling when current endpoint has multiple addresses
-	for _, addr := range e.Addresses {
-		if b.push.SupportsTunnel(e.Network, addr) {
-			return true
-		}
-	}
-
-	return false
+	return e.CapturedByZtunnel
 }
 
 func getOutlierDetectionAndLoadBalancerSettings(
@@ -920,18 +1043,59 @@ func (b *EndpointBuilder) findServiceWaypoint(endpointIndex *model.EndpointIndex
 	if !svc.IngressUseWaypoint && !isEastWestGateway(b.proxy) {
 		return nil, false
 	}
+	// Weighted waypoints override the single primary waypoint for gateway endpoint generation.
+	if len(svc.WeightedWaypoints) > 0 {
+		return b.weightedWaypointEndpoints(svc, endpointIndex)
+	}
+	eps := b.waypointEndpoints(svc.WaypointHostname, int(svc.Service.GetWaypoint().GetHboneMtlsPort()), endpointIndex)
+	return eps, true
+}
+
+// waypointEndpoints returns the endpoints of a waypoint's HBONE port.
+func (b *EndpointBuilder) waypointEndpoints(hostname string, port int, endpointIndex *model.EndpointIndex) []*model.IstioEndpoint {
 	waypointClusterName := model.BuildSubsetKey(
 		model.TrafficDirectionOutbound,
 		"",
-		host.Name(svc.WaypointHostname),
-		int(svc.Service.GetWaypoint().GetHboneMtlsPort()),
+		host.Name(hostname),
+		port,
 	)
 	endpointBuilder := NewEndpointBuilder(waypointClusterName, b.proxy, b.push)
-	waypointEndpoints, _ := endpointBuilder.snapshotEndpointsForPort(endpointIndex)
-	return waypointEndpoints, true
+	eps, _ := endpointBuilder.snapshotEndpointsForPort(endpointIndex)
+	return eps
 }
 
-func (b *EndpointBuilder) snapshotEndpointsForPort(endpointIndex *model.EndpointIndex) ([]*model.IstioEndpoint, bool) {
+// weightedWaypointEndpoints scales endpoint weights so each waypoint gets its configured share.
+func (b *EndpointBuilder) weightedWaypointEndpoints(
+	svc model.ServiceWaypointInfo,
+	endpointIndex *model.EndpointIndex,
+) ([]*model.IstioEndpoint, bool) {
+	// Scale factor keeps the per-endpoint integer weights precise after dividing by the pod count.
+	const weightScale = 10000
+	var out []*model.IstioEndpoint
+	for _, ww := range svc.WeightedWaypoints {
+		if ww.Weight == 0 {
+			// Resolved but receives no traffic.
+			continue
+		}
+		eps := b.waypointEndpoints(ww.Hostname, int(ww.HboneMtlsPort), endpointIndex)
+		if len(eps) == 0 {
+			continue
+		}
+		perEndpoint := ww.Weight * weightScale / uint32(len(eps))
+		if perEndpoint == 0 {
+			perEndpoint = 1
+		}
+		for _, ep := range eps {
+			c := ep.ShallowCopy()
+			c.LbWeight = perEndpoint
+			out = append(out, c)
+		}
+	}
+	// Once weighted waypoints are configured, fail closed instead of falling back to direct endpoints.
+	return out, true
+}
+
+func (b *EndpointBuilder) snapshotEndpointsForPort(endpointIndex *model.EndpointIndex) ([]*model.IstioEndpoint, bool) { //nolint:unparam
 	svcPort := b.servicePort(b.port)
 	if svcPort == nil {
 		return nil, false

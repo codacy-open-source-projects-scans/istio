@@ -13,6 +13,7 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-class-name: istio
     gateway.networking.k8s.io/gateway-name: default
+    istio.io/dataplane-mode: none
     should: see-infra-label
   name: default-istio
   namespace: default
@@ -31,6 +32,7 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-class-name: istio
     gateway.networking.k8s.io/gateway-name: default
+    istio.io/dataplane-mode: none
     should: see-infra-label
   name: default-istio
   namespace: default
@@ -55,6 +57,7 @@ spec:
         gateway.istio.io/managed: istio.io-gateway-controller
         gateway.networking.k8s.io/gateway-class-name: istio
         gateway.networking.k8s.io/gateway-name: default
+        istio.io/dataplane-mode: none
         service.istio.io/canonical-name: default-istio
         service.istio.io/canonical-revision: latest
         should: see-infra-label
@@ -114,11 +117,6 @@ spec:
             resourceFieldRef:
               divisor: "1"
               resource: limits.memory
-        - name: GOMAXPROCS
-          valueFrom:
-            resourceFieldRef:
-              divisor: "1"
-              resource: limits.cpu
         - name: ISTIO_META_CLUSTER_ID
           value: Kubernetes
         - name: ISTIO_META_NODE_NAME
@@ -198,7 +196,7 @@ spec:
           value: "0"
       serviceAccountName: default-istio
       volumes:
-      - emptyDir: {}
+      - emptyDir: null
         name: workload-socket
       - emptyDir: {}
         name: credential-socket
@@ -235,6 +233,7 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-class-name: istio
     gateway.networking.k8s.io/gateway-name: default
+    istio.io/dataplane-mode: none
     should: see-infra-label
   name: default-istio
   namespace: default

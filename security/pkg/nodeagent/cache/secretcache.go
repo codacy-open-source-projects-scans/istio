@@ -866,12 +866,8 @@ var rotateTime = func(secret security.SecretItem, graceRatio float64, graceRatio
 		jitterGraceRatio = 0
 	}
 	secretLifeTime := secret.ExpireTime.Sub(secret.CreatedTime)
-	gracePeriod := time.Duration((jitterGraceRatio) * float64(secretLifeTime))
-	delay := time.Until(secret.ExpireTime.Add(-gracePeriod))
-	if delay < 0 {
-		delay = 0
-	}
-	return delay
+	gracePeriod := time.Duration(jitterGraceRatio * float64(secretLifeTime))
+	return max(time.Until(secret.ExpireTime.Add(-gracePeriod)), 0)
 }
 
 func (sc *SecretManagerClient) registerSecret(item security.SecretItem) {

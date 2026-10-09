@@ -40,6 +40,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core/extension"
 	istio_route "istio.io/istio/pilot/pkg/networking/core/route"
 	"istio.io/istio/pilot/pkg/networking/core/tunnelingconfig"
+	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
@@ -206,9 +207,18 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			}
 		}
 	}
+	// Use the connection settings already resolved and cached in NewListenerBuilder.
+	cs := builder.connectionSettings
+
 	listeners := make([]*listener.Listener, 0)
 	for _, ml := range mutableopts {
 		ml.mutable.Listener = buildGatewayListener(*ml.opts, ml.transport)
+
+		// Set listener-level buffer limit from ConnectionSettings.
+		if v := safeUint32(cs.GetListenerPerConnectionBufferLimitBytes()); v != nil {
+			ml.mutable.Listener.PerConnectionBufferLimitBytes = v
+		}
+
 		log.Debugf("buildGatewayListeners: marshaling listener %q with %d filter chains",
 			ml.mutable.Listener.GetName(), len(ml.mutable.Listener.GetFilterChains()))
 
@@ -359,7 +369,7 @@ func buildNameToServiceMapForHTTPRoutes(node *model.Proxy, push *model.PushConte
 		// If we find no service for the namespace of virtualService or the selected service is not visible to the proxy node,
 		// we should fallback to pick one service which is visible to the ConfigNamespace of node.
 		if service == nil {
-			service = push.ServiceForHostname(node, hostname)
+			service = node.SidecarScope.GetService(hostname)
 		}
 		nameToServiceMap[hostname] = service
 	}
@@ -422,19 +432,17 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 	isH3DiscoveryNeeded := merged.HTTP3AdvertisingRoutes.Contains(routeName)
 
 	gatewayRoutes := make(map[string]map[string][]*route.Route)
-	gatewayVirtualServices := make(map[string][]*config.Config)
 	vHostDedupMap := make(map[host.Name]*route.VirtualHost)
+
+	var perRouteAuthz *authz.PerRouteBuilder
+	if features.EnableGatewayAPIHTTPRouteAuth {
+		perRouteAuthz = authz.NewPerRouteBuilder(push, node)
+	}
 	for _, server := range servers {
 		gatewayName := merged.GatewayNameForServer[server]
 		port := int(server.Port.Number)
 
-		var virtualServices []*config.Config
-		var exists bool
-
-		if virtualServices, exists = gatewayVirtualServices[gatewayName]; !exists {
-			virtualServices = push.VirtualServicesForGateway(node.ConfigNamespace, gatewayName)
-			gatewayVirtualServices[gatewayName] = virtualServices
-		}
+		virtualServices := node.SidecarScope.GatewayVirtualServices(gatewayName)
 
 		for _, virtualService := range virtualServices {
 			virtualServiceHosts := host.NewNames(virtualService.Spec.(*networking.VirtualService).Hosts)
@@ -477,6 +485,9 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 						return hashByDestination[destination]
 					},
 					InferencePoolExtensionRefs: infPoolConfigs,
+				}
+				if perRouteAuthz != nil {
+					opts.BuildPerRouteAuthConfig = perRouteAuthz.Build
 				}
 				routes, err = istio_route.BuildHTTPRoutesForVirtualService(node, *virtualService, port, sets.New(gatewayName), opts)
 				if err != nil {
@@ -858,7 +869,7 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTCPRoutes(server *netwo
 		gatewayServerHosts.Insert(host.Name(hostname))
 	}
 
-	virtualServices := lb.push.VirtualServicesForGateway(lb.node.ConfigNamespace, gatewayName)
+	virtualServices := lb.node.SidecarScope.GatewayVirtualServices(gatewayName)
 	if len(virtualServices) == 0 {
 		log.Warnf("no virtual service bound to gateway: %v", gatewayName)
 	}
@@ -880,6 +891,9 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTCPRoutes(server *netwo
 		// based on the match port/server port and the gateway name
 		for _, tcp := range vsvc.Tcp {
 			if l4MultiMatch(tcp.Match, server, gatewayName) {
+				if len(tcp.Route) == 0 {
+					continue
+				}
 				includeMx := server.GetTls().GetMode() == networking.ServerTLSSettings_ISTIO_MUTUAL
 				return lb.buildOutboundNetworkFilters(tcp.Route, port, v.Meta, includeMx)
 			}
@@ -926,7 +940,7 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTLSRoutes(server *netwo
 	if server.Tls.Mode == networking.ServerTLSSettings_AUTO_PASSTHROUGH {
 		filterChains = append(filterChains, builtAutoPassthroughFilterChains(lb.push, lb.node, lb.node.MergedGateway.TLSServerInfo[server].SNIHosts)...)
 	} else {
-		virtualServices := lb.push.VirtualServicesForGateway(lb.node.ConfigNamespace, gatewayName)
+		virtualServices := lb.node.SidecarScope.GatewayVirtualServices(gatewayName)
 		for _, v := range virtualServices {
 			vsvc := v.Spec.(*networking.VirtualService)
 			// We have two cases here:
@@ -945,6 +959,9 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTLSRoutes(server *netwo
 			// matches, one for 1.foo.com, another for 2.foo.com, this code will produce duplicate filter
 			// chain matches
 			for _, tls := range vsvc.Tls {
+				if len(tls.Route) == 0 {
+					continue
+				}
 				for i, match := range tls.Match {
 					if l4SingleMatch(convertTLSMatchToL4Match(match), server, gatewayName) {
 						// Envoy will reject config that has multiple filter chain matches with the same matching rules

@@ -41,6 +41,7 @@ import (
 	"istio.io/istio/security/pkg/cmd"
 	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/ra"
+	pkiutil "istio.io/istio/security/pkg/pki/util"
 	caserver "istio.io/istio/security/pkg/server/ca"
 	"istio.io/istio/security/pkg/server/ca/authenticate"
 	"istio.io/istio/security/pkg/util"
@@ -94,6 +95,13 @@ var (
 	maxWorkloadCertTTL = env.Register("MAX_WORKLOAD_CERT_TTL",
 		cmd.DefaultMaxWorkloadCertTTL,
 		"The max TTL of issued workload certificates.")
+
+	maxRAWorkloadCertTTL = env.Register("MAX_RA_WORKLOAD_CERT_TTL",
+		48*time.Hour,
+		"Upper bound on the TTL a workload may request when Istiod uses the Kubernetes CSR API "+
+			"as its registration authority (EXTERNAL_CA=ISTIOD_RA_KUBERNETES_API). "+
+			"Certificates issued via this path are not revocable, so a tighter cap limits "+
+			"the blast radius of a stolen istio-token. Defaults to 48h.")
 
 	SelfSignedCACertTTL = env.Register("CITADEL_SELF_SIGNED_CA_CERT_TTL",
 		cmd.DefaultSelfSignedCACertTTL,
@@ -255,11 +263,12 @@ func detectSigningCABundleAndCRL() (ca.SigningCAFileBundle, error) {
 	}
 
 	if features.EnableCACRL {
-		// load crl file if it exists
 		crlFilePath := path.Join(LocalCertDir.Get(), ca.CACRLFile)
+		signingCAFileBundle.CRLFile = crlFilePath
 		if _, err := os.Stat(crlFilePath); err == nil {
 			log.Info("Detected CRL file")
-			signingCAFileBundle.CRLFile = crlFilePath
+		} else if os.IsNotExist(err) {
+			log.Warn("No CRL file found")
 		}
 	}
 
@@ -368,21 +377,16 @@ func handleEvent(s *Server) {
 	}
 
 	if features.EnableCACRL {
-		// check if crl file is updated
-		if len(fileBundle.CRLFile) > 0 {
-			currentCRLData := s.CA.GetCAKeyCertBundle().GetCRLPem()
-			crlData, crlReadErr := os.ReadFile(fileBundle.CRLFile)
-			if crlReadErr != nil {
-				// handleEvent can be triggered either for key-cert bundle update or
-				// for crl file update. So, even if there is an error in reading crl file,
-				// we should log error and continue with key-cert bundle update.
-				log.Errorf("failed reading crl file: %v", crlReadErr)
-			}
-
-			if !bytes.Equal(currentCRLData, crlData) {
-				log.Infof("Updating CRL data")
-				updateCRL = true
-			}
+		currentCRLData := s.CA.GetCAKeyCertBundle().GetCRLPem()
+		crlData, crlReadErr := pkiutil.ReadCRLBytesFromFile(fileBundle.CRLFile)
+		if crlReadErr != nil && !os.IsNotExist(crlReadErr) {
+			// handleEvent can be triggered either for key-cert bundle update or
+			// for crl file update. So, even if there is an error in reading crl file,
+			// we should log error and continue with key-cert bundle update.
+			log.Errorf("failed reading crl file: %v", crlReadErr)
+		} else if !bytes.Equal(currentCRLData, crlData) {
+			log.Infof("Updating CRL data")
+			updateCRL = true
 		}
 	}
 
@@ -519,6 +523,9 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 
 	useSelfSignedCA := !signingCABundleComplete || (features.UseCacertsForSelfSignedCA && istioGenerated)
 	if useSelfSignedCA {
+		if features.DisableSelfSignedCA {
+			return nil, fmt.Errorf("self-signed Istio CA is disabled (PILOT_DISABLE_SELF_SIGNED_CA=true) and no plugged-in CA (cacerts) is configured")
+		}
 		if features.UseCacertsForSelfSignedCA && istioGenerated {
 			log.Infof("IstioGenerated %s secret found, use it as the CA certificate", ca.CACertsSecret)
 
@@ -548,16 +555,18 @@ func (s *Server) createIstioCA(opts *caOptions) (*ca.IstioCA, error) {
 		if features.EnableCACRL {
 			// CRL is only supported for Plugged CA.
 			// If CRL file is present, read and notify it for initial replication
-			if len(fileBundle.CRLFile) > 0 {
+			crlBytes, crlErr := pkiutil.ReadCRLBytesFromFile(fileBundle.CRLFile)
+			if os.IsNotExist(crlErr) {
+				log.Debugf("CRL file %q not found", fileBundle.CRLFile)
+			} else if crlErr != nil {
+				log.Errorf("failed to read CRL file %s: %v", fileBundle.CRLFile, crlErr)
+				return nil, crlErr
+			} else if len(crlBytes) == 0 {
+				log.Debugf("CRL file %s is empty, notifying it for initial replication", fileBundle.CRLFile)
+			} else {
 				log.Debugf("CRL file %s found, notifying it for initial replication", fileBundle.CRLFile)
-				crlBytes, crlErr := os.ReadFile(fileBundle.CRLFile)
-				if crlErr != nil {
-					log.Errorf("failed to read CRL file %s: %v", fileBundle.CRLFile, crlErr)
-					return nil, crlErr
-				}
-
-				s.istiodCertBundleWatcher.SetAndNotifyCACRL(crlBytes)
 			}
+			s.istiodCertBundleWatcher.SetAndNotifyCACRL(crlBytes)
 		}
 
 		s.initCACertsAndCRLWatcher()
@@ -637,15 +646,16 @@ func (s *Server) createIstioRA(opts *caOptions) (ra.RegistrationAuthority, error
 		return nil, fmt.Errorf("kubeClient is nil")
 	}
 	raOpts := &ra.IstioRAOptions{
-		ExternalCAType:   opts.ExternalCAType,
-		DefaultCertTTL:   workloadCertTTL.Get(),
-		MaxCertTTL:       maxWorkloadCertTTL.Get(),
-		CaSigner:         opts.ExternalCASigner,
-		CaCertFile:       caCertFile,
-		VerifyAppendCA:   true,
-		K8sClient:        s.kubeClient.Kube(),
-		TrustDomain:      opts.TrustDomain,
-		CertSignerDomain: opts.CertSignerDomain,
+		ExternalCAType:       opts.ExternalCAType,
+		DefaultCertTTL:       workloadCertTTL.Get(),
+		MaxCertTTL:           maxWorkloadCertTTL.Get(),
+		MaxRAWorkloadCertTTL: maxRAWorkloadCertTTL.Get(),
+		CaSigner:             opts.ExternalCASigner,
+		CaCertFile:           caCertFile,
+		VerifyAppendCA:       true,
+		K8sClient:            s.kubeClient.Kube(),
+		TrustDomain:          opts.TrustDomain,
+		CertSignerDomain:     opts.CertSignerDomain,
 	}
 	raServer, err := ra.NewIstioRA(raOpts)
 	if err != nil {

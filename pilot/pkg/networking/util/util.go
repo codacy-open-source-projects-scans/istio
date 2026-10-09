@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -33,6 +34,7 @@ import (
 	headerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/header/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -43,6 +45,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/label"
+	networkutil "istio.io/istio/pilot/pkg/util/network"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
@@ -66,11 +69,25 @@ const (
 	// PassthroughCluster
 	Passthrough = "allow_any"
 
+	// AllowAnyDynamicDNSCluster is the DFP cluster used for ALLOW_ANY_DYNAMIC_DNS outbound traffic policy mode.
+	AllowAnyDynamicDNSCluster = "AllowAnyDynamicDNSCluster"
+	// AllowAnyDynamicDNS is the name of the virtual host and route name for ALLOW_ANY_DYNAMIC_DNS mode.
+	AllowAnyDynamicDNS = "allow_any_dynamic_dns"
+	// AllowAnyDFPDNSCacheName is the shared DNS cache name used by the DFP cluster and filters for ALLOW_ANY_DYNAMIC_DNS.
+	AllowAnyDFPDNSCacheName = "allow_any_dfp_dns_cache"
+
 	// PassthroughFilterChain to catch traffic that doesn't match other filter chains.
 	PassthroughFilterChain = "PassthroughFilterChain"
 
 	// Inbound pass through cluster need to the bind the loopback ip address for the security and loop avoidance.
 	InboundPassthroughCluster = "InboundPassthroughCluster"
+
+	// SelfDiscoveryCluster is the self-discovery static cluster injected into the Envoy bootstrap when
+	// ISTIO_META_ENABLE_SELF_DISCOVERY is set. It mirrors the proxy's own service endpoints within
+	// its region and is referenced as cluster_manager.local_cluster_name so Envoy can compute the
+	// per-zone host distribution used by zone-aware load balancing. This value must stay in sync with
+	// the "local_cluster" name hardcoded in the envoy bootstrap template.
+	SelfDiscoveryCluster = "local_cluster"
 
 	// IstioMetadataKey is the key under which metadata is added to a route or cluster
 	// regarding the virtual service or destination rule used for each
@@ -95,6 +112,60 @@ const (
 	// to indicate whether Istio rewrite the ALPN headers
 	AlpnOverrideMetadataKey = "alpn_override"
 )
+
+// SelectDNSLookupFamily derives the DNS lookup family for DNS-resolving constructs (STRICT_DNS /
+// LOGICAL_DNS clusters and dynamic forward proxy DNS caches) from the proxy's own IP addresses.
+// Centralizing this keeps the behavior consistent across the default cluster builder and all the
+// DFP builders. When the proxy IPs are unknown the historical V4_ONLY default is used.
+func SelectDNSLookupFamily(proxyIPAddresses []string) cluster.Cluster_DnsLookupFamily {
+	switch {
+	case len(proxyIPAddresses) == 0:
+		return cluster.Cluster_V4_ONLY
+	case networkutil.AllIPv4(proxyIPAddresses):
+		// IPv4 only.
+		return cluster.Cluster_V4_ONLY
+	case networkutil.AllIPv6(proxyIPAddresses):
+		// IPv6 only. Istio sees only IPv6 addresses, but there may be a link-local interface
+		// serving IPv4. Allow both families so we do not break resolution to IPv4-only destinations.
+		if features.EnableAdditionalIpv4OutboundListenerForIpv6Only {
+			return cluster.Cluster_ALL
+		}
+		return cluster.Cluster_V6_ONLY
+	default:
+		// Dual stack: use Cluster_ALL to enable Happy Eyeballs when dual stack is enabled,
+		// otherwise keep the original V4_ONLY behavior.
+		if features.EnableDualStack {
+			return cluster.Cluster_ALL
+		}
+		return cluster.Cluster_V4_ONLY
+	}
+}
+
+// GetDNSProxyAddress returns the configured DNS proxy address. Localhost and fallback addresses
+// use the proxy's IP family; IPv4 is used when the proxy IPs are unknown or dual stack.
+func GetDNSProxyAddress(proxyIPAddresses []string, dnsProxyAddr string) *core.Address {
+	localhost := model.LocalhostAddressPrefix
+	if len(proxyIPAddresses) > 0 && networkutil.AllIPv6(proxyIPAddresses) {
+		localhost = model.LocalhostIPv6AddressPrefix
+	}
+	fallbackAddr := net.JoinHostPort(localhost, "15053")
+	if dnsProxyAddr == "" {
+		dnsProxyAddr = fallbackAddr
+	}
+	host, portStr, err := net.SplitHostPort(dnsProxyAddr)
+	if err != nil {
+		log.Warnf("failed to parse DNSProxyAddr %q, falling back to %s: %v", dnsProxyAddr, fallbackAddr, err)
+		host, portStr = localhost, "15053"
+	}
+	if host == "localhost" {
+		host = localhost
+	}
+	port, err := strconv.ParseUint(portStr, 10, 32)
+	if err != nil {
+		port = 15053
+	}
+	return BuildAddress(host, uint32(port))
+}
 
 // ALPNH2Only advertises that Proxy is going to use HTTP/2 when talking to the cluster.
 var ALPNH2Only = pm.ALPNH2Only
@@ -434,9 +505,18 @@ func IsHTTPFilterChain(filterChain *listener.FilterChain) bool {
 	return false
 }
 
-// MergeAnyWithAny merges a given any typed message into the given Any typed message by dynamically inferring the
-// type of Any
-func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
+// MergeAnyWithMessage merges a decoded source message into an Any without modifying src.
+func MergeAnyWithMessage(dst *anypb.Any, src proto.Message) (*anypb.Any, error) {
+	return mergeAnyWithMessage(dst, src, merge.Merge)
+}
+
+// MergeAnyWithMessageReplaceList behaves like MergeAnyWithMessage, except that repeated (list) fields
+// present in src fully replace the corresponding list in dst instead of being appended to it.
+func MergeAnyWithMessageReplaceList(dst *anypb.Any, src proto.Message) (*anypb.Any, error) {
+	return mergeAnyWithMessage(dst, src, merge.MergeWithReplaceList)
+}
+
+func mergeAnyWithMessage(dst *anypb.Any, src proto.Message, mergeFn func(dst, src proto.Message)) (*anypb.Any, error) {
 	// Assuming that Pilot is compiled with this type [which should always be the case]
 	var err error
 
@@ -446,14 +526,12 @@ func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
 		return nil, err
 	}
 
-	// get an object of type used by this message
-	srcX, err := src.UnmarshalNew()
-	if err != nil {
-		return nil, err
+	if src == nil {
+		return nil, fmt.Errorf("merge source typed config is not decoded")
 	}
 
 	// Merge the two typed protos
-	merge.Merge(dstX, srcX)
+	mergeFn(dstX, src)
 
 	// Convert the merged proto back to dst
 	retVal := protoconv.MessageToAny(dstX)
@@ -514,7 +592,18 @@ func addIstioEndpointLabel(metadata *core.Metadata, key string, val *structpb.Va
 	metadata.FilterMetadata[IstioMetadataKey].Fields[key] = val
 }
 
-// IsAllowAnyOutbound checks if allow_any is enabled for outbound traffic
+// IsAllowAnyDynamicDNSOutbound checks if ALLOW_ANY_DYNAMIC_DNS mode is enabled for outbound traffic.
+// This mode is scoped to sidecar proxies only — gateways are not eligible.
+func IsAllowAnyDynamicDNSOutbound(node *model.Proxy) bool {
+	return node.Type == model.SidecarProxy &&
+		node.SidecarScope != nil &&
+		node.SidecarScope.OutboundTrafficPolicy != nil &&
+		meshconfig.MeshConfig_OutboundTrafficPolicy_Mode(node.SidecarScope.OutboundTrafficPolicy.Mode) ==
+			meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS
+}
+
+// IsAllowAnyOutbound checks if outbound traffic to unknown destinations should be allowed
+// (either via ALLOW_ANY passthrough or ALLOW_ANY_DYNAMIC_DNS via DFP).
 func IsAllowAnyOutbound(node *model.Proxy) bool {
 	return node.SidecarScope != nil &&
 		node.SidecarScope.OutboundTrafficPolicy != nil &&
@@ -848,38 +937,9 @@ func MergeSubsetTrafficPolicy(original, subsetPolicy *networking.TrafficPolicy, 
 
 	// merge DR with subset traffic policy
 	// Override with subset values.
-	mergedPolicy := ShallowCopyTrafficPolicy(original)
+	mergedPolicy := model.ShallowCopyTrafficPolicy(original)
 
-	return mergeTrafficPolicy(mergedPolicy, subsetPolicy, hasPortLevel)
-}
-
-// Note that port-level settings will override the destination-level settings.
-// Traffic settings specified at the destination-level will not be inherited when overridden by port-level settings,
-// i.e. default values will be applied to fields omitted in port-level traffic policies.
-func mergeTrafficPolicy(mergedPolicy, subsetPolicy *networking.TrafficPolicy, hasPortLevel bool) *networking.TrafficPolicy {
-	if subsetPolicy.ConnectionPool != nil || hasPortLevel {
-		mergedPolicy.ConnectionPool = subsetPolicy.ConnectionPool
-	}
-	if subsetPolicy.OutlierDetection != nil || hasPortLevel {
-		mergedPolicy.OutlierDetection = subsetPolicy.OutlierDetection
-	}
-	if subsetPolicy.LoadBalancer != nil || hasPortLevel {
-		mergedPolicy.LoadBalancer = subsetPolicy.LoadBalancer
-	}
-	if subsetPolicy.Tls != nil || hasPortLevel {
-		mergedPolicy.Tls = subsetPolicy.Tls
-	}
-
-	if subsetPolicy.Tunnel != nil {
-		mergedPolicy.Tunnel = subsetPolicy.Tunnel
-	}
-	if subsetPolicy.ProxyProtocol != nil {
-		mergedPolicy.ProxyProtocol = subsetPolicy.ProxyProtocol
-	}
-	if subsetPolicy.RetryBudget != nil {
-		mergedPolicy.RetryBudget = subsetPolicy.RetryBudget
-	}
-	return mergedPolicy
+	return model.MergeTrafficPolicy(mergedPolicy, subsetPolicy, hasPortLevel)
 }
 
 func shadowCopyPortTrafficPolicy(portTrafficPolicy *networking.TrafficPolicy_PortTrafficPolicy) *networking.TrafficPolicy {
@@ -891,22 +951,6 @@ func shadowCopyPortTrafficPolicy(portTrafficPolicy *networking.TrafficPolicy_Por
 	ret.LoadBalancer = portTrafficPolicy.LoadBalancer
 	ret.OutlierDetection = portTrafficPolicy.OutlierDetection
 	ret.Tls = portTrafficPolicy.Tls
-	return ret
-}
-
-// ShallowCopyTrafficPolicy shallow copy a traffic policy, portLevelSettings are ignored.
-func ShallowCopyTrafficPolicy(original *networking.TrafficPolicy) *networking.TrafficPolicy {
-	if original == nil {
-		return nil
-	}
-	ret := &networking.TrafficPolicy{}
-	ret.ConnectionPool = original.ConnectionPool
-	ret.LoadBalancer = original.LoadBalancer
-	ret.OutlierDetection = original.OutlierDetection
-	ret.Tls = original.Tls
-	ret.Tunnel = original.Tunnel
-	ret.ProxyProtocol = original.ProxyProtocol
-	ret.RetryBudget = original.RetryBudget
 	return ret
 }
 

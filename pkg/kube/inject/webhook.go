@@ -85,9 +85,11 @@ const (
 	// prometheus will convert annotation to this format
 	// `prometheus.io/scrape` `prometheus.io.scrape` `prometheus-io/scrape` have the same meaning in Prometheus
 	// for more details, please checkout [here](https://github.com/prometheus/prometheus/blob/71a0f42331566a8849863d77078083edbb0b3bc4/util/strutil/strconv.go#L40)
-	prometheusScrapeAnnotation = "prometheus_io_scrape"
-	prometheusPortAnnotation   = "prometheus_io_port"
-	prometheusPathAnnotation   = "prometheus_io_path"
+	prometheusScrapeAnnotation             = "prometheus_io_scrape"
+	prometheusPortAnnotation               = "prometheus_io_port"
+	prometheusPathAnnotation               = "prometheus_io_path"
+	prometheusIstioScrapeTargetsAnnotation = "prometheus_istio_io_scrape_targets"
+	prometheusIstioSecurePortAnnotation    = "prometheus_istio_io_secure_port"
 
 	watchDebounceDelay = 100 * time.Millisecond
 )
@@ -114,6 +116,7 @@ type Webhook struct {
 	valuesConfig ValuesConfig
 	namespaces   *multicluster.KclientComponent[*corev1.Namespace]
 	nodes        *multicluster.KclientComponent[*corev1.Node]
+	sccs         *multicluster.Component[*SCCClient]
 
 	// please do not call SetHandler() on this watcher, instead us MultiCast.AddHandler()
 	watcher   Watcher
@@ -214,6 +217,9 @@ func NewWebhook(p WebhookParameters) (*Webhook, error) {
 	if p.MultiCluster != nil {
 		if platform.IsOpenShift() {
 			wh.namespaces = multicluster.BuildMultiClusterKclientComponent[*corev1.Namespace](p.MultiCluster, kubetypes.Filter{})
+			wh.sccs = multicluster.BuildMultiClusterComponent(p.MultiCluster, func(cluster *multicluster.Cluster) *SCCClient {
+				return NewSCCClient(cluster.Client)
+			})
 		}
 	}
 
@@ -389,6 +395,7 @@ type InjectionParameters struct {
 	pod                 *corev1.Pod
 	deployMeta          types.NamespacedName
 	namespace           *corev1.Namespace
+	sccs                *SCCClient
 	nativeSidecar       bool
 	typeMeta            metav1.TypeMeta
 	templates           map[string]*template.Template
@@ -751,6 +758,8 @@ func postProcessPod(pod *corev1.Pod, injectedPod corev1.Pod, req InjectionParame
 		return err
 	}
 
+	applySecurePrometheusAnnotation(pod)
+
 	if err := applyRewrite(pod, req); err != nil {
 		return err
 	}
@@ -879,7 +888,36 @@ func mergeOrAppendProbers(previouslyInjected bool, envVars []corev1.EnvVar, newP
 	return append(envVars, corev1.EnvVar{Name: status.KubeAppProberEnvName, Value: newProbers})
 }
 
-var emptyScrape = status.PrometheusScrapeConfiguration{}
+// applySecurePrometheusAnnotation auto-populates the "prometheus.istio.io/secure-port"
+// annotation when the istio-proxy container has ENVOY_SECURE_MERGED_METRICS_PORT set.
+// This mirrors applyPrometheusMerge's handling of the plain-text port so that users only
+// need to configure the env variable and Prometheus discovery is wired up automatically.
+//
+// The env var is present at postProcessPod time for both sidecars (where proxyMetadata
+// is expanded into the container env by the injection template) and for injected gateway
+// pods (where the env var is set directly on the istio-proxy container).
+//
+// If the user has already set the annotation explicitly it is left unchanged.
+func applySecurePrometheusAnnotation(pod *corev1.Pod) {
+	// User already opted in explicitly.
+	for k := range pod.Annotations {
+		if strutil.SanitizeLabelName(k) == prometheusIstioSecurePortAnnotation {
+			return
+		}
+	}
+
+	sidecar := FindSidecar(pod)
+	if sidecar == nil {
+		return
+	}
+
+	for _, env := range sidecar.Env {
+		if env.Name == "ENVOY_SECURE_MERGED_METRICS_PORT" && env.Value != "" && env.Value != "0" {
+			pod.Annotations["prometheus.istio.io/secure-port"] = env.Value
+			return
+		}
+	}
+}
 
 // applyPrometheusMerge configures prometheus scraping annotations for the "metrics merge" feature.
 // This moves the current prometheus.io annotations into an environment variable and replaces them
@@ -896,8 +934,40 @@ func applyPrometheusMerge(pod *corev1.Pod, mesh *meshconfig.MeshConfig) error {
 			}
 		}
 		scrape := getPrometheusScrapeConfiguration(pod)
+		// When scrape-targets are present, set legacy Port/Path from the first target so that
+		// old agents (which don't know about Targets) can still scrape the primary endpoint.
+		if len(scrape.Targets) > 0 {
+			scrape.Port = scrape.Targets[0].Port
+			scrape.Path = scrape.Targets[0].Path
+			for _, t := range scrape.Targets {
+				portNum, err := strconv.Atoi(t.Port)
+				if err != nil || portNum < 1 || portNum > 65535 {
+					return fmt.Errorf("invalid prometheus scrape targets: invalid target port %q", t.Port)
+				}
+				canon := strconv.Itoa(portNum)
+				if canon == targetPort {
+					return fmt.Errorf("invalid prometheus scrape targets: target port %s conflicts with agent port", t.Port)
+				}
+				if reason, reserved := status.IstioReservedPortReason(canon); reserved {
+					return fmt.Errorf("invalid prometheus scrape targets: target port %s is reserved for Istio (%s) and cannot be scraped", t.Port, reason)
+				}
+			}
+		} else if scrape.Port != "" {
+			// Validate legacy prometheus.io/port annotation when the new scrape-targets annotation is not used.
+			portNum, err := strconv.Atoi(scrape.Port)
+			if err != nil || portNum < 1 || portNum > 65535 {
+				return fmt.Errorf("invalid prometheus scrape configuration: invalid port %q", scrape.Port)
+			}
+			canon := strconv.Itoa(portNum)
+			if canon == targetPort {
+				return fmt.Errorf("invalid prometheus scrape configuration: port %s conflicts with agent port", scrape.Port)
+			}
+			if reason, reserved := status.IstioReservedPortReason(canon); reserved {
+				return fmt.Errorf("invalid prometheus scrape configuration: port %s is reserved for Istio (%s) and cannot be scraped", scrape.Port, reason)
+			}
+		}
 		sidecar := FindSidecar(pod)
-		if sidecar != nil && scrape != emptyScrape {
+		if sidecar != nil && !scrape.IsEmpty() {
 			by, err := json.Marshal(scrape)
 			if err != nil {
 				return err
@@ -940,6 +1010,7 @@ var prometheusAnnotations = sets.New(
 	prometheusPathAnnotation,
 	prometheusPortAnnotation,
 	prometheusScrapeAnnotation,
+	prometheusIstioScrapeTargetsAnnotation,
 )
 
 func clearPrometheusAnnotations(pod *corev1.Pod) {
@@ -968,6 +1039,13 @@ func getPrometheusScrapeConfiguration(pod *corev1.Pod) status.PrometheusScrapeCo
 			cfg.Scrape = val
 		case prometheusPathAnnotation:
 			cfg.Path = val
+		case prometheusIstioScrapeTargetsAnnotation:
+			targets, err := status.ParseScrapeTargets(val)
+			if err != nil {
+				log.Warnf("failed to parse %s annotation: %v", k, err)
+			} else {
+				cfg.Targets = targets
+			}
 		}
 	}
 
@@ -1166,6 +1244,14 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 			log.Warnf("unable to fetch namespace, failed to get client for %q", clusterID)
 		}
 
+		if wh.sccs != nil {
+			if cc := wh.sccs.ForCluster(cluster.ID(clusterID)); cc != nil {
+				params.sccs = *cc
+			} else {
+				log.Warnf("unable to resolve SCC proxy UID/GID, failed to get client for %q", clusterID)
+			}
+		}
+
 		// OpenShift automatically assigns a SecurityContext.RunAsUser to all containers in the Pod, even if the Pod's
 		// YAML does not explicitly set this value. Istio treats the values specified in the istio-proxy container as
 		// overrides and preserves them in the final Pod yaml as expected. However, the RunAsUser value which is
@@ -1213,23 +1299,34 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 }
 
 func isSidecarUserMatchingAppUser(pod *corev1.Pod) bool {
+	var sideCarUser int64
+	if sc := FindSidecar(pod); sc != nil && sc.SecurityContext != nil && sc.SecurityContext.RunAsUser != nil {
+		sideCarUser = *sc.SecurityContext.RunAsUser
+	} else {
+		return false
+	}
+	for _, appUID := range appContainerUIDs(pod) {
+		if appUID == sideCarUser {
+			return true
+		}
+	}
+	return false
+}
+
+func appContainerUIDs(pod *corev1.Pod) (uids []int64) {
 	containers := append([]corev1.Container{}, pod.Spec.Containers...)
 	containers = append(containers, pod.Spec.InitContainers...)
 
-	var sideCarUser, appUser int64
 	for i := range containers {
-		if containers[i].Name == ProxyContainerName {
-			if containers[i].SecurityContext != nil && containers[i].SecurityContext.RunAsUser != nil {
-				sideCarUser = *containers[i].SecurityContext.RunAsUser
-			}
-		} else if containers[i].Name != ValidationContainerName && containers[i].Name != InitContainerName {
-			if containers[i].SecurityContext != nil && containers[i].SecurityContext.RunAsUser != nil {
-				appUser = *containers[i].SecurityContext.RunAsUser
-			}
+		if containers[i].Name == ProxyContainerName || containers[i].Name == ValidationContainerName || containers[i].Name == InitContainerName {
+			continue
+		}
+		if containers[i].SecurityContext != nil && containers[i].SecurityContext.RunAsUser != nil {
+			uids = append(uids, *containers[i].SecurityContext.RunAsUser)
 		}
 	}
 
-	return sideCarUser == appUser
+	return uids
 }
 
 func DetectNativeSidecar(nodes kclient.Client[*corev1.Node], podNodeName string) bool {

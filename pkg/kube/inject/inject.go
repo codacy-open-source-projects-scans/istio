@@ -51,6 +51,7 @@ import (
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
@@ -111,6 +112,7 @@ type SidecarTemplateData struct {
 	Revision                 string
 	NativeSidecars           bool
 	ProxyImage               string
+	ProxyInitImage           string
 	ProxyUID                 int64
 	ProxyGID                 int64
 	InboundTrafficPolicyMode string
@@ -209,10 +211,8 @@ func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, m
 	}
 
 	// skip special kubernetes system namespaces
-	for _, namespace := range ignored {
-		if metadata.Namespace == namespace {
-			return false
-		}
+	if slices.Contains(ignored, metadata.Namespace) {
+		return false
 	}
 
 	annos := metadata.GetAnnotations()
@@ -320,18 +320,41 @@ func ProxyImage(values *opconfig.Values, image *proxyConfig.ProxyImage, annotati
 	imageName := "proxyv2"
 	global := values.GetGlobal()
 
+	if global.GetProxy() != nil && global.GetProxy().GetImage() != "" {
+		imageName = global.GetProxy().GetImage()
+	}
+
+	imageType := ""
+	if image != nil {
+		imageType = image.ImageType
+	}
+
+	return proxyImageURL(values, imageName, imageType, annotations)
+}
+
+// ProxyInitImage constructs image url for the proxy init container.
+// values based name => {{ .Values.global.hub }}/{{ .Values.global.proxy_init.image }}:{{ .Values.global.tag }}
+func ProxyInitImage(values *opconfig.Values, annotations map[string]string) string {
+	imageName := "proxyv2"
+	global := values.GetGlobal()
+
+	if global.GetProxyInit() != nil && global.GetProxyInit().GetImage() != "" {
+		imageName = global.GetProxyInit().GetImage()
+	}
+
+	return proxyImageURL(values, imageName, "", annotations)
+}
+
+func proxyImageURL(values *opconfig.Values, imageName, imageType string, annotations map[string]string) string {
+	global := values.GetGlobal()
+
 	tag := ""
 	if global.GetTag() != nil { // Tag is an interface but we need the string form.
 		tag = fmt.Sprintf("%v", global.GetTag().AsInterface())
 	}
 
-	imageType := global.GetVariant()
-	if image != nil {
-		imageType = image.ImageType
-	}
-
-	if global.GetProxy() != nil && global.GetProxy().GetImage() != "" {
-		imageName = global.GetProxy().GetImage()
+	if imageType == "" {
+		imageType = global.GetVariant()
 	}
 
 	if it, ok := annotations[annotation.SidecarProxyImageType.Name]; ok {
@@ -451,7 +474,7 @@ func RunTemplate(params InjectionParameters) (mergedPod *corev1.Pod, templatePod
 		return nil, nil, err
 	}
 
-	proxyUID, proxyGID := GetProxyIDs(params.namespace)
+	proxyUID, proxyGID := GetProxyIDs(params.namespace, params.pod, params.sccs)
 
 	// When changing this, make sure to change TemplateInput in deploymentcontroller.go
 	data := SidecarTemplateData{
@@ -464,6 +487,7 @@ func RunTemplate(params InjectionParameters) (mergedPod *corev1.Pod, templatePod
 		Values:                   params.valuesConfig.asMap,
 		Revision:                 params.revision,
 		ProxyImage:               ProxyImage(params.valuesConfig.asStruct, params.proxyConfig.Image, strippedPod.Annotations),
+		ProxyInitImage:           ProxyInitImage(params.valuesConfig.asStruct, strippedPod.Annotations),
 		NativeSidecars:           params.nativeSidecar,
 		ProxyUID:                 proxyUID,
 		ProxyGID:                 proxyGID,
@@ -751,7 +775,7 @@ func IntoObject(injector Injector, sidecarTemplate Templates, valuesConfig Value
 		templateValue := outValue.FieldByName("Spec").FieldByName("Template")
 		// `Template` is defined as a pointer in some older API
 		// definitions, e.g. ReplicationController
-		if templateValue.Kind() == reflect.Ptr {
+		if templateValue.Kind() == reflect.Pointer {
 			if templateValue.IsNil() {
 				return out, fmt.Errorf("spec.template is required value")
 			}
@@ -946,22 +970,31 @@ func updateClusterEnvs(container *corev1.Container, newKVs map[string]string) {
 	container.Env = envVars
 }
 
-// GetProxyIDs returns the UID and GID to be used in the RunAsUser and RunAsGroup fields in the template
-// Inspects the namespace metadata for hints and fallbacks to the usual value of 1337.
-func GetProxyIDs(namespace *corev1.Namespace) (uid int64, gid int64) {
+// GetProxyIDs returns the proxy RunAsUser/RunAsGroup. On OpenShift, a non-nil sccs resolves the
+// pod's SCC, which takes precedence over the namespace annotation; both fall back to 1337.
+func GetProxyIDs(namespace *corev1.Namespace, pod *corev1.Pod, sccs *SCCClient) (uid int64, gid int64) {
 	uid = constants.DefaultProxyUIDInt
 	gid = constants.DefaultProxyUIDInt
 
-	if namespace == nil {
-		return uid, gid
+	// Resolve OpenShift's preallocated UID/GID range from the namespace, then let a pod-specific SCC override it if one applies.
+	if namespace != nil {
+		if _, uidMax, err := getPreallocatedUIDRange(namespace); err == nil {
+			uid = *uidMax
+		}
+		if groups, err := getPreallocatedSupplementalGroups(namespace); err == nil && len(groups) > 0 {
+			gid = groups[0].Max
+		}
 	}
 
-	// Check for OpenShift specifics and returns the max number in the range specified in the namespace annotation
-	if _, uidMax, err := getPreallocatedUIDRange(namespace); err == nil {
-		uid = *uidMax
-	}
-	if groups, err := getPreallocatedSupplementalGroups(namespace); err == nil && len(groups) > 0 {
-		gid = groups[0].Max
+	if sccs != nil && pod != nil {
+		if sccUID, sccGID := getSCCProxyIDs(sccs, namespace, pod); sccUID != nil || sccGID != nil {
+			if sccUID != nil {
+				uid = *sccUID
+			}
+			if sccGID != nil {
+				gid = *sccGID
+			}
+		}
 	}
 
 	return uid, gid

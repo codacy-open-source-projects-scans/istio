@@ -68,6 +68,10 @@ var (
 	EnableAmbientBaggage = registerAmbient("AMBIENT_ENABLE_BAGGAGE", false, false,
 		"If true, enables waypoints to use baggage header to discover and propagate peer metadata for metrics.")
 
+	EnableAmbientTLSProxyHTTPMetrics = registerAmbient("AMBIENT_ENABLE_TLS_PROXY_HTTP_METRICS", false, false,
+		"If true, enables waypoints to register HTTP metrics for cross-cluster requests when using protocols "+
+			"like TLS or PROXY.")
+
 	// Using just EnableAmbientMultiNetwork is not enough for users that already experiment with ambient multi-network and use istio from head.
 	// While we don't provide much guarantees for alpha features like ambient multi-network, if it's easy to avoid breaking users unnecessarily
 	// we should do that.
@@ -85,6 +89,14 @@ var (
 		"ENABLE_LAYERED_WAYPOINT_AUTHORIZATION_POLICIES",
 		false,
 		"If enabled, selector based authorization policies will be enforced as L4 policies in front of the waypoint.").Get()
+
+	// Registered unconditionally (not via registerAmbient) so the default applies in environments
+	// where ambient is enabled at runtime rather than via PILOT_ENABLE_AMBIENT; without ambient no
+	// Address updates are produced, so this has no effect.
+	ScopedAddressPushes = env.Register("AMBIENT_SCOPED_ADDRESS_PUSHES", true,
+		"If enabled, ambient Address updates only trigger pushes for waypoints whose attached services or workloads changed, "+
+			"and are skipped entirely for sidecar and gateway proxies. If disabled, every Address update triggers a "+
+			"full LDS/CDS/EDS push to all waypoints and an RDS push to all proxies.").Get()
 
 	EnableWdsDryRunAuthzPol = registerAmbient("AMBIENT_ENABLE_DRY_RUN_AUTHORIZATION_POLICY", false, false,
 		"If enabled, ztunnel will be configured with dry-run authorizationPolicies. "+

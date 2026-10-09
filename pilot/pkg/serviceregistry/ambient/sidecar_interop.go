@@ -16,6 +16,7 @@
 package ambient
 
 import (
+	"bytes"
 	"net/netip"
 	"strings"
 
@@ -28,13 +29,13 @@ import (
 	"istio.io/istio/pkg/workloadapi"
 )
 
-// serviceEDS represents a service and a list of all instances of waypoints.
-// For example, we may have ServiceKey=httpbin.org and WaypointInstance=[list of *waypoint workloads* attached].
-// This is to map to the eventual EDS structure.
+// serviceEDS captures the inputs that affect gateway EDS for a waypoint-bound service.
 type serviceEDS struct {
 	ServiceKey       string
-	WaypointInstance []model.WorkloadInfo
+	WaypointInstance []*model.WorkloadInfo
 	UseWaypoint      bool
+	// Included so weight changes trigger EDS for the bound service.
+	WeightedWaypoints []*workloadapi.WeightedWaypoint
 }
 
 func (s serviceEDS) ResourceName() string {
@@ -57,7 +58,36 @@ func (s serviceEDS) Equals(other serviceEDS) bool {
 			return false
 		}
 	}
+	if len(s.WeightedWaypoints) != len(other.WeightedWaypoints) {
+		return false
+	}
+	// assumes builder preserved order; compare the fields cheaply rather than proto.Equal on the
+	// EDS hot path.
+	for i := range s.WeightedWaypoints {
+		if !weightedWaypointEqual(s.WeightedWaypoints[i], other.WeightedWaypoints[i]) {
+			return false
+		}
+	}
 	return true
+}
+
+// weightedWaypointEqual compares the fields that affect gateway EDS: the weight and the destination
+// waypoint (hostname or network address, plus HBONE port). The getters are nil-safe, so this covers
+// either GatewayAddress oneof case.
+func weightedWaypointEqual(a, b *workloadapi.WeightedWaypoint) bool {
+	if a.GetWeight() != b.GetWeight() {
+		return false
+	}
+	ad, bd := a.GetDestination(), b.GetDestination()
+	if ad.GetHboneMtlsPort() != bd.GetHboneMtlsPort() {
+		return false
+	}
+	if ad.GetHostname().GetNamespace() != bd.GetHostname().GetNamespace() ||
+		ad.GetHostname().GetHostname() != bd.GetHostname().GetHostname() {
+		return false
+	}
+	aa, ba := ad.GetAddress(), bd.GetAddress()
+	return aa.GetNetwork() == ba.GetNetwork() && bytes.Equal(aa.GetAddress(), ba.GetAddress())
 }
 
 // RegisterEdsShim handles triggering xDS events when Envoy EDS needs to change.
@@ -68,11 +98,11 @@ func (s serviceEDS) Equals(other serviceEDS) bool {
 // Ideally, the information we are using in Envoy and the event trigger are using the same data directly.
 func RegisterEdsShim(
 	xdsUpdater model.XDSUpdater,
-	Workloads krt.Collection[model.WorkloadInfo],
+	Workloads krt.Collection[*model.WorkloadInfo],
 	Namespaces krt.Collection[model.NamespaceInfo],
-	WorkloadsByServiceKey krt.Index[string, model.WorkloadInfo],
-	Services krt.Collection[model.ServiceInfo],
-	ServicesByAddress krt.Index[networkAddress, model.ServiceInfo],
+	WorkloadsByServiceKey krt.Index[string, *model.WorkloadInfo],
+	Services krt.Collection[*model.ServiceInfo],
+	ServicesByAddress krt.Index[networkAddress, *model.ServiceInfo],
 	opts krt.OptionsBuilder,
 ) {
 	// Helps us avoid race conditions in tests.
@@ -81,66 +111,68 @@ func RegisterEdsShim(
 	multiNetworkEnabled := features.EnableAmbientMultiNetwork
 	ServiceEds := krt.NewCollection(
 		Services,
-		func(ctx krt.HandlerContext, svc model.ServiceInfo) *serviceEDS {
-			useWaypoint := ingressUseWaypoint(svc, krt.FetchOne(ctx, Namespaces, krt.FilterKey(svc.Service.Namespace)))
+		func(ctx krt.HandlerContext, svc *model.ServiceInfo) *serviceEDS {
+			useWaypoint := ingressUseWaypoint(*svc, krt.FetchOne(ctx, Namespaces, krt.FilterKey(svc.Service.Namespace)))
 			if !useWaypoint && (!multiNetworkEnabled || svc.Scope != model.Global) {
 				// Currently, we only need this for ingress/east west gateway -> waypoint usage
 				// If we extend this to sidecars, etc we can drop this.
 				return nil
 			}
-			wp := svc.Service.Waypoint
-			if wp == nil {
+			if svc.Service.Waypoint == nil {
 				return nil
 			}
-			var waypointServiceKey string
-			switch addr := wp.Destination.(type) {
-			// Easy case: waypoint is already a hostname. Just return it directly
-			case *workloadapi.GatewayAddress_Hostname:
-				hn := addr.Hostname
-				waypointServiceKey = hn.Namespace + "/" + hn.Hostname
-			// Hard case: waypoint is an IP address. Need to look it up.
-			case *workloadapi.GatewayAddress_Address:
-				wAddress := addr.Address
-				serviceKey := networkAddress{
-					network: wAddress.Network,
-					ip:      mustByteIPToString(wAddress.Address),
+			// Track every waypoint whose endpoints can appear in the gateway CLA.
+			var workloads []*model.WorkloadInfo
+			for _, wp := range serviceOwningWaypoints(svc) {
+				var waypointServiceKey string
+				switch addr := wp.Destination.(type) {
+				case *workloadapi.GatewayAddress_Hostname:
+					hn := addr.Hostname
+					waypointServiceKey = namespacedHostname(hn.Namespace, hn.Hostname)
+				case *workloadapi.GatewayAddress_Address:
+					wAddress := addr.Address
+					serviceKey := networkAddress{
+						network: wAddress.Network,
+						ip:      mustByteIPToString(wAddress.Address),
+					}
+					waypointSvc := krt.FetchOne(ctx, Services, krt.FilterIndex(ServicesByAddress, serviceKey))
+					if waypointSvc == nil {
+						continue
+					}
+					waypointServiceKey = (*waypointSvc).ResourceName()
 				}
-				waypointSvc := krt.FetchOne(ctx, Services, krt.FilterIndex(ServicesByAddress, serviceKey))
-				if waypointSvc == nil {
-					return nil
-				}
-				waypointServiceKey = waypointSvc.ResourceName()
+				workloads = append(workloads, WorkloadsByServiceKey.Fetch(ctx, waypointServiceKey)...)
 			}
-			workloads := WorkloadsByServiceKey.Fetch(ctx, waypointServiceKey)
 			// for comparison in Equals
-			workloads = slices.SortBy(workloads, func(i model.WorkloadInfo) string {
+			workloads = slices.SortBy(workloads, func(i *model.WorkloadInfo) string {
 				return i.Workload.Uid
 			})
 			return &serviceEDS{
-				ServiceKey:       svc.ResourceName(),
-				UseWaypoint:      useWaypoint,
-				WaypointInstance: workloads,
+				ServiceKey:        svc.ResourceName(),
+				UseWaypoint:       useWaypoint,
+				WaypointInstance:  workloads,
+				WeightedWaypoints: svc.Service.WeightedWaypoints,
 			}
 		},
 		opts.WithName("ServiceEds")...)
 	ServiceEds.RegisterBatch(
 		PushXds(xdsUpdater, func(svc serviceEDS) model.ConfigKey {
 			ns, hostname, _ := strings.Cut(svc.ServiceKey, "/")
-			return model.ConfigKey{Kind: kind.ServiceEntry, Name: hostname, Namespace: ns}
+			return model.ConfigKey{Kind: kind.Endpoints, Name: hostname, Namespace: ns}
 		}), false)
 }
 
 func (a *index) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
 	res := []model.ServiceWaypointInfo{}
-	var svcs []model.ServiceInfo
+	var svcs []*model.ServiceInfo
 	if key == "" {
 		svcs = a.services.List()
-	} else {
-		svcs = ptr.ToList(a.services.GetKey(key))
+	} else if svc := ptr.Flatten(a.services.GetKey(key)); svc != nil {
+		svcs = []*model.ServiceInfo{svc}
 	}
 	for _, s := range svcs {
 		wp := s.Service.GetWaypoint()
-		useWaypoint := ingressUseWaypoint(s, a.namespaces.GetKey(s.Service.Namespace))
+		useWaypoint := ingressUseWaypoint(*s, a.namespaces.GetKey(s.Service.Namespace))
 		wi := model.ServiceWaypointInfo{
 			Service:            s.Service,
 			IngressUseWaypoint: useWaypoint,
@@ -148,27 +180,45 @@ func (a *index) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
 		if wp == nil {
 			continue
 		}
-		switch addr := wp.GetDestination().(type) {
-		// Easy case: waypoint is already a hostname. Just return it directly
-		case *workloadapi.GatewayAddress_Hostname:
-			wi.WaypointHostname = addr.Hostname.Hostname
-		// Hard case: waypoint is an IP address. Need to look it up.
-		case *workloadapi.GatewayAddress_Address:
-			wpAddr, _ := netip.AddrFromSlice(addr.Address.Address)
-			wpNetAddr := networkAddress{
-				network: addr.Address.Network,
-				ip:      wpAddr.String(),
-			}
-			waypoints := a.services.ByAddress.Lookup(wpNetAddr)
-			if len(waypoints) == 0 {
-				// No waypoint found.
+		wi.WaypointHostname = a.resolveWaypointHostname(wp)
+		if wi.WaypointHostname == "" {
+			// Primary waypoint address (an IP) resolved to no known waypoint service.
+			continue
+		}
+		// Resolve weighted waypoints for gateway EDS.
+		for _, ww := range s.Service.GetWeightedWaypoints() {
+			h := a.resolveWaypointHostname(ww.GetDestination())
+			if h == "" {
 				continue
 			}
-			wi.WaypointHostname = waypoints[0].Service.Hostname
+			wi.WeightedWaypoints = append(wi.WeightedWaypoints, model.WeightedWaypointHostname{
+				Hostname:      h,
+				HboneMtlsPort: ww.GetDestination().GetHboneMtlsPort(),
+				Weight:        ww.GetWeight(),
+			})
 		}
 		res = append(res, wi)
 	}
 	return res
+}
+
+// resolveWaypointHostname resolves hostname waypoints directly and IP waypoints via services.
+func (a *index) resolveWaypointHostname(wp *workloadapi.GatewayAddress) string {
+	switch addr := wp.GetDestination().(type) {
+	case *workloadapi.GatewayAddress_Hostname:
+		return addr.Hostname.Hostname
+	case *workloadapi.GatewayAddress_Address:
+		wpAddr, _ := netip.AddrFromSlice(addr.Address.Address)
+		waypoints := a.services.ByAddress.Lookup(networkAddress{
+			network: addr.Address.Network,
+			ip:      wpAddr.String(),
+		})
+		if len(waypoints) == 0 {
+			return ""
+		}
+		return waypoints[0].Service.Hostname
+	}
+	return ""
 }
 
 func ingressUseWaypoint(s model.ServiceInfo, ns *model.NamespaceInfo) bool {

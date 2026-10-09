@@ -183,7 +183,6 @@ func (s *Server) initK8SConfigStore(args *PilotArgs) error {
 	})
 	tw.AddHandler(func(sets.String) {
 		s.XDSServer.ConfigUpdate(&model.PushRequest{
-			Full:   true,
 			Reason: model.NewReasonStats(model.TagUpdate),
 			Forced: true,
 		})
@@ -235,7 +234,6 @@ func (s *Server) initK8SConfigStore(args *PilotArgs) error {
 
 					// Trigger a push so we can recompute status
 					s.XDSServer.ConfigUpdate(&model.PushRequest{
-						Full:   true,
 						Reason: model.NewReasonStats(model.GlobalUpdate),
 						Forced: true,
 					})
@@ -356,9 +354,8 @@ func (s *Server) initConfigSources(args *PilotArgs) (err error) {
 			if err != nil {
 				return fmt.Errorf("failed to dial XDS %s %v", configSource.Address, err)
 			}
-			store := memory.Make(collections.Pilot)
 			// TODO: enable namespace filter for memory controller
-			configController := memory.NewController(store)
+			configController := memory.NewController(collections.Pilot, false)
 			configController.RegisterHasSyncedHandler(xdsMCP.HasSynced)
 			xdsMCP.Store = configController
 			err = xdsMCP.Run()

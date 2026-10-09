@@ -66,7 +66,7 @@ func SplitExcludeNamespaces(s string) []string {
 //
 // That is, have we annotated it after successfully setting up iptables rules AND sending it to a node proxy instance.
 //
-// If you just want to know if the pod _should be_ configured for traffic redirection, see PodRedirectionEnabled
+// If you just want to know if the pod _should be_ configured for traffic redirection, see CompiledEnablementSelectors.Matches
 func PodFullyEnrolled(pod *corev1.Pod) bool {
 	if pod != nil {
 		return pod.GetAnnotations()[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled
@@ -82,7 +82,7 @@ func PodFullyEnrolled(pod *corev1.Pod) bool {
 //
 // Pods like this still need to undergo the removal process (to potentially undo the redirection).
 //
-// If you just want to know if the pod _should be_ configured for traffic redirection, see PodRedirectionEnabled
+// If you just want to know if the pod _should be_ configured for traffic redirection, see CompiledEnablementSelectors.Matches
 func PodPartiallyEnrolled(pod *corev1.Pod) bool {
 	if pod != nil {
 		return pod.GetAnnotations()[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionPending
@@ -160,12 +160,20 @@ func GetPodIPsIfPresent(pod *corev1.Pod) []netip.Addr {
 	var podIPs []netip.Addr
 	if len(pod.Status.PodIPs) != 0 {
 		for _, pip := range pod.Status.PodIPs {
-			ip := netip.MustParseAddr(pip.IP)
+			ip, err := netip.ParseAddr(pip.IP)
+			if err != nil {
+				log.Warnf("failed to parse pod IP %q for pod %s/%s: %v", pip.IP, pod.Namespace, pod.Name, err)
+				continue
+			}
 			podIPs = append(podIPs, ip)
 		}
 	} else if len(pod.Status.PodIP) != 0 {
-		ip := netip.MustParseAddr(pod.Status.PodIP)
-		podIPs = append(podIPs, ip)
+		ip, err := netip.ParseAddr(pod.Status.PodIP)
+		if err != nil {
+			log.Warnf("failed to parse pod IP %q for pod %s/%s: %v", pod.Status.PodIP, pod.Namespace, pod.Name, err)
+		} else {
+			podIPs = append(podIPs, ip)
+		}
 	}
 	return podIPs
 }

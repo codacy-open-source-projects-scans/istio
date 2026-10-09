@@ -14,9 +14,12 @@
 package ambient
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,10 +36,12 @@ import (
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/workloadapi"
+	"istio.io/istio/tests/util/leak"
 )
 
 type ambientclients struct {
@@ -59,6 +64,116 @@ type remoteAmbientClients struct {
 
 func (r *remoteAmbientClients) ResourceName() string {
 	return string(r.clusterID)
+}
+
+// clusterGeneration identifies one generation of a remote cluster: its ID, plus the stop channel that
+// is closed when that generation is torn down. A credential rotation replaces the generation, which a
+// nested collection surfaces by rebuilding the cluster's contribution with the new stop channel.
+type clusterGeneration struct {
+	id   cluster.ID
+	stop <-chan struct{}
+}
+
+func (c clusterGeneration) ResourceName() string {
+	return string(c.id)
+}
+
+// clusterClients holds the ambient test clients for every cluster the multicluster controller knows
+// about.
+//
+// They are built through the multicluster nested collection API, which is the only way to reach a
+// cluster from outside the multicluster package: tests never hold a raw *Cluster. The local cluster's
+// clients are the "local" collection and each remote cluster contributes a single-element collection
+// built inside its own lifecycle, so a cluster's clients appear when it syncs and go away with it.
+type clusterClients struct {
+	// local is the config cluster's clients, which the ambient test server already owns.
+	local *remoteAmbientClients
+	// localID identifies local within the flattened collection.
+	localID     cluster.ID
+	collections krt.Collection[krt.Collection[*remoteAmbientClients]]
+}
+
+func (s *ambientTestServer) newClusterClients(t *testing.T, stop <-chan struct{}) *clusterClients {
+	t.Helper()
+	local := &remoteAmbientClients{
+		clusterID: s.clusterID,
+		ambientclients: &ambientclients{
+			pc:    s.pc,
+			sc:    s.sc,
+			ns:    s.ns,
+			grc:   s.grc,
+			gwcls: s.gwcls,
+			se:    s.se,
+			we:    s.we,
+			pa:    s.pa,
+			authz: s.authz,
+			sec:   s.sec,
+		},
+	}
+	localCollection := krt.NewStaticCollection(nil, []*remoteAmbientClients{local},
+		krt.WithName("LocalAmbientClients"), krt.WithStop(stop))
+
+	return &clusterClients{
+		local:   local,
+		localID: s.clusterID,
+		collections: multicluster.NestedCollectionFromLocalAndRemote(
+			s.mcController,
+			localCollection,
+			func(ctx krt.HandlerContext, c multicluster.ClusterCollections) *krt.Collection[*remoteAmbientClients] {
+				cl := c.Client()
+				// krt.NewStaticCollection returns a concrete StaticCollection, so the interface value
+				// has to be named to take its address.
+				col := krt.NewStaticCollection(nil, []*remoteAmbientClients{{
+					clusterID: c.ID(),
+					ambientclients: &ambientclients{
+						pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
+						sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
+						ns:    clienttest.NewWriter[*corev1.Namespace](t, cl),
+						grc:   clienttest.NewWriter[*k8sv1.Gateway](t, cl),
+						gwcls: clienttest.NewWriter[*k8sv1.GatewayClass](t, cl),
+						se:    clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
+						we:    clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
+						pa:    clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
+						authz: clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
+						sec:   clienttest.NewWriter[*corev1.Secret](t, cl),
+					},
+				}}, krt.WithName(fmt.Sprintf("AmbientClients[%s]", c.ID())), krt.WithStop(c.GetStop()))
+				return &col
+			},
+			"GlobalAmbientClients",
+			krt.NewOptionsBuilder(stop, "TestClients", nil),
+		),
+	}
+}
+
+// remotes returns the remote clusters' clients, sorted by cluster ID so that the order in which
+// clusters happen to appear in the collection cannot change what a test does.
+func (c *clusterClients) remotes() []*remoteAmbientClients {
+	var out []*remoteAmbientClients
+	for _, col := range c.collections.List() {
+		for _, client := range col.List() {
+			if client.clusterID != c.localID {
+				out = append(out, client)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b *remoteAmbientClients) int {
+		return cmp.Compare(a.clusterID, b.clusterID)
+	})
+	return out
+}
+
+// all returns the local cluster's clients followed by remotes().
+func (c *clusterClients) all() []*remoteAmbientClients {
+	return append([]*remoteAmbientClients{c.local}, c.remotes()...)
+}
+
+// waitForRemotes blocks until exactly n remote clusters have contributed their clients, and returns
+// them. A cluster only reaches the collection once it has completed its initial sync.
+func (c *clusterClients) waitForRemotes(t *testing.T, n int) []*remoteAmbientClients {
+	t.Helper()
+	assert.EventuallyEqual(t, func() int { return len(c.remotes()) }, n)
+	return c.remotes()
 }
 
 func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
@@ -127,28 +242,25 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 			s := newAmbientTestServer(t, testC, testNW, "")
 			s.AddSecret("s1", "c1") // overlapping ips
 			s.AddSecret("s2", "c2") // Non-overlapping ips
-			remoteClients := krt.NewCollection(s.mcController.Clusters(), func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
-				cl := c.Client
-				return ptr.Of(&remoteAmbientClients{
-					clusterID: c.ID,
-					ambientclients: &ambientclients{
-						pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
-						sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
-						ns:    clienttest.NewWriter[*corev1.Namespace](t, cl),
-						grc:   clienttest.NewWriter[*k8sv1.Gateway](t, cl),
-						gwcls: clienttest.NewWriter[*k8sv1.GatewayClass](t, cl),
-						se:    clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
-						we:    clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
-						pa:    clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
-						authz: clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
-						sec:   clienttest.NewWriter[*corev1.Secret](t, cl),
-					},
-				})
-			})
+			stop := test.NewStop(t)
 
-			assert.EventuallyEqual(t, func() int {
-				return len(remoteClients.List())
-			}, 2)
+			cc := s.newClusterClients(t, stop)
+			remoteClients := cc.waitForRemotes(t, 2)
+			clients := cc.all()
+
+			// The per-cluster namespace collections already carry the cluster metadata, so they can be
+			// nested and indexed as-is. Nothing is derived from them here (we only read them), so no
+			// per-cluster stop channel is needed.
+			namespaceCollections := multicluster.NestedCollectionFromLocalAndRemote(
+				s.mcController,
+				s.mcController.ConfigCluster().Namespaces(),
+				func(ctx krt.HandlerContext, i multicluster.ClusterCollections) *krt.Collection[*corev1.Namespace] {
+					return ptr.Of(i.Namespaces())
+				},
+				"GlobalNamespacesTest",
+				krt.NewOptionsBuilder(stop, "TestNamespaces", nil),
+			)
+			namespacesByCluster := multicluster.NestedCollectionIndexByCluster(namespaceCollections)
 
 			differentCIDRIPs := map[string]string{
 				"waypoint": "10.1.0.10",
@@ -175,24 +287,6 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 				"c1":       "77.1.2.49",
 				"c2":       "", // c2 and cluster0 share the same network, so no gw
 			}
-			rClients := remoteClients.List()
-			clients := append([]*remoteAmbientClients{
-				{
-					clusterID: s.clusterID,
-					ambientclients: &ambientclients{
-						pc:    s.pc,
-						sc:    s.sc,
-						ns:    s.ns,
-						grc:   s.grc,
-						gwcls: s.gwcls,
-						se:    s.se,
-						we:    s.we,
-						pa:    s.pa,
-						authz: s.authz,
-						sec:   s.sec,
-					},
-				},
-			}, rClients...)
 			for _, client := range clients {
 				// Test ambient index already creates istio-system namespace
 				if client.clusterID != s.clusterID {
@@ -217,16 +311,19 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 						},
 					})
 
-					// Ensure the namespace network is set in up in the collection before doing other assertions
-					assert.EventuallyEqual(t, func() bool {
-						networks := s.networks.SystemNamespaceNetworkByCluster.Lookup(client.clusterID)
-						if len(networks) == 0 {
-							return false
+					// A cluster's network is read from the topology label on its own system namespace, so wait
+					// for that namespace to reach the cluster's informer before making other assertions.
+					assert.EventuallyEqual(t, func() string {
+						collections := namespacesByCluster.Lookup(client.clusterID)
+						if len(collections) == 0 {
+							return ""
 						}
-
-						nw := networks[0].Network
-						return string(nw) == clusterToNetwork[client.clusterID]
-					}, true)
+						ns := collections[0].GetKey(systemNS)
+						if ns == nil {
+							return ""
+						}
+						return (*ns).Labels[label.TopologyNetwork.Name]
+					}, clusterToNetwork[client.clusterID])
 				}
 				if networkGatewayIps[client.clusterID] != "" {
 					s.addNetworkGatewayForClient(t, networkGatewayIps[client.clusterID], clusterToNetwork[client.clusterID], client.grc)
@@ -269,7 +366,8 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 				if clusterToNetwork[client.clusterID] == clusterToNetwork[s.clusterID] {
 					events = append(events, s.podXdsNameForCluster("pod1", client.clusterID))
 				} else if networkGatewayIps[client.clusterID] != "" {
-					events = append(events, fmt.Sprintf("%s/SplitHorizonWorkload/ns1/east-west/%s/%s",
+					events = append(events, fmt.Sprintf(
+						"%s/SplitHorizonWorkload/ns1/east-west/%s/%s",
 						clusterToNetwork[client.clusterID],
 						networkGatewayIps[client.clusterID],
 						s.svcXdsName("svc2"),
@@ -300,7 +398,7 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 			s.assertEvent(t, s.podXdsName("pod1"))
 			s.deleteWaypoint(t, "test-wp")
 
-			for _, rc := range remoteClients.List() {
+			for _, rc := range remoteClients {
 				// Removing the service changes the WDS workload in that cluster due to service attachments.
 				// Note that we should NOT get an event changing the service attachment in our local cluster.
 				// We also get a service event because we lost an IP
@@ -311,7 +409,8 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 					s.assertEvent(t, s.podXdsNameForCluster("pod1", rc.clusterID))
 				} else {
 					s.deleteServiceForClient(t, "svc2", rc.sc)
-					s.assertEvent(t, fmt.Sprintf("%s/SplitHorizonWorkload/ns1/east-west/%s/%s",
+					s.assertEvent(t, fmt.Sprintf(
+						"%s/SplitHorizonWorkload/ns1/east-west/%s/%s",
 						clusterToNetwork[rc.clusterID],
 						networkGatewayIps[rc.clusterID],
 						s.svcXdsName("svc2"),
@@ -372,9 +471,9 @@ func TestMulticlusterAmbientIndex_ServicesForWaypoint(t *testing.T) {
 			[]int32{80}, map[string]string{"app": "waypoint"}, "10.0.0.2")
 		s.assertEvent(s.t, s.svcXdsName("svc1"))
 
-		svc1Host := ptr.ToList(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))
+		svc1Host := []*model.ServiceInfo{ptr.Flatten(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))}
 		assert.Equal(t, len(svc1Host), 1)
-		assert.EventuallyEqual(t, func() []model.ServiceInfo {
+		assert.EventuallyEqual(t, func() []*model.ServiceInfo {
 			return s.ServicesForWaypoint(wpKey)
 		}, svc1Host)
 	})
@@ -393,9 +492,9 @@ func TestMulticlusterAmbientIndex_ServicesForWaypoint(t *testing.T) {
 			[]int32{80}, map[string]string{"app": "waypoint"}, "10.0.0.1")
 		s.assertEvent(s.t, s.svcXdsName("svc1"))
 
-		svc1Host := ptr.ToList(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))
+		svc1Host := []*model.ServiceInfo{ptr.Flatten(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))}
 		assert.Equal(t, len(svc1Host), 1)
-		assert.EventuallyEqual(t, func() []model.ServiceInfo {
+		assert.EventuallyEqual(t, func() []*model.ServiceInfo {
 			return s.ServicesForWaypoint(wpKey)
 		}, svc1Host)
 	})
@@ -414,9 +513,9 @@ func TestMulticlusterAmbientIndex_ServicesForWaypoint(t *testing.T) {
 			[]int32{80}, map[string]string{"app": "waypoint"}, "10.0.0.1")
 		s.assertEvent(s.t, s.svcXdsName("svc1"))
 
-		svc1Host := ptr.ToList(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))
+		svc1Host := []*model.ServiceInfo{ptr.Flatten(s.services.GetKey(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1"))))}
 		assert.Equal(t, len(svc1Host), 1)
-		assert.EventuallyEqual(t, func() []model.ServiceInfo {
+		assert.EventuallyEqual(t, func() []*model.ServiceInfo {
 			return s.ServicesForWaypoint(wpKey)
 		}, svc1Host)
 	})
@@ -426,47 +525,11 @@ func TestMulticlusterAmbientIndex_TestServiceMerging(t *testing.T) {
 	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
 	s := newAmbientTestServer(t, testC, testNW, "")
 	s.AddSecret("s1", "remote-cluster") // overlapping ips
-	remoteClients := krt.NewCollection(s.mcController.Clusters(), func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
-		cl := c.Client
-		return ptr.Of(&remoteAmbientClients{
-			clusterID: c.ID,
-			ambientclients: &ambientclients{
-				pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
-				sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
-				ns:    clienttest.NewWriter[*corev1.Namespace](t, cl),
-				grc:   clienttest.NewWriter[*k8sv1.Gateway](t, cl),
-				gwcls: clienttest.NewWriter[*k8sv1.GatewayClass](t, cl),
-				se:    clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
-				we:    clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
-				pa:    clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
-				authz: clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
-				sec:   clienttest.NewWriter[*corev1.Secret](t, cl),
-			},
-		})
-	})
+	cc := s.newClusterClients(t, test.NewStop(t))
 
 	const remoteNetwork = "remote-network"
-
-	assert.EventuallyEqual(t, func() int {
-		return len(remoteClients.List())
-	}, 1)
-
-	remoteClient := remoteClients.List()[0]
-	localClient := remoteAmbientClients{
-		clusterID: s.clusterID,
-		ambientclients: &ambientclients{
-			pc:    s.pc,
-			sc:    s.sc,
-			ns:    s.ns,
-			grc:   s.grc,
-			gwcls: s.gwcls,
-			se:    s.se,
-			we:    s.we,
-			pa:    s.pa,
-			authz: s.authz,
-			sec:   s.sec,
-		},
-	}
+	remoteClient := cc.waitForRemotes(t, 1)[0]
+	localClient := cc.local
 	remoteClient.ns.Create(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   systemNS,
@@ -478,13 +541,15 @@ func TestMulticlusterAmbientIndex_TestServiceMerging(t *testing.T) {
 			Name: testNS,
 		},
 	})
-	s.addServiceForClient(t, "svc2",
+	s.addServiceForClient(
+		t, "svc2",
 
 		map[string]string{},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1", localClient.sc,
 	)
-	s.addServiceForClient(t, "svc2",
+	s.addServiceForClient(
+		t, "svc2",
 		map[string]string{},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "a"}, "127.1.0.1", remoteClient.sc,
@@ -510,7 +575,8 @@ func TestMulticlusterAmbientIndex_TestServiceMerging(t *testing.T) {
 		}
 		return nil
 	})
-	s.labelServiceForClient(t, "svc2", testNS,
+	s.labelServiceForClient(
+		t, "svc2", testNS,
 		map[string]string{"istio.io/global": "true"},
 		remoteClient.sc,
 	)
@@ -528,7 +594,8 @@ func TestMulticlusterAmbientIndex_TestServiceMerging(t *testing.T) {
 		return nil
 	})
 	// Add a service to local cluster
-	s.addService(t, "svc2",
+	s.addService(
+		t, "svc2",
 		map[string]string{"istio.io/global": "true"},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1",
@@ -554,47 +621,11 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 	// Test that we're propagating the trust domain correctly
 	s.meshConfig.Mesh().TrustDomain = s.DomainSuffix
 	s.AddSecret("s1", "remote-cluster") // overlapping ips
-	remoteClients := krt.NewCollection(s.mcController.Clusters(), func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
-		cl := c.Client
-		return ptr.Of(&remoteAmbientClients{
-			clusterID: c.ID,
-			ambientclients: &ambientclients{
-				pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
-				sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
-				ns:    clienttest.NewWriter[*corev1.Namespace](t, cl),
-				grc:   clienttest.NewWriter[*k8sv1.Gateway](t, cl),
-				gwcls: clienttest.NewWriter[*k8sv1.GatewayClass](t, cl),
-				se:    clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
-				we:    clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
-				pa:    clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
-				authz: clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
-				sec:   clienttest.NewWriter[*corev1.Secret](t, cl),
-			},
-		})
-	})
+	cc := s.newClusterClients(t, test.NewStop(t))
 
 	const remoteNetwork = "remote-network"
-
-	assert.EventuallyEqual(t, func() int {
-		return len(remoteClients.List())
-	}, 1)
-
-	remoteClient := remoteClients.List()[0]
-	localClient := remoteAmbientClients{
-		clusterID: s.clusterID,
-		ambientclients: &ambientclients{
-			pc:    s.pc,
-			sc:    s.sc,
-			ns:    s.ns,
-			grc:   s.grc,
-			gwcls: s.gwcls,
-			se:    s.se,
-			we:    s.we,
-			pa:    s.pa,
-			authz: s.authz,
-			sec:   s.sec,
-		},
-	}
+	remoteClient := cc.waitForRemotes(t, 1)[0]
+	localClient := cc.local
 	remoteClient.ns.Create(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   systemNS,
@@ -608,14 +639,16 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 	})
 	networkGatewayIP := "172.0.1.2"
 	s.addNetworkGatewayForClient(t, networkGatewayIP, remoteNetwork, remoteClient.grc)
-	s.addServiceForClient(t, "svc2",
+	s.addServiceForClient(
+		t, "svc2",
 		map[string]string{
 			"istio.io/global": "true",
 		},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1", localClient.sc,
 	)
-	s.addServiceForClient(t, "svc2",
+	s.addServiceForClient(
+		t, "svc2",
 		map[string]string{
 			"istio.io/global": "true",
 		},
@@ -630,7 +663,7 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		if svc.Scope != model.Global {
 			return fmt.Errorf("expected service scope to be Global, got %s", svc.Scope)
 		}
-		gwwl := s.workloads.GetKey("NetworkGateway/remote-network/172.0.1.2/0")
+		gwwl := ptr.Flatten(s.workloads.GetKey("NetworkGateway/remote-network/172.0.1.2/0"))
 		if gwwl == nil {
 			return fmt.Errorf("expected network gateway workload to exist, but it does not")
 		}
@@ -638,14 +671,16 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 			return fmt.Errorf("expected network gateway workload to have addresses, got %v", gwwl.Workload.Addresses)
 		}
 		if gwwl.Workload.TrustDomain != s.DomainSuffix {
-			return fmt.Errorf("expected network gateway workload to have trust domain %s, got %s",
+			return fmt.Errorf(
+				"expected network gateway workload to have trust domain %s, got %s",
 				s.DomainSuffix,
 				gwwl.Workload.TrustDomain,
 			)
 		}
 		expectedAddress := []uint8{172, 0, 1, 2}
 		if !reflect.DeepEqual(gwwl.Workload.Addresses[0], expectedAddress) {
-			return fmt.Errorf("expected network gateway workload to have address %s, got %s",
+			return fmt.Errorf(
+				"expected network gateway workload to have address %s, got %s",
 				networkGatewayIP,
 				gwwl.Workload.Addresses[0],
 			)
@@ -665,7 +700,7 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		if len(ais) != 3 {
 			return fmt.Errorf("expected 3 pods, got %d", len(ais))
 		}
-		shwl := s.workloads.GetKey(splitHorizonName)
+		shwl := ptr.Flatten(s.workloads.GetKey(splitHorizonName))
 		if shwl == nil {
 			return fmt.Errorf("expected split horizon workload to exist, but it does not")
 		}
@@ -683,18 +718,21 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 			)
 		}
 		if shwl.Workload.NetworkGateway.Destination.(*workloadapi.GatewayAddress_Address).Address.Network != remoteNetwork {
-			return fmt.Errorf("expected split horizon workload to have network %s, got %s",
+			return fmt.Errorf(
+				"expected split horizon workload to have network %s, got %s",
 				remoteNetwork,
 				shwl.Workload.NetworkGateway.Destination.(*workloadapi.GatewayAddress_Address).Address.Network,
 			)
 		}
 		if shwl.Workload.Capacity.GetValue() != 1 {
-			return fmt.Errorf("expected split horizon workload to have capacity 1, got %d",
+			return fmt.Errorf(
+				"expected split horizon workload to have capacity 1, got %d",
 				shwl.Workload.Capacity.GetValue(),
 			)
 		}
 		if len(shwl.Workload.Addresses) != 0 {
-			return fmt.Errorf("expected no addresses in split horizon workload, got %v",
+			return fmt.Errorf(
+				"expected no addresses in split horizon workload, got %v",
 				shwl.Workload.Addresses,
 			)
 		}
@@ -710,7 +748,7 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		if len(ais) != 3 {
 			return fmt.Errorf("expected 3 pods, got %d", len(ais))
 		}
-		shwl := s.workloads.GetKey(splitHorizonName)
+		shwl := ptr.Flatten(s.workloads.GetKey(splitHorizonName))
 		if shwl == nil {
 			return fmt.Errorf("expected split horizon workload to exist, but it does not")
 		}
@@ -739,7 +777,7 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		if len(ais) != 3 {
 			return fmt.Errorf("expected 3 pods, got %d", len(ais))
 		}
-		shwl := s.workloads.GetKey(splitHorizonName)
+		shwl := ptr.Flatten(s.workloads.GetKey(splitHorizonName))
 		if shwl == nil {
 			return fmt.Errorf("expected split horizon workload to exist, but it does not")
 		}
@@ -774,7 +812,8 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		map[string]string{"istio.io/global": "true"}, localClient.sc)
 	s.labelServiceForClient(t, "svc2", testNS,
 		map[string]string{"istio.io/global": "true"}, remoteClient.sc)
-	s.assertEvent(t, s.podXdsNameForCluster("pod2", remoteClient.clusterID),
+	s.assertEvent(
+		t, s.podXdsNameForCluster("pod2", remoteClient.clusterID),
 		s.podXdsNameForCluster("pod1-abc", remoteClient.clusterID),
 	)
 	assert.EventuallyEqual(t, func() int {
@@ -794,18 +833,241 @@ func TestMulticlusterAmbientIndex_SplitHorizon(t *testing.T) {
 		ais := s.Lookup("ns1/svc2.ns1.svc.company.com")
 		return len(ais)
 	}, 3)
-	s.assertEvent(t, s.podXdsNameForCluster("pod2", remoteClient.clusterID),
+	s.assertEvent(
+		t, s.podXdsNameForCluster("pod2", remoteClient.clusterID),
 		s.podXdsNameForCluster("pod1-abc", remoteClient.clusterID),
 		splitHorizonName,
 	)
 }
 
-func (a *ambientTestServer) DeleteSecret(secretName string) {
-	a.t.Helper()
-	a.sec.Delete(secretName, secretNamespace)
+func TestMulticlusterAmbientIndex_SplitHorizonPreservesWaypoint(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	s := newAmbientTestServer(t, testC, testNW, "")
+	s.meshConfig.Mesh().TrustDomain = s.DomainSuffix
+	s.AddSecret("s1", "remote-cluster")
+	cc := s.newClusterClients(t, test.NewStop(t))
+
+	const remoteNetwork = "remote-network"
+	remoteClient := cc.waitForRemotes(t, 1)[0]
+	localClient := cc.local
+	remoteClient.ns.Create(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   systemNS,
+			Labels: map[string]string{label.TopologyNetwork.Name: remoteNetwork},
+		},
+	})
+	remoteClient.ns.Create(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testNS,
+		},
+	})
+	networkGatewayIP := "172.0.1.2"
+	s.addNetworkGatewayForClient(t, networkGatewayIP, remoteNetwork, remoteClient.grc)
+
+	// Create a waypoint for the service
+	s.addWaypointSpecificAddress(t, "10.0.0.10", "", "wp-svc", constants.AllTraffic, true)
+	s.addService(t, "wp-svc",
+		map[string]string{},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "waypoint"}, "10.0.0.10")
+
+	// Create a global service with ingress-use-waypoint on both clusters
+	s.addServiceForClient(
+		t, "svc1",
+		map[string]string{
+			"istio.io/global":               "true",
+			label.IoIstioUseWaypoint.Name:   "wp-svc",
+			"istio.io/ingress-use-waypoint": "true",
+		},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1", localClient.sc,
+	)
+	s.addServiceForClient(
+		t, "svc1",
+		map[string]string{
+			"istio.io/global":               "true",
+			label.IoIstioUseWaypoint.Name:   "wp-svc",
+			"istio.io/ingress-use-waypoint": "true",
+		},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "a"}, "127.1.0.1", remoteClient.sc,
+	)
+	s.clearEvents()
+
+	// Add local and remote workloads to trigger the SAN merge in SplitHorizonServices.
+	// The remote pod must be on a different network so its SAN gets merged, which is
+	// the code path where fields were being dropped.
+	s.addPodsForClient(t, "10.0.1.1", "pod1", "sa1",
+		map[string]string{"app": "a"}, nil, true, corev1.PodRunning, localClient.pc)
+	s.addPodsForClient(t, "127.0.0.1", "pod1-remote", "sa-remote",
+		map[string]string{"app": "a"}, nil, true, corev1.PodRunning, remoteClient.pc)
+
+	// Wait for the SAN merge to happen — the service should have SANs from the remote workload.
+	// This proves the SplitHorizonServices code path that creates a new ServiceInfo was hit.
+	svcKey := s.svcXdsName("svc1")
+	retry.UntilSuccessOrFail(t, func() error {
+		svc := s.lookupService(fmt.Sprintf("%s/%s", testNS, s.hostnameForService("svc1")))
+		if svc == nil {
+			return fmt.Errorf("service not found")
+		}
+		if svc.Scope != model.Global {
+			return fmt.Errorf("expected service scope to be Global, got %s", svc.Scope)
+		}
+		hasRemoteSAN := false
+		for _, san := range svc.Service.SubjectAltNames {
+			if strings.Contains(san, "sa-remote") {
+				hasRemoteSAN = true
+				break
+			}
+		}
+		if !hasRemoteSAN {
+			return fmt.Errorf("expected SANs to include remote workload SAN (sa-remote), got %v",
+				svc.Service.SubjectAltNames)
+		}
+		// Now verify the fields that were previously dropped during SAN merge
+		if !svc.Waypoint.IngressLabelPresent {
+			return fmt.Errorf("expected Waypoint.IngressLabelPresent to be true, got false")
+		}
+		if !svc.Waypoint.IngressUseWaypoint {
+			return fmt.Errorf("expected Waypoint.IngressUseWaypoint to be true, got false")
+		}
+		if svc.Source.Kind == 0 {
+			return fmt.Errorf("expected Source.Kind to be preserved, got zero")
+		}
+		if len(svc.PortNames) == 0 {
+			return fmt.Errorf("expected PortNames to be preserved, got empty")
+		}
+		return nil
+	})
+
+	// Verify ServicesWithWaypoint also returns the correct IngressUseWaypoint
+	retry.UntilSuccessOrFail(t, func() error {
+		svcs := s.ServicesWithWaypoint(svcKey)
+		if len(svcs) == 0 {
+			return fmt.Errorf("ServicesWithWaypoint returned 0 results")
+		}
+		if !svcs[0].IngressUseWaypoint {
+			return fmt.Errorf("expected ServicesWithWaypoint to return IngressUseWaypoint=true, got false")
+		}
+		if svcs[0].WaypointHostname == "" {
+			return fmt.Errorf("expected WaypointHostname to be set, got empty")
+		}
+		return nil
+	})
 }
 
-func (a *ambientTestServer) AddSecret(secretName, clusterID string) {
+func (s *ambientTestServer) DeleteSecret(secretName string) {
+	s.t.Helper()
+	s.sec.Delete(secretName, secretNamespace)
+}
+
+func (s *ambientTestServer) AddSecret(secretName, clusterID string) {
 	kubeconfig++
-	a.sec.CreateOrUpdate(makeSecret(secretNamespace, secretName, clusterCredential{clusterID, fmt.Appendf(nil, "kubeconfig-%d", kubeconfig)}))
+	s.sec.CreateOrUpdate(makeSecret(secretNamespace, secretName, clusterCredential{clusterID, fmt.Appendf(nil, "kubeconfig-%d", kubeconfig)}))
+}
+
+// TestMulticlusterAmbientIndex_ClusterLifecycleNoLeak verifies that adding and then removing a
+// remote cluster does not leak any goroutines backing that cluster's derived krt collections
+// (e.g. the per-cluster node locality collection) or the informer handlers they register.
+//
+// The ambient index (and its top-level stop channel) lives on the parent test, while the
+// add/remove cycles run in a subtest wrapped in leak.Check.
+func TestMulticlusterAmbientIndex_ClusterLifecycleNoLeak(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	// Build the index WITHOUT starting the config cluster client. This lets us create the warmup
+	// remote-cluster secret up front and have it processed as part of the very first sync, so that
+	// waiting on HasSynced deterministically means "all global collections are wired up".
+	s := newAmbientTestServerWithFlags(t, testC, testNW, FeatureFlags{
+		DefaultAllowFromWaypoint:              features.DefaultAllowFromWaypoint,
+		EnableK8SServiceSelectWorkloadEntries: features.EnableK8SServiceSelectWorkloadEntries,
+	}, "", false /* runClient */)
+	cl := s.mcController.ConfigCluster().Client()
+	stop := test.NewStop(t)
+
+	// Track the clusters through the nested collection API rather than a raw *Cluster collection. Each
+	// remote cluster contributes one clusterGeneration carrying the stop channel of the generation that
+	// produced it, which is what lets this test observe a credential rotation and the teardown of the
+	// generation it replaced.
+	generations := multicluster.NestedCollectionFromLocalAndRemote(
+		s.mcController,
+		krt.NewStaticCollection[clusterGeneration](nil, nil, krt.WithName("LocalGenerations"), krt.WithStop(stop)),
+		func(ctx krt.HandlerContext, c multicluster.ClusterCollections) *krt.Collection[clusterGeneration] {
+			col := krt.NewStaticCollection(nil,
+				[]clusterGeneration{{id: c.ID(), stop: c.GetStop()}},
+				krt.WithName(fmt.Sprintf("Generation[%s]", c.ID())), krt.WithStop(c.GetStop()))
+			return &col
+		},
+		"GlobalClusterGenerations",
+		krt.NewOptionsBuilder(stop, "TestGenerations", nil),
+	)
+	remoteGenerations := func() []clusterGeneration {
+		var out []clusterGeneration
+		for _, col := range generations.List() {
+			out = append(out, col.List()...)
+		}
+		return out
+	}
+	generationStop := func(id cluster.ID) <-chan struct{} {
+		for _, g := range remoteGenerations() {
+			if g.id == id {
+				return g.stop
+			}
+		}
+		return nil
+	}
+
+	waitRemoteClusters := func(t *testing.T, n int) {
+		t.Helper()
+		assert.EventuallyEqual(t, func() int { return len(remoteGenerations()) }, n)
+	}
+
+	// Warm-up: create a remote cluster BEFORE running the client. Global collections lazily wire up
+	// per-cluster dependency handlers the first time they see a remote cluster; doing this as part of
+	// the initial sync (gated by HasSynced) guarantees they are all created before leak.Check snapshots
+	// its baseline. We intentionally do NOT remove this cluster: teardown is async, and leaving the
+	// cluster in place keeps us in a stable, fully-initialized steady state. The subtests exercise
+	// add/remove of a *second* cluster and must return to this baseline.
+	s.AddSecret("s1", "remote-cluster-1")
+	t.Cleanup(cl.Shutdown)
+	cl.RunAndWait(test.NewStop(t))
+	assert.EventuallyEqual(t, s.HasSynced, true)
+	waitRemoteClusters(t, 1)
+
+	t.Run("add-remove-cluster", func(t *testing.T) {
+		leak.Check(t)
+
+		s.AddSecret("s2", "remote-cluster-2")
+		waitRemoteClusters(t, 2)
+
+		s.DeleteSecret("s2")
+		waitRemoteClusters(t, 1)
+	})
+
+	t.Run("update-then-remove-cluster", func(t *testing.T) {
+		leak.Check(t)
+
+		s.AddSecret("s2", "remote-cluster-2")
+		waitRemoteClusters(t, 2)
+
+		// Update the cluster: re-adding the secret with a fresh kubeconfig swaps in a new Cluster (new
+		// stop + collections), tearing down the old one. This is the teardown path we verify doesn't
+		// leak. The cluster count stays at 2 across the update, so waitRemoteClusters would return
+		// immediately without the swap having propagated into the collection. The rotation is a new
+		// generation, so it rebuilds the cluster's contribution: wait for remote-cluster-2 to be
+		// reported with a stop channel other than the one it had.
+		oldStop := generationStop("remote-cluster-2")
+		if oldStop == nil {
+			t.Fatal("remote-cluster-2 is not in the generations collection")
+		}
+		s.AddSecret("s2", "remote-cluster-2")
+		assert.EventuallyEqual(t, func() bool {
+			current := generationStop("remote-cluster-2")
+			return current != nil && current != oldStop
+		}, true, retry.Timeout(30*time.Second))
+		<-oldStop
+
+		// Remove so the subtest ends back at the single warm-up cluster, matching the leak.Check baseline.
+		s.DeleteSecret("s2")
+		waitRemoteClusters(t, 1)
+	})
 }

@@ -23,11 +23,11 @@ import (
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/runtime"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proto/merge"
+	"istio.io/istio/pkg/slices"
 )
 
 // ApplyClusterMerge processes the MERGE operation and merges the supplied configuration to the matched clusters.
@@ -51,7 +51,7 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Merg
 			clusterMatch(c, cp, hosts) {
 			return nil
 		}
-		if cp.Operation != networking.EnvoyFilter_Patch_MERGE {
+		if !model.IsMergeOperation(cp.Operation) {
 			IncrementEnvoyFilterMetric(cp.Key(), Cluster, applied)
 			continue
 		}
@@ -63,7 +63,7 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Merg
 			}
 			applied = true
 			if !tsMerged {
-				merge.Merge(c, cp.Value)
+				mergePatchValue(cp.Operation, c, cp.Value)
 			}
 		}
 		IncrementEnvoyFilterMetric(cp.Key(), Cluster, applied)
@@ -75,7 +75,7 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Merg
 // Returns a boolean indicating if the merge was handled by this function; if false, it should still be called
 // outside of this function.
 func mergeTransportSocketCluster(c *cluster.Cluster, cp *model.EnvoyFilterConfigPatchWrapper) (merged bool, err error) {
-	cpValueCast, okCpCast := (cp.Value).(*cluster.Cluster)
+	cpValueCast, okCpCast := cp.Value.(*cluster.Cluster)
 	if !okCpCast {
 		return false, fmt.Errorf("cast of cp.Value failed: %v", okCpCast)
 	}
@@ -114,9 +114,9 @@ func mergeTransportSocketCluster(c *cluster.Cluster, cp *model.EnvoyFilterConfig
 		dst := ts.GetTypedConfig()
 		srcPatch := cpValueCast.GetTransportSocket().GetTypedConfig()
 		if dst != nil && srcPatch != nil {
-			retVal, errMerge := util.MergeAnyWithAny(dst, srcPatch)
+			retVal, errMerge := mergeAnyPatchValue(cp.Operation, dst, cp.TransportSocketTypedConfig)
 			if errMerge != nil {
-				return false, fmt.Errorf("function MergeAnyWithAny failed for ApplyClusterMerge: %v", errMerge)
+				return false, fmt.Errorf("function mergeAnyPatchValue failed for ApplyClusterMerge: %v", errMerge)
 			}
 
 			// Merge the above result with the whole cluster
@@ -170,7 +170,7 @@ func clusterMatch(cluster *cluster.Cluster, cp *model.EnvoyFilterConfigPatchWrap
 		return false
 	}
 
-	if cMatch.Service != "" && !hostContains(hostMatches, host.Name(cMatch.Service)) {
+	if cMatch.Service != "" && !slices.Contains(hostMatches, host.Name(cMatch.Service)) {
 		return false
 	}
 
@@ -180,13 +180,4 @@ func clusterMatch(cluster *cluster.Cluster, cp *model.EnvoyFilterConfigPatchWrap
 		return false
 	}
 	return true
-}
-
-func hostContains(hosts []host.Name, service host.Name) bool {
-	for _, h := range hosts {
-		if h == service {
-			return true
-		}
-	}
-	return false
 }

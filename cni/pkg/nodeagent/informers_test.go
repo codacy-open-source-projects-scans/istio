@@ -34,6 +34,7 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/monitoring/monitortest"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 func TestInformerExistingPodAddedWhenNsLabeled(t *testing.T) {
@@ -352,6 +353,53 @@ func TestInformerExistingPodNotAddedIfNoIPInAnyStatusField(t *testing.T) {
 	assertPodNotAnnotated(t, client, pod)
 
 	// Assert expected calls (not) actually made
+	fs.AssertExpectations(t)
+}
+
+func TestInformerExistingHostNetworkPodNotAddedWhenNsLabeled(t *testing.T) {
+	setupLogging()
+	NodeName = "testnode"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Host network pods have no netns of their own to capture, so they must never be
+	// enrolled, even in an ambient-labeled namespace. Note the pod has a valid IP:
+	// hostNetwork is the only thing keeping it out of the mesh.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "test",
+		},
+		Spec: corev1.PodSpec{
+			NodeName:    NodeName,
+			HostNetwork: true,
+		},
+		Status: corev1.PodStatus{
+			PodIP: "11.1.1.12",
+		},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+
+	client := kube.NewFakeClient(ns, pod)
+
+	fs := &fakeServer{}
+
+	_, mt := populateClientAndWaitForInformer(ctx, t, client, fs, 2, 1)
+
+	// label the namespace
+	labelsPatch := []byte(fmt.Sprintf(`{"metadata":{"labels":{"%s":"%s"}}}`,
+		label.IoIstioDataplaneMode.Name, constants.DataplaneModeAmbient))
+	_, err := client.Kube().CoreV1().Namespaces().Patch(ctx, ns.Name,
+		types.MergePatchType, labelsPatch, metav1.PatchOptions{})
+	assert.NoError(t, err)
+
+	// wait for all update events to settle
+	// total 3: 1. init ns reconcile 2. ns label reconcile 3. pod reconcile
+	mt.Assert(EventTotals.Name(), map[string]string{"type": "update"}, monitortest.Exactly(3))
+
+	assertPodNotAnnotated(t, client, pod)
+
+	// Assert no dataplane calls (e.g. AddPodToMesh) were made
 	fs.AssertExpectations(t)
 }
 
@@ -985,6 +1033,48 @@ func TestInformerAmbientEnabledReturnsNoPodIfNotEnabled(t *testing.T) {
 	assert.Equal(t, disabledPod, nil)
 }
 
+func TestInformerAmbientEnabledReturnsNoPodIfHostNetwork(t *testing.T) {
+	setupLogging()
+	NodeName = "testnode"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// GetPodIfAmbientEnabled feeds the CNI-event enrollment path, whose netns
+	// resolution can fall back to guessing via /proc scans. Host network pods must be
+	// rejected here so that fallback is never entered for them.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "test",
+			UID:       "1234",
+		},
+		Spec: corev1.PodSpec{
+			NodeName:    NodeName,
+			HostNetwork: true,
+		},
+		Status: corev1.PodStatus{
+			PodIP: "11.1.1.12",
+		},
+	}
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "test",
+			Labels: map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient},
+		},
+	}
+
+	client := kube.NewFakeClient(ns, pod)
+	fs := &fakeServer{}
+
+	handlers, _ := populateClientAndWaitForInformer(ctx, t, client, fs, 2, 1)
+
+	hostNetworkPod, err := handlers.GetPodIfAmbientEnabled(pod.Name, ns.Name)
+
+	assert.NoError(t, err)
+	assert.Equal(t, hostNetworkPod, nil)
+}
+
 func TestInformerAmbientEnabledReturnsErrorIfBogusNS(t *testing.T) {
 	setupLogging()
 	NodeName = "testnode"
@@ -1240,6 +1330,108 @@ func TestInformerStillHandlesDeleteEventIfPodNotActuallyPresentAnymore(t *testin
 	fs.AssertExpectations(t)
 }
 
+// setupHandlersWithFakeDataplane wires the informer handlers to talk directly to the
+// fakeServer mock instead of the real meshDataplane, so tests can assert on
+// SyncHostProbeIPSet. The queue is intentionally not started tests drive
+// reconcile() directly so the only dataplane calls are the ones under test.
+func setupHandlersWithFakeDataplane(ctx context.Context, client kube.Client, fs *fakeServer) *InformerHandlers {
+	handlers := setupHandlers(ctx, client, fs, "istio-system", defaultAmbientSelector, nil)
+	client.RunAndWait(ctx.Done())
+	kube.WaitForCacheSync("test", ctx.Done(), handlers.pods.HasSynced, handlers.namespaces.HasSynced)
+	return handlers
+}
+
+// An already-enrolled pod whose probe IP reappears (e.g. the startup snapshot pruned it
+// while Status.PodIPs was momentarily empty after a node/kubelet restart) should have its
+// host probe ipset entry re-asserted exactly once, with no add/remove since enrollment is
+// otherwise unchanged.
+func TestInformerEnrolledPodProbeIPSetReassertedWhenIPReappears(t *testing.T) {
+	setupLogging()
+	NodeName = "testnode"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "test",
+			Annotations: map[string]string{annotation.AmbientRedirection.Name: constants.AmbientRedirectionEnabled},
+		},
+		Spec:   corev1.PodSpec{NodeName: NodeName},
+		Status: corev1.PodStatus{PodIP: "11.1.1.12"},
+	}
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "test",
+			Labels: map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient},
+		},
+	}
+
+	client := kube.NewFakeClient(ns, pod)
+	fs := &fakeServer{}
+	fs.On("SyncHostProbeIPSet", mock.IsType(pod), util.GetPodIPsIfPresent(pod)).Once().Return(nil)
+
+	handlers := setupHandlersWithFakeDataplane(ctx, client, fs)
+
+	// The previous event observed no IP (snapshot pruned the entry); the current cache has
+	// it back. That IP-less -> IP transition is what triggers the self-heal.
+	iplessOldPod := pod.DeepCopy()
+	iplessOldPod.Status.PodIP = ""
+	iplessOldPod.Status.PodIPs = nil
+
+	assert.NoError(t, handlers.reconcile(controllers.Event{
+		Event: controllers.EventUpdate,
+		Old:   iplessOldPod,
+		New:   pod,
+	}))
+
+	fs.AssertExpectations(t)
+}
+
+// An update that does not change an enrolled pod's IPs (e.g. a readiness/condition change)
+// must not re-assert the ipset, to avoid a redundant syscall on every unrelated update.
+func TestInformerEnrolledPodProbeIPSetNotReassertedWhenIPUnchanged(t *testing.T) {
+	setupLogging()
+	NodeName = "testnode"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "test",
+			Annotations: map[string]string{annotation.AmbientRedirection.Name: constants.AmbientRedirectionEnabled},
+		},
+		Spec:   corev1.PodSpec{NodeName: NodeName},
+		Status: corev1.PodStatus{PodIP: "11.1.1.12"},
+	}
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "test",
+			Labels: map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient},
+		},
+	}
+
+	client := kube.NewFakeClient(ns, pod)
+	// No SyncHostProbeIPSet expectation: fakeServer.Called would fail the test if it were
+	// invoked for an IP-unchanged update.
+	fs := &fakeServer{}
+
+	handlers := setupHandlersWithFakeDataplane(ctx, client, fs)
+
+	// Same IP as the cached pod, only an unrelated status field differs.
+	oldPod := pod.DeepCopy()
+	oldPod.Status.Phase = corev1.PodRunning
+
+	assert.NoError(t, handlers.reconcile(controllers.Event{
+		Event: controllers.EventUpdate,
+		Old:   oldPod,
+		New:   pod,
+	}))
+
+	fs.AssertExpectations(t)
+}
+
 func TestInformerExistingPodNotAddedWhenNsExcluded(t *testing.T) {
 	setupLogging()
 	NodeName = "testnode"
@@ -1452,45 +1644,33 @@ func TestInformerLabeledPodInExcludedNsNotEnrolled(t *testing.T) {
 }
 
 func assertPodAnnotated(t *testing.T, client kube.Client, pod *corev1.Pod) {
-	for i := 0; i < 5; i++ {
+	retry.UntilOrFail(t, func() bool {
 		p, err := client.Kube().CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled {
-			return
-		}
-		time.Sleep(1 * time.Second)
-	}
-	t.Fatal("Pod not annotated")
+		return p.Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled
+	}, retry.Timeout(5*time.Second), retry.Delay(50*time.Millisecond), retry.Message("Pod not annotated"))
 }
 
 func assertPodAnnotatedPending(t *testing.T, client kube.Client, pod *corev1.Pod) {
-	for i := 0; i < 5; i++ {
+	retry.UntilOrFail(t, func() bool {
 		p, err := client.Kube().CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionPending {
-			return
-		}
-		time.Sleep(1 * time.Second)
-	}
-	t.Fatal("Pod not annotated with pending status")
+		return p.Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionPending
+	}, retry.Timeout(5*time.Second), retry.Delay(50*time.Millisecond), retry.Message("Pod not annotated with pending status"))
 }
 
 func assertPodNotAnnotated(t *testing.T, client kube.Client, pod *corev1.Pod) {
-	for i := 0; i < 5; i++ {
+	retry.UntilOrFail(t, func() bool {
 		p, err := client.Kube().CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.Annotations[annotation.AmbientRedirection.Name] != constants.AmbientRedirectionEnabled {
-			return
-		}
-		time.Sleep(1 * time.Second)
-	}
-	t.Fatal("Pod annotated")
+		return p.Annotations[annotation.AmbientRedirection.Name] != constants.AmbientRedirectionEnabled
+	}, retry.Timeout(5*time.Second), retry.Delay(50*time.Millisecond), retry.Message("Pod annotated"))
 }
 
 // nolint: lll

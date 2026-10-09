@@ -127,7 +127,7 @@ func (n *networkManager) networkFromMeshNetworks(endpointIP string) network.ID {
 			log.Warnf("Found multiple networks CIDRs matching the endpoint IP: %s. Using the first match.", endpointIP)
 		}
 		if len(entries) > 0 {
-			return (entries[0].(namedRangerEntry)).name
+			return entries[0].(namedRangerEntry).name
 		}
 	}
 	return ""
@@ -155,7 +155,7 @@ func (c *Controller) onNetworkChange() {
 		log.Errorf("one or more errors force-syncing endpoints: %v", err)
 	}
 	if c.reloadNetworkGateways() {
-		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
+		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
 	}
 	c.NotifyGatewayHandlers()
 }
@@ -422,7 +422,6 @@ func (n *networkManager) handleGatewayResource(_ *gatewayv1.Gateway, gw *gateway
 			if l.Protocol == "HBONE" {
 				networkGateway := base
 				networkGateway.Addr = addr.Value
-				networkGateway.Port = uint32(l.Port)
 				networkGateway.HBONEPort = uint32(l.Port)
 				newGateways.Insert(networkGateway)
 			}

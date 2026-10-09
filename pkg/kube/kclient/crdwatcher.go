@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/gateway-api/pkg/consts"
 
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config/schema/gatewayapi"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -73,12 +74,6 @@ func newCrdWatcher(client kube.Client) kubetypes.CrdWatcher {
 	return c
 }
 
-var minimumCRDVersions = map[string]*semver.Version{
-	"grpcroutes.gateway.networking.k8s.io":         semver.New(1, 1, 0, "", ""),
-	"backendtlspolicies.gateway.networking.k8s.io": semver.New(1, 4, 0, "", ""),
-	"tlsroutes.gateway.networking.k8s.io":          semver.New(1, 5, 0, "", ""),
-}
-
 // resourceFilterConfig contains a filter definition parsed from the flags. In case
 // the filter is passed with "*." the filter will be marked as Prefix type and
 // the check will match the value as a suffix, and not as an exact match
@@ -109,6 +104,8 @@ func fetchResourceFilter(filters string) []resourceFilterConfig {
 }
 
 type filterFunction = func(obj any) bool
+
+const gatewayAPIDevelopmentVersion = "v0.0.0-dev"
 
 // unionFilter can be used to establish multiple object filters on CRD types.
 // We can use it for cases where we care about filtering out a CRD for a specific
@@ -177,7 +174,7 @@ func resourceMatchFilters(name string, filters []resourceFilterConfig) bool {
 func minimumVersionFilter(t any) bool {
 	// Setup a filter
 	crd := t.(*metav1.PartialObjectMetadata)
-	mv, f := minimumCRDVersions[crd.Name]
+	mv, f := gatewayapi.MinimumCRDVersions[crd.Name]
 	if !f {
 		return true
 	}
@@ -185,6 +182,11 @@ func minimumVersionFilter(t any) bool {
 	if !f {
 		log.Errorf("CRD %v expected to have a %v annotation, but none found; ignoring", crd.Name, consts.BundleVersion)
 		return false
+	}
+	// Development Gateway API bundles use this sentinel version. They may contain changes newer
+	// than the latest released bundle, so they always satisfy the minimum version requirement.
+	if bv == gatewayAPIDevelopmentVersion {
+		return true
 	}
 	fv, err := semver.NewVersion(bv)
 	if err != nil {
@@ -199,7 +201,9 @@ func minimumVersionFilter(t any) bool {
 	}
 	fv = &nv
 	if fv.LessThan(mv) {
-		log.Infof("CRD %v version %v is below minimum version %v, ignoring", crd.Name, fv, mv)
+		log.Warnf("CRD %v version %v is below minimum version %v required by this Istio version; "+
+			"resources of this kind will not be processed. Upgrade the Gateway API CRDs to satisfy the minimum version.",
+			crd.Name, fv, mv)
 		return false
 	}
 	return true

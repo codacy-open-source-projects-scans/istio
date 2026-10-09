@@ -19,14 +19,20 @@ import (
 
 	mysql "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/network/mysql_proxy/v3"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	dfp "github.com/envoyproxy/go-control-plane/envoy/extensions/common/dynamic_forward_proxy/v3"
+	httpdfp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/dynamic_forward_proxy/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	mongo "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	redis "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	snidfp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_dynamic_forward_proxy/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	cares "github.com/envoyproxy/go-control-plane/envoy/extensions/network/dns_resolver/cares/v3"
 	hashpolicy "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	extensions "istio.io/api/extensions/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -38,6 +44,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core/tunnelingconfig"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
+	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config"
@@ -77,11 +84,11 @@ func setAccessLogAndBuildTCPFilter(push *model.PushContext, node *model.Proxy,
 	return tcpFilter
 }
 
-func buildSNIDFPFilter(port int, svc *model.Service) *listener.Filter {
+func buildSNIDFPFilter(port int, svc *model.Service, lookupFamily cluster.Cluster_DnsLookupFamily) *listener.Filter {
 	sniDfp := &snidfp.FilterConfig{
 		DnsCacheConfig: &dfp.DnsCacheConfig{
 			Name:            model.BuildDNSCacheName(svc.Hostname),
-			DnsLookupFamily: cluster.Cluster_V4_ONLY,
+			DnsLookupFamily: lookupFamily,
 		},
 		PortSpecifier: &snidfp.FilterConfig_PortValue{
 			PortValue: uint32(port),
@@ -91,6 +98,52 @@ func buildSNIDFPFilter(port int, svc *model.Service) *listener.Filter {
 	return &listener.Filter{
 		Name:       wellknown.SNIDynamicForwardProxy,
 		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(sniDfp)},
+	}
+}
+
+// buildAllowAnyDynamicDNSDNSCacheConfig builds the shared DnsCacheConfig for ALLOW_ANY_DYNAMIC_DNS mode.
+// When DNS_CAPTURE is enabled, the resolver is pointed at the Istio DNS proxy (DNS_PROXY_ADDR).
+// Otherwise no explicit resolver is set and Envoy uses its default DNS resolution.
+func buildAllowAnyDynamicDNSDNSCacheConfig(meta *model.NodeMetadata) *dfp.DnsCacheConfig {
+	cfg := &dfp.DnsCacheConfig{
+		Name: util.AllowAnyDFPDNSCacheName,
+		// Envoy defaults MaxHosts to 1024 when unset. Set it explicitly so the cap is
+		// visible in the generated config and tunable via PILOT_ALLOW_ANY_DYNAMIC_DNS_MAX_HOSTS.
+		MaxHosts: wrappers.UInt32(uint32(features.AllowAnyDynamicDNSMaxHosts)),
+	}
+	if meta != nil {
+		cfg.DnsLookupFamily = util.SelectDNSLookupFamily(meta.InstanceIPs)
+	} else {
+		cfg.DnsLookupFamily = cluster.Cluster_V4_ONLY
+	}
+	if meta == nil || !bool(meta.DNSCapture) {
+		return cfg
+	}
+	caresConfig, err := anypb.New(&cares.CaresDnsResolverConfig{
+		Resolvers: []*core.Address{util.GetDNSProxyAddress(meta.InstanceIPs, meta.DNSProxyAddr)},
+	})
+	if err == nil {
+		cfg.TypedDnsResolverConfig = &core.TypedExtensionConfig{
+			Name:        "envoy.network.dns_resolver.cares",
+			TypedConfig: caresConfig,
+		}
+	}
+	return cfg
+}
+
+// buildAllowAnyDynamicDNSHTTPForwardProxyFilter builds an HTTP dynamic forward proxy filter for
+// ALLOW_ANY_DYNAMIC_DNS mode. It resolves hostnames from the Host/:authority header using the
+// shared DNS cache (Istio DNS proxy).
+func buildAllowAnyDynamicDNSHTTPForwardProxyFilter(meta *model.NodeMetadata) *hcm.HttpFilter {
+	return &hcm.HttpFilter{
+		Name: "envoy.filters.http.dynamic_forward_proxy",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&httpdfp.FilterConfig{
+				ImplementationSpecifier: &httpdfp.FilterConfig_DnsCacheConfig{
+					DnsCacheConfig: buildAllowAnyDynamicDNSDNSCacheConfig(meta),
+				},
+			}),
+		},
 	}
 }
 
@@ -169,7 +222,7 @@ func (lb *ListenerBuilder) buildCompleteNetworkFilters(
 		policySvc != nil &&
 		policySvc.Hostname.IsWildCarded() &&
 		policySvc.Resolution == model.DynamicDNS {
-		sniDFPFilter := buildSNIDFPFilter(port, policySvc)
+		sniDFPFilter := buildSNIDFPFilter(port, policySvc, util.SelectDNSLookupFamily(lb.node.IPAddresses))
 		filters = append(filters, sniDFPFilter)
 	}
 
@@ -201,7 +254,7 @@ func (lb *ListenerBuilder) buildOutboundNetworkFiltersWithWeightedClusters(route
 	}
 
 	for _, route := range routes {
-		service := lb.push.ServiceForHostname(lb.node, host.Name(route.Destination.Host))
+		service := lb.node.SidecarScope.GetService(host.Name(route.Destination.Host))
 		if route.Weight > 0 {
 			clusterName := istioroute.GetDestinationCluster(route.Destination, service, port.Port)
 			clusterSpecifier.WeightedClusters.Clusters = append(clusterSpecifier.WeightedClusters.Clusters, &tcp.TcpProxy_WeightedCluster_ClusterWeight{
@@ -291,7 +344,7 @@ func (lb *ListenerBuilder) buildOutboundNetworkFilters(
 	port *model.Port, configMeta config.Meta, includeMx bool,
 ) []*listener.Filter {
 	push, node := lb.push, lb.node
-	service := push.ServiceForHostname(node, host.Name(routes[0].Destination.Host))
+	service := node.SidecarScope.GetService(host.Name(routes[0].Destination.Host))
 	var destinationRule *networking.DestinationRule
 	if service != nil {
 		destinationRule = CastDestinationRule(node.SidecarScope.DestinationRule(model.TrafficDirectionOutbound, node, service.Hostname).GetRule())

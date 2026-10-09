@@ -212,12 +212,12 @@ func NewController(opts ControllerOptions) *Controller {
 }
 
 func (c *Controller) buildClustersCollection(optsBuilder krt.OptionsBuilder) {
-	// Wait for the remote config source to sync and mark the cluster store as ready.
+	// Wait for the remote config source, queue and cluster store to sync and then mark the cluster store as ready.
 	// Run() also waits on the same source before starting the queue; this goroutine
 	// separately gates the KRT-backed clusters collection on source sync.
 	// For the file-backed source, sync will not begin until Run() calls Start().
 	go func() {
-		if !kube.WaitForCacheSync("multicluster remote config source", c.stop, c.source.HasSynced) {
+		if !kube.WaitForCacheSync("multicluster remote config source", c.stop, c.source.HasSynced, c.queue.HasSynced, c.cs.HasSynced) {
 			log.Errorf("Timed out waiting for remote config source to sync")
 		}
 		c.cs.MarkSynced()
@@ -236,19 +236,11 @@ func (c *Controller) buildClustersCollection(optsBuilder krt.OptionsBuilder) {
 	}, optsBuilder.WithName("RemoteClusters")...)
 }
 
-// Clusters returns the krt collection of remote Clusters.
-func (c *Controller) Clusters() krt.Collection[*Cluster] {
-	return c.clusters
-}
-
-// ConfigCluster returns the local/config cluster.
-func (c *Controller) ConfigCluster() *Cluster {
-	return c.configCluster
-}
-
-// ClusterStore returns the underlying ClusterStore.
-func (c *Controller) ClusterStore() *ClusterStore {
-	return c.cs
+// ConfigCluster returns a collections view of the local/config cluster. Unlike remote clusters, the
+// config cluster lives for the lifetime of the process, so collections derived from it need no
+// special teardown. See ClusterCollections.
+func (c *Controller) ConfigCluster() ClusterCollections {
+	return ClusterCollections{cluster: c.configCluster}
 }
 
 type ComponentBuilder interface {

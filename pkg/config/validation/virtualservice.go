@@ -98,9 +98,9 @@ func validateHTTPRoute(http *networking.HTTPRoute, delegate, gatewaySemantics bo
 
 	errs = AppendValidation(errs, validateDestination(http.Mirror))
 	errs = AppendValidation(errs, validateHTTPMirrors(http.Mirrors))
-	errs = AppendValidation(errs, validateHTTPRedirect(http.Redirect))
+	errs = AppendValidation(errs, validateHTTPRedirect(http.Redirect, http.Match))
 	errs = AppendValidation(errs, validateHTTPDirectResponse(http.DirectResponse))
-	errs = AppendValidation(errs, validateHTTPRetry(http.Retries))
+	errs = AppendValidation(errs, agent.ValidateHTTPRetry(http.Retries))
 	errs = AppendValidation(errs, validateHTTPRewrite(http.Rewrite))
 	errs = AppendValidation(errs, validateAuthorityRewrite(http.Rewrite, http.Headers))
 	errs = AppendValidation(errs, validateHTTPRouteDestinations(http.Route, gatewaySemantics))

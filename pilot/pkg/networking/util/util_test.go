@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"testing"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -27,7 +28,9 @@ import (
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/anypb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -834,10 +837,91 @@ func TestIsAllowAnyOutbound(t *testing.T) {
 			},
 			result: true,
 		},
+		{
+			name: "OutboundTrafficPolicyAllowAnyDynamicDNS",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: false,
+		},
 	}
 	for i := range tests {
 		t.Run(tests[i].name, func(t *testing.T) {
 			out := IsAllowAnyOutbound(tests[i].node)
+			if out != tests[i].result {
+				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
+			}
+		})
+	}
+}
+
+func TestIsAllowAnyDynamicDNSOutbound(t *testing.T) {
+	tests := []struct {
+		name   string
+		node   *model.Proxy
+		result bool
+	}{
+		{
+			name:   "NilSidecarScope",
+			node:   &model.Proxy{Type: model.SidecarProxy},
+			result: false,
+		},
+		{
+			name: "AllowAny",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_ALLOW_ANY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "RegistryOnly",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "AllowAnyDynamicDNS_Sidecar",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: true,
+		},
+		{
+			name: "AllowAnyDynamicDNS_Gateway_NotEligible",
+			node: &model.Proxy{
+				Type: model.Router,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: false,
+		},
+	}
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			out := IsAllowAnyDynamicDNSOutbound(tests[i].node)
 			if out != tests[i].result {
 				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
 			}
@@ -1964,4 +2048,143 @@ func BenchmarkAddConfigInfoMetadata(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestSelectDNSLookupFamily(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []string
+		want cluster.Cluster_DnsLookupFamily
+	}{
+		{"no ips defaults to v4", nil, cluster.Cluster_V4_ONLY},
+		{"ipv4 only", []string{"10.0.0.1"}, cluster.Cluster_V4_ONLY},
+		{"ipv6 only", []string{"2001:db8::1"}, cluster.Cluster_V6_ONLY},
+		{"dual stack defaults to v4", []string{"10.0.0.1", "2001:db8::1"}, cluster.Cluster_V4_ONLY},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SelectDNSLookupFamily(tc.ips); got != tc.want {
+				t.Errorf("SelectDNSLookupFamily(%v) = %v, want %v", tc.ips, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetDNSProxyAddress(t *testing.T) {
+	tests := []struct {
+		name         string
+		ips          []string
+		dnsProxyAddr string
+		wantHost     string
+		wantPort     uint32
+	}{
+		{"no ips defaults to v4", nil, "", model.LocalhostAddressPrefix, 15053},
+		{"ipv4 localhost", []string{"10.0.0.1"}, "localhost:15053", model.LocalhostAddressPrefix, 15053},
+		{"ipv6 localhost", []string{"2001:db8::1"}, "localhost:15053", model.LocalhostIPv6AddressPrefix, 15053},
+		{"dual stack defaults to v4", []string{"10.0.0.1", "2001:db8::1"}, "", model.LocalhostAddressPrefix, 15053},
+		{"custom address", []string{"2001:db8::1"}, "10.0.0.1:53", "10.0.0.1", 53},
+		{"invalid address falls back to ipv6", []string{"2001:db8::1"}, "invalid", model.LocalhostIPv6AddressPrefix, 15053},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sa := GetDNSProxyAddress(tc.ips, tc.dnsProxyAddr).GetSocketAddress()
+			if sa == nil {
+				t.Fatal("expected SocketAddress")
+			}
+			if sa.Address != tc.wantHost {
+				t.Errorf("expected host %q, got %q", tc.wantHost, sa.Address)
+			}
+			if sa.GetPortValue() != tc.wantPort {
+				t.Errorf("expected port %d, got %d", tc.wantPort, sa.GetPortValue())
+			}
+		})
+	}
+}
+
+func TestMergeAnyWithMessageListSemantics(t *testing.T) {
+	dst := protoconv.MessageToAny(&hcm.HttpConnectionManager{
+		StatPrefix:  "dst",
+		HttpFilters: []*hcm.HttpFilter{{Name: "istio.metadata_exchange"}},
+	})
+	src := &hcm.HttpConnectionManager{
+		HttpFilters: []*hcm.HttpFilter{{Name: "envoy.filters.http.router"}},
+	}
+
+	tests := []struct {
+		name  string
+		merge func(dst *anypb.Any, src proto.Message) (*anypb.Any, error)
+		want  *hcm.HttpConnectionManager
+	}{
+		{
+			name:  "MergeAnyWithMessage appends lists",
+			merge: MergeAnyWithMessage,
+			want: &hcm.HttpConnectionManager{
+				StatPrefix: "dst",
+				HttpFilters: []*hcm.HttpFilter{
+					{Name: "istio.metadata_exchange"},
+					{Name: "envoy.filters.http.router"},
+				},
+			},
+		},
+		{
+			name:  "MergeAnyWithMessageReplaceList replaces lists",
+			merge: MergeAnyWithMessageReplaceList,
+			want: &hcm.HttpConnectionManager{
+				StatPrefix:  "dst",
+				HttpFilters: []*hcm.HttpFilter{{Name: "envoy.filters.http.router"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.merge(dst, src)
+			assert.NoError(t, err)
+			assert.Equal(t, got, protoconv.MessageToAny(tt.want))
+		})
+	}
+}
+
+func TestMergeAnyWithMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		merge       func(dst *anypb.Any, src proto.Message) (*anypb.Any, error)
+		replaceList bool
+	}{
+		{name: "MERGE", merge: MergeAnyWithMessage},
+		{name: "MERGE_AND_REPLACE_LIST", merge: MergeAnyWithMessageReplaceList, replaceList: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &hcm.HttpConnectionManager{
+				HttpFilters: []*hcm.HttpFilter{{Name: "patch"}},
+			}
+			original := proto.Clone(src).(*hcm.HttpConnectionManager)
+			for _, name := range []string{"first", "second"} {
+				dst := &hcm.HttpConnectionManager{
+					StatPrefix:  name,
+					HttpFilters: []*hcm.HttpFilter{{Name: name}},
+				}
+				merged, err := tc.merge(protoconv.MessageToAny(dst), src)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := &hcm.HttpConnectionManager{}
+				if err := merged.UnmarshalTo(got); err != nil {
+					t.Fatal(err)
+				}
+				wantFilters := []*hcm.HttpFilter{{Name: name}, {Name: "patch"}}
+				if tc.replaceList {
+					wantFilters = []*hcm.HttpFilter{{Name: "patch"}}
+				}
+				assert.Equal(t, got, &hcm.HttpConnectionManager{
+					StatPrefix:  name,
+					HttpFilters: wantFilters,
+				})
+				assert.Equal(t, src, original)
+			}
+			if _, err := tc.merge(protoconv.MessageToAny(original), nil); err == nil {
+				t.Fatal("expected an error for an undecoded source")
+			}
+		})
+	}
 }

@@ -22,6 +22,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/labels"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -29,33 +30,38 @@ import (
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/kubetypes"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/util/sets"
 )
 
 var log = istiolog.RegisterScope("untaint", "CNI node-untaint controller")
-
-const (
-	TaintName = "cni.istio.io/not-ready"
-)
 
 var istioCniLabels = map[string]string{
 	"k8s-app": "istio-cni-node",
 }
 
-type NodeUntainter struct {
-	podsClient  kclient.Client[*v1.Pod]
-	nodesClient kclient.Client[*v1.Node]
-	cnilabels   labels.Instance
-	ourNs       string
-	queue       controllers.Queue
+var ztunnelLabels = map[string]string{
+	"app": "ztunnel",
 }
 
-func filterNamespace(ns string) func(any) bool {
+type NodeUntainter struct {
+	podsClient    kclient.Client[*v1.Pod]
+	nodesClient   kclient.Client[*v1.Node]
+	cnilabels     labels.Instance
+	ztunnellabels labels.Instance
+	cniNs         string
+	ztunnelNs     sets.String
+	checkZtunnel  bool
+	queue         controllers.Queue
+	taintName     string
+}
+
+func filterNamespaces(nses sets.String) func(any) bool {
 	return func(obj any) bool {
 		object := controllers.ExtractObject(obj)
 		if object == nil {
 			return false
 		}
-		return ns == object.GetNamespace()
+		return nses.Contains(object.GetNamespace())
 	}
 }
 
@@ -65,20 +71,45 @@ func NewNodeUntainter(stop <-chan struct{}, kubeClient kubelib.Client, cniNs, sy
 	if ns == "" {
 		ns = sysNs
 	}
+	// istio-cni, ztunnel and istiod can all live in different namespaces, so watch the
+	// cni namespace plus wherever ztunnel runs (only needed when we gate on ztunnel).
+	checkZtunnel := features.NodeUntaintCheckZtunnel
+	ztunnelNs := sets.New[string]()
+	if checkZtunnel {
+		ztunnelNs = ztunnelNamespaces(sysNs)
+	}
+	watchedNs := sets.New(ns).Merge(ztunnelNs)
 	podsClient := kclient.NewFiltered[*v1.Pod](kubeClient, kclient.Filter{
-		ObjectFilter:    kubetypes.NewStaticObjectFilter(filterNamespace(ns)),
+		ObjectFilter:    kubetypes.NewStaticObjectFilter(filterNamespaces(watchedNs)),
 		ObjectTransform: kubelib.StripPodUnusedFields,
 		FieldSelector:   "status.phase!=Failed",
 	})
 	nodes := kclient.NewFiltered[*v1.Node](kubeClient, kclient.Filter{ObjectTransform: kubelib.StripNodeUnusedFields})
 	nt := &NodeUntainter{
-		podsClient:  podsClient,
-		nodesClient: nodes,
-		cnilabels:   labels.Instance(istioCniLabels),
-		ourNs:       ns,
+		podsClient:    podsClient,
+		nodesClient:   nodes,
+		cnilabels:     labels.Instance(istioCniLabels),
+		ztunnellabels: labels.Instance(ztunnelLabels),
+		cniNs:         ns,
+		ztunnelNs:     ztunnelNs,
+		checkZtunnel:  checkZtunnel,
+		taintName:     features.NodeUntaintTaintName,
 	}
 	nt.setup(stop, debugger)
 	return nt
+}
+
+// ztunnelNamespaces returns where ztunnel may run. CA_TRUSTED_NODE_ACCOUNTS is rendered from
+// `trustedZtunnelNamespace`; istiod's own ns stays in so a bad guess can't wedge scheduling.
+func ztunnelNamespaces(sysNs string) sets.String {
+	res := sets.New(sysNs)
+	for sa := range features.CATrustedNodeAccounts {
+		if sa.Namespace != "" {
+			res.Insert(sa.Namespace)
+		}
+	}
+	log.Debugf("node untainter looking for ztunnel in namespaces %v", res)
+	return res
 }
 
 func (n *NodeUntainter) setup(stop <-chan struct{}, debugger *krt.DebugHandler) {
@@ -88,7 +119,7 @@ func (n *NodeUntainter) setup(stop <-chan struct{}, debugger *krt.DebugHandler) 
 
 	readyCniPods := krt.NewCollection(pods, func(ctx krt.HandlerContext, p *v1.Pod) **v1.Pod {
 		log.Debugf("cniPods event: %s", p.Name)
-		if p.Namespace != n.ourNs {
+		if p.Namespace != n.cniNs {
 			return nil
 		}
 		if !n.cnilabels.SubsetOf(p.ObjectMeta.Labels) {
@@ -101,18 +132,46 @@ func (n *NodeUntainter) setup(stop <-chan struct{}, debugger *krt.DebugHandler) 
 		return &p
 	}, opts.WithName("cni-pods")...)
 
-	// these are all the nodes that have a ready cni pod. if the cni pod is ready,
-	// it means we are ok scheduling pods to it.
+	readyZtunnelPods := krt.NewCollection(pods, func(ctx krt.HandlerContext, p *v1.Pod) **v1.Pod {
+		log.Debugf("ztunnelPods event: %s", p.Name)
+		if !n.ztunnelNs.Contains(p.Namespace) {
+			return nil
+		}
+		if !n.ztunnellabels.SubsetOf(p.ObjectMeta.Labels) {
+			return nil
+		}
+		if !IsPodReadyConditionTrue(p.Status) {
+			return nil
+		}
+		log.Debugf("ztunnel pod %s on node %s ready!", p.Name, p.Spec.NodeName)
+		return &p
+	}, opts.WithName("ztunnel-pods")...)
+
+	ztunnelByNode := krt.NewIndex(readyZtunnelPods, "node", func(p *v1.Pod) []string {
+		if p.Spec.NodeName == "" {
+			return nil
+		}
+		return []string{p.Spec.NodeName}
+	})
+
+	// nodes with a ready cni pod, and (when ambient) a ready ztunnel pod too.
 	readyCniNodes := krt.NewCollection(readyCniPods, func(ctx krt.HandlerContext, p *v1.Pod) **v1.Node {
 		pnode := krt.FetchOne(ctx, nodes, krt.FilterKey(p.Spec.NodeName))
 		if pnode == nil {
 			return nil
 		}
 		node := *pnode
-		if !hasTaint(node) {
+		if !n.hasTaint(node) {
 			return nil
 		}
-		return &node
+		if n.checkZtunnel {
+			// Fetch registers a dependency, so this recomputes when ztunnel readiness changes.
+			if len(krt.Fetch(ctx, readyZtunnelPods, krt.FilterIndex(ztunnelByNode, node.Name))) == 0 {
+				log.Debugf("node %s has a ready cni pod but no ready ztunnel, keeping it tainted", node.Name)
+				return nil
+			}
+		}
+		return pnode
 	}, opts.WithName("ready-cni-nodes")...)
 
 	n.queue = controllers.NewQueue("untaint nodes",
@@ -149,15 +208,15 @@ func (n *NodeUntainter) reconcileNode(key types.NamespacedName) error {
 		return nil
 	}
 
-	err := removeReadinessTaint(n.nodesClient, node)
+	err := removeReadinessTaint(n.nodesClient, node, n.taintName)
 	if err != nil {
-		log.Errorf("failed to remove readiness taint from node %v: %v", node.Name, err)
+		log.Errorf("failed to remove readiness taint '%v' from node %v: %v", n.taintName, node.Name, err)
 	}
 	return err
 }
 
-func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node) error {
-	updatedTaint := deleteTaint(node.Spec.Taints)
+func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node, taintName string) error {
+	updatedTaint := deleteTaint(node.Spec.Taints, taintName)
 	if len(updatedTaint) == len(node.Spec.Taints) {
 		// nothing to remove..
 		return nil
@@ -192,10 +251,10 @@ func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node) e
 }
 
 // deleteTaint removes all the taints that have the same key and effect to given taintToDelete.
-func deleteTaint(taints []v1.Taint) []v1.Taint {
+func deleteTaint(taints []v1.Taint, taintName string) []v1.Taint {
 	newTaints := []v1.Taint{}
 	for i := range taints {
-		if taints[i].Key == TaintName {
+		if taints[i].Key == taintName {
 			continue
 		}
 		newTaints = append(newTaints, taints[i])
@@ -203,9 +262,9 @@ func deleteTaint(taints []v1.Taint) []v1.Taint {
 	return newTaints
 }
 
-func hasTaint(n *v1.Node) bool {
-	for _, taint := range n.Spec.Taints {
-		if taint.Key == TaintName {
+func (n *NodeUntainter) hasTaint(node *v1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == n.taintName {
 			return true
 		}
 	}

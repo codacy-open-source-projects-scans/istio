@@ -40,10 +40,12 @@ const (
 	wildcardNamespace = "*"
 	currentNamespace  = "."
 	wildcardService   = host.Name("*")
+	excludePrefix     = "~"
 )
 
 var (
 	sidecarScopedKnownConfigTypes = sets.New(
+		kind.Endpoints,
 		kind.ServiceEntry,
 		kind.VirtualService,
 		kind.DestinationRule,
@@ -64,8 +66,19 @@ var (
 )
 
 type hostClassification struct {
-	exactHosts sets.Set[host.Name]
-	allHosts   []host.Name
+	exactHosts    sets.Set[host.Name]
+	allHosts      []host.Name
+	excludedHosts []host.Name
+}
+
+// Excluded reports whether h matches any ~-prefixed exclusion entry scoped to this namespace.
+func (hc hostClassification) Excluded(h host.Name) bool {
+	for _, excluded := range hc.excludedHosts {
+		if h.SubsetOf(excluded) {
+			return true
+		}
+	}
+	return false
 }
 
 // Matches checks if the hostClassification(sidecar egress hosts) matches the Service's hostname
@@ -182,10 +195,17 @@ type SidecarScope struct {
 	// be forwarded.
 	OutboundTrafficPolicy *networking.OutboundTrafficPolicy
 
-	// Set of known configs this sidecar depends on.
+	// Set of known configs this sidecar depends on. Service and DestinationRule dependencies are
+	// answered from servicesByHostname and destinationRulesByNames instead.
 	// This field will be used to determine the config/resource scope
 	// which means which config changes will affect the proxies within this scope.
 	configDependencies sets.Set[ConfigHash]
+
+	// VirtualServices bound to each gateway selected by this scope. Gateway names are namespace/name.
+	gatewayVirtualServices map[string][]*config.Config
+	// The VirtualServices above as dependencies. Kept separate from configDependencies, which
+	// gateway scopes share with their namespace scope.
+	gatewayConfigDependencies sets.Set[ConfigHash]
 
 	// Function that will initialize the sidecar scope. This is used to
 	// defer the initialization of the sidecar scope until the first time
@@ -205,9 +225,10 @@ func (sc *SidecarScope) MarshalJSON() ([]byte, error) {
 		"egressListenerServices": slices.Map(sc.EgressListeners, func(e *IstioEgressListenerWrapper) []*Service {
 			return e.services
 		}),
-		"servicesByHostname": sc.servicesByHostname,
-		"sidecar":            sc.Sidecar,
-		"destinationRules":   sc.destinationRules,
+		"servicesByHostname":     sc.servicesByHostname,
+		"sidecar":                sc.Sidecar,
+		"destinationRules":       sc.destinationRules,
+		"gatewayVirtualServices": sc.gatewayVirtualServices,
 	}, "", "  ")
 }
 
@@ -253,7 +274,7 @@ type IstioEgressListenerWrapper struct {
 
 const defaultSidecar = "default-sidecar"
 
-// DefaultSidecarScopeForGateway builds a SidecarScope contains services and destinationRules for a given gateway/waypoint.
+// DefaultSidecarScopeForGateway builds a SidecarScope containing services and destination rules for a gateway.
 func DefaultSidecarScopeForGateway(ps *PushContext, configNamespace string) *SidecarScope {
 	services := ps.servicesExportedToNamespace(configNamespace)
 	out := &SidecarScope{
@@ -273,12 +294,40 @@ func DefaultSidecarScopeForGateway(ps *PushContext, configNamespace string) *Sid
 
 	out.selectAuthnPolicies(ps, configNamespace)
 
-	// waypoint need to get vses from the egress listener
-	defaultEgressListener := &IstioEgressListenerWrapper{
-		virtualServices: ps.VirtualServicesForGateway(configNamespace, constants.IstioMeshGateway),
-	}
-	out.EgressListeners = []*IstioEgressListenerWrapper{defaultEgressListener}
 	out.initFunc = func() {}
+
+	return out
+}
+
+// gatewaySidecarScope extends the initialized namespace scope of a router or ambient east-west gateway
+// with the VirtualServices bound to its gateway set. The common indexes, including the mesh egress
+// listener of a waypoint base, are immutable and shared with the namespace scope.
+func gatewaySidecarScope(ps *PushContext, base *SidecarScope, gateways []string) *SidecarScope {
+	out := *base
+	out.Version = ps.PushVersion
+	out.gatewayVirtualServices = make(map[string][]*config.Config, len(gateways))
+	for _, gateway := range gateways {
+		virtualServices := ps.virtualServicesForGateway(base.Namespace, gateway)
+		out.gatewayVirtualServices[gateway] = virtualServices
+		if out.gatewayConfigDependencies == nil {
+			out.gatewayConfigDependencies = sets.NewWithLength[ConfigHash](len(virtualServices))
+		}
+		for _, vs := range virtualServices {
+			out.gatewayConfigDependencies.Insert(ConfigKey{
+				Kind: kind.VirtualService, Namespace: vs.Namespace, Name: vs.Name,
+			}.HashCode())
+		}
+	}
+	return &out
+}
+
+// DefaultSidecarScopeForWaypoint extends the gateway scope with mesh VirtualServices for waypoint routing.
+func DefaultSidecarScopeForWaypoint(ps *PushContext, configNamespace string) *SidecarScope {
+	out := DefaultSidecarScopeForGateway(ps, configNamespace)
+
+	out.EgressListeners = []*IstioEgressListenerWrapper{{
+		virtualServices: ps.virtualServicesForGateway(configNamespace, constants.IstioMeshGateway),
+	}}
 
 	return out
 }
@@ -344,9 +393,8 @@ func initSidecarScopeInternalIndexes(ps *PushContext, sidecarScope *SidecarScope
 
 	if sidecarScope.Sidecar.GetOutboundTrafficPolicy() == nil {
 		if ps.Mesh.OutboundTrafficPolicy != nil {
-			sidecarScope.OutboundTrafficPolicy = &networking.OutboundTrafficPolicy{
-				Mode: networking.OutboundTrafficPolicy_Mode(ps.Mesh.OutboundTrafficPolicy.Mode),
-			}
+			mode := networking.OutboundTrafficPolicy_Mode(ps.Mesh.OutboundTrafficPolicy.Mode)
+			sidecarScope.OutboundTrafficPolicy = &networking.OutboundTrafficPolicy{Mode: mode}
 		}
 	} else {
 		sidecarScope.OutboundTrafficPolicy = sidecarScope.Sidecar.GetOutboundTrafficPolicy()
@@ -361,7 +409,15 @@ func (sc *SidecarScope) collectImportedServices(ps *PushContext, configNamespace
 		return serviceMatchingVirtualServicePorts(s, ports)
 	}
 
-	servicesAdded := make(map[host.Name]sidecarServiceIndex)
+	imported := 0
+	for _, ilw := range sc.EgressListeners {
+		imported += len(ilw.services)
+	}
+	servicesAdded := make(map[host.Name]sidecarServiceIndex, imported)
+	sc.services = make([]*Service, 0, imported)
+	if len(sc.servicesByHostname) == 0 {
+		sc.servicesByHostname = make(map[host.Name]*Service, imported)
+	}
 	for _, ilw := range sc.EgressListeners {
 		// First add the explicitly requested services, which take priority
 		for _, s := range ilw.services {
@@ -447,21 +503,10 @@ func (sc *SidecarScope) selectDestinationRules(ps *PushContext, configNamespace 
 			sc.destinationRules[s.Hostname] = drList
 			for _, dr := range drList {
 				for _, key := range dr.from {
-					sc.AddConfigDependencies(ConfigKey{
-						Kind:      kind.DestinationRule,
-						Name:      key.Name,
-						Namespace: key.Namespace,
-					}.HashCode())
-
 					sc.destinationRulesByNames[key] = dr.rule
 				}
 			}
 		}
-		sc.AddConfigDependencies(ConfigKey{
-			Kind:      kind.ServiceEntry,
-			Name:      string(s.Hostname),
-			Namespace: s.Attributes.Namespace,
-		}.HashCode())
 	}
 }
 
@@ -474,12 +519,22 @@ func convertIstioListenerToWrapper(ps *PushContext, configNamespace string,
 	}
 
 	hostsByNamespace := make(map[string]hostClassification)
+
+	allExactHosts := true
 	for _, h := range istioListener.Hosts {
 		if strings.Count(h, "/") != 1 {
 			log.Errorf("Illegal host in sidecar resource: %s, host must be of form namespace/dnsName", h)
 			continue
 		}
 		ns, name, _ := strings.Cut(h, "/")
+
+		excluded := strings.HasPrefix(ns, excludePrefix)
+		if excluded {
+			ns = strings.TrimPrefix(ns, excludePrefix)
+			if ns == "" {
+				ns = wildcardNamespace
+			}
+		}
 		if ns == currentNamespace {
 			ns = configNamespace
 		}
@@ -490,9 +545,20 @@ func convertIstioListenerToWrapper(ps *PushContext, configNamespace string,
 			hc = hostClassification{exactHosts: sets.New[host.Name](), allHosts: make([]host.Name, 0)}
 		}
 
+		if excluded {
+			hc.excludedHosts = append(hc.excludedHosts, hName)
+			hostsByNamespace[ns] = hc
+			continue
+		}
+
 		// exact hosts are saved separately for map lookup
 		if !hName.IsWildCarded() {
 			hc.exactHosts.Insert(hName)
+		} else {
+			allExactHosts = false
+		}
+		if ns == wildcardNamespace {
+			allExactHosts = false
 		}
 
 		// allHosts contains the exact hosts and wildcard hosts,
@@ -502,11 +568,45 @@ func convertIstioListenerToWrapper(ps *PushContext, configNamespace string,
 	}
 
 	out.virtualServices = SelectVirtualServices(ps.virtualServiceIndex, configNamespace, hostsByNamespace)
-	svces := ps.servicesExportedToNamespace(configNamespace)
+	var svces []*Service
+	if allExactHosts {
+		svces = ps.servicesForExactHosts(configNamespace, hostsByNamespace)
+	} else {
+		svces = ps.servicesExportedToNamespace(configNamespace)
+	}
 	out.services = out.selectServices(svces, configNamespace, hostsByNamespace)
 	out.mostSpecificWildcardVsIndex = computeWildcardHostVirtualServiceIndex(out.virtualServices, out.services)
 
 	return out
+}
+
+// servicesForExactHosts resolves the candidate services for an egress listener whose hosts are all exact
+// (non-wildcard) and explicitly namespaced, via direct lookups in ps.ServiceIndex.HostnameAndNamespace instead
+// of scanning every service visible to configNamespace. It is a fast-path replacement for
+// servicesExportedToNamespace; the returned list is fed to selectServices, exactly like the scan-based path.
+func (ps *PushContext) servicesForExactHosts(configNamespace string,
+	hostsByNamespace map[string]hostClassification,
+) []*Service {
+	var candidates []*Service
+	for ns, hc := range hostsByNamespace {
+		for hName := range hc.exactHosts {
+			byNamespace, ok := ps.ServiceIndex.HostnameAndNamespace[hName]
+			if !ok {
+				continue
+			}
+			svc, ok := byNamespace[ns]
+			if !ok {
+				continue
+			}
+			// HostnameAndNamespace contains all services regardless of exportTo, so visibility is reapplied.
+			if !ps.IsServiceVisible(svc, configNamespace) {
+				continue
+			}
+			candidates = append(candidates, svc)
+		}
+	}
+	// Sort for deterministic output, matching servicesExportedToNamespace (built from creation-ordered services).
+	return SortServicesByCreationTime(candidates)
 }
 
 // GetEgressListenerForRDS returns the egress listener corresponding to
@@ -595,6 +695,7 @@ func (ilw *IstioEgressListenerWrapper) MostSpecificWildcardVirtualServiceIndex()
 
 // DependsOnConfig determines if the proxy depends on the given config.
 // Returns whether depends on this config or this kind of config is not scoped(unknown to be depended) here.
+// Gateway-specific scopes also depend on the VirtualServices bound to their gateways.
 func (sc *SidecarScope) DependsOnConfig(config ConfigKey, rootNs string) bool {
 	if sc == nil {
 		return true
@@ -610,7 +711,28 @@ func (sc *SidecarScope) DependsOnConfig(config ConfigKey, rootNs string) bool {
 		return true
 	}
 
-	return sc.configDependencies.Contains(config.HashCode())
+	switch config.Kind {
+	case kind.ServiceEntry, kind.Endpoints:
+		// Both are keyed by service hostname and namespace.
+		if svc := sc.servicesByHostname[host.Name(config.Name)]; svc != nil && svc.Attributes.Namespace == config.Namespace {
+			return true
+		}
+	case kind.DestinationRule:
+		if _, f := sc.destinationRulesByNames[types.NamespacedName{Name: config.Name, Namespace: config.Namespace}]; f {
+			return true
+		}
+	}
+
+	// Dependencies added through AddConfigDependencies still apply.
+	hash := config.HashCode()
+	return sc.configDependencies.Contains(hash) || sc.gatewayConfigDependencies.Contains(hash)
+}
+
+// GatewayVirtualServices returns the VirtualServices bound to the namespace/name gateway in this scope.
+// Only the gateway-specific scopes of routers and ambient east-west gateways carry them. SetSidecarScope
+// selects those scopes from the proxy's merged gateways, so it must run after SetGatewaysForProxy.
+func (sc *SidecarScope) GatewayVirtualServices(gateway string) []*config.Config {
+	return sc.gatewayVirtualServices[gateway]
 }
 
 func (sc *SidecarScope) GetService(hostname host.Name) *Service {
@@ -724,10 +846,16 @@ func (ilw *IstioEgressListenerWrapper) selectServices(services []*Service, confi
 	wildcardHosts, wnsFound := hostsByNamespace[wildcardNamespace]
 	for _, s := range services {
 		configNamespace := s.Attributes.Namespace
+		nsHosts, nsFound := hostsByNamespace[configNamespace]
+
+		// Skip services excluded by a ~-prefixed host in the service's namespace or wildcard scope.
+		if (nsFound && nsHosts.Excluded(s.Hostname)) || (wnsFound && wildcardHosts.Excluded(s.Hostname)) {
+			continue
+		}
 
 		// Check if there is an explicit import of form ns/* or ns/host
-		if importedHosts, nsFound := hostsByNamespace[configNamespace]; nsFound {
-			if svc := matchingAliasService(importedHosts, matchingService(importedHosts, s, ilw)); svc != nil {
+		if nsFound {
+			if svc := matchingAliasService(nsHosts, matchingService(nsHosts, s, ilw)); svc != nil {
 				importedServices = append(importedServices, svc)
 				continue
 			}

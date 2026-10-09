@@ -22,6 +22,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -825,19 +826,64 @@ func TestPodWorkloads(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "pod with invalid authz",
+			inputs: []any{
+				// no label selector
+				model.WorkloadAuthorization{
+					LabelSelector: model.NewSelector(nil),
+					Authorization: &security.Authorization{Name: "local-ns", Namespace: "ns"},
+				},
+				// no Authorization
+				model.WorkloadAuthorization{
+					LabelSelector: model.NewSelector(map[string]string{"app": "foo"}),
+					Authorization: nil,
+				},
+			},
+			pod: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Labels: map[string]string{
+						"app": "foo",
+					},
+				},
+				Spec: v1.PodSpec{},
+				Status: v1.PodStatus{
+					Phase:      v1.PodRunning,
+					Conditions: podReady,
+					PodIP:      "1.2.3.4",
+				},
+			},
+			result: &workloadapi.Workload{
+				Uid:                   "cluster0//Pod/ns/name",
+				Name:                  "name",
+				Namespace:             "ns",
+				Addresses:             [][]byte{netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice()},
+				Network:               testNW,
+				CanonicalName:         "foo",
+				CanonicalRevision:     "latest",
+				WorkloadType:          workloadapi.WorkloadType_POD,
+				WorkloadName:          "name",
+				Status:                workloadapi.WorkloadStatus_HEALTHY,
+				ClusterId:             testC,
+				AuthorizationPolicies: []string{},
+			},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := krttest.NewMock(t, tt.inputs)
 			a := newAmbientUnitTest(t)
-			WorkloadServices := krttest.GetMockCollection[model.ServiceInfo](mock)
+			WorkloadServices := krttest.GetMockPointers[model.ServiceInfo](mock)
 			WorkloadServicesNamespaceIndex := krt.NewNamespaceIndex(WorkloadServices)
 			EndpointSlices := krttest.GetMockCollection[*discovery.EndpointSlice](mock)
 			EndpointSlicesAddressIndex := endpointSliceAddressIndex(EndpointSlices)
 			builder := a.podWorkloadBuilder(
 				GetMeshConfig(mock),
-				krttest.GetMockCollection[model.WorkloadAuthorization](mock),
-				krttest.GetMockCollection[*securityclient.PeerAuthentication](mock),
+				selectingWorkloadAuthzByNs(krttest.GetMockCollection[model.WorkloadAuthorization](mock)),
+				krt.NewNamespaceIndex(krttest.GetMockCollection[*securityclient.PeerAuthentication](mock)),
 				krttest.GetMockCollection[Waypoint](mock),
 				WorkloadServices,
 				WorkloadServicesNamespaceIndex,
@@ -903,6 +949,60 @@ func TestWorkloadEntryWorkloads(t *testing.T) {
 				WorkloadName:      "name",
 				Status:            workloadapi.WorkloadStatus_HEALTHY,
 				ClusterId:         testC,
+				Services: map[string]*workloadapi.PortList{
+					"ns/hostname": {
+						Ports: []*workloadapi.Port{{
+							ServicePort: 80,
+							TargetPort:  8080,
+						}},
+					},
+				},
+			},
+		},
+		{
+			name: "we with tunnel label is HBONE",
+			inputs: []any{
+				model.ServiceInfo{
+					Service: &workloadapi.Service{
+						Name:      "svc",
+						Namespace: "ns",
+						Hostname:  "hostname",
+						Ports: []*workloadapi.Port{{
+							ServicePort: 80,
+							TargetPort:  8080,
+						}},
+					},
+					LabelSelector: model.NewSelector(map[string]string{"app": "foo"}),
+				},
+			},
+			we: &networkingclient.WorkloadEntry{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Labels: map[string]string{
+						"app":             "foo",
+						model.TunnelLabel: model.TunnelHTTP,
+					},
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			result: &workloadapi.Workload{
+				Uid:               "cluster0/networking.istio.io/WorkloadEntry/ns/name",
+				Name:              "name",
+				Namespace:         "ns",
+				Addresses:         [][]byte{netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice()},
+				Network:           testNW,
+				CanonicalName:     "foo",
+				CanonicalRevision: "latest",
+				WorkloadType:      workloadapi.WorkloadType_POD,
+				WorkloadName:      "name",
+				Status:            workloadapi.WorkloadStatus_HEALTHY,
+				ClusterId:         testC,
+				TunnelProtocol:    workloadapi.TunnelProtocol_HBONE,
+				NativeTunnel:      true,
 				Services: map[string]*workloadapi.PortList{
 					"ns/hostname": {
 						Ports: []*workloadapi.Port{{
@@ -1386,12 +1486,12 @@ func TestWorkloadEntryWorkloads(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := krttest.NewMock(t, tt.inputs)
 			a := newAmbientUnitTest(t)
-			WorkloadServices := krttest.GetMockCollection[model.ServiceInfo](mock)
+			WorkloadServices := krttest.GetMockPointers[model.ServiceInfo](mock)
 			WorkloadServicesNamespaceIndex := krt.NewNamespaceIndex(WorkloadServices)
 			builder := a.workloadEntryWorkloadBuilder(
 				GetMeshConfig(mock),
-				krttest.GetMockCollection[model.WorkloadAuthorization](mock),
-				krttest.GetMockCollection[*securityclient.PeerAuthentication](mock),
+				selectingWorkloadAuthzByNs(krttest.GetMockCollection[model.WorkloadAuthorization](mock)),
+				krt.NewNamespaceIndex(krttest.GetMockCollection[*securityclient.PeerAuthentication](mock)),
 				krttest.GetMockCollection[Waypoint](mock),
 				WorkloadServices,
 				WorkloadServicesNamespaceIndex,
@@ -1403,6 +1503,249 @@ func TestWorkloadEntryWorkloads(t *testing.T) {
 				res = wrapper.Workload
 			}
 			assert.Equal(t, res, tt.result)
+		})
+	}
+}
+
+func TestWorkloadEntryConditions(t *testing.T) {
+	waypointAddr := &workloadapi.GatewayAddress{
+		Destination: &workloadapi.GatewayAddress_Hostname{
+			Hostname: &workloadapi.NamespacedHostname{
+				Namespace: "ns",
+				Hostname:  "hostname.example",
+			},
+		},
+		HboneMtlsPort: 15008,
+	}
+
+	waypoint := Waypoint{
+		Named: krt.Named{
+			Name:      "waypoint",
+			Namespace: "waypoint-ns",
+		},
+		TrafficType: constants.AllTraffic,
+		Address:     waypointAddr,
+		AllowedRoutes: WaypointSelector{
+			FromNamespaces: gatewayv1.NamespacesFromSelector,
+			Selector:       labels.ValidatedSetSelector(map[string]string{v1.LabelMetadataName: "ns"}),
+		},
+	}
+
+	ns := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ns",
+			Labels: map[string]string{
+				v1.LabelMetadataName: "ns",
+			},
+		},
+	}
+
+	cases := []struct {
+		name       string
+		inputs     []any
+		we         *networkingclient.WorkloadEntry
+		conditions model.ConditionSet
+	}{
+		{
+			name: "workload entry bound to waypoint",
+			inputs: []any{
+				waypoint,
+				ns,
+			},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Labels: map[string]string{
+						label.IoIstioUseWaypoint.Name:          "waypoint",
+						label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
+					},
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: {
+					Status:  true,
+					Reason:  string(model.WaypointAccepted),
+					Message: "Successfully attached to waypoint waypoint-ns/waypoint",
+				},
+			},
+		},
+		{
+			name: "workload entry with waypoint not ready",
+			inputs: []any{
+				ns,
+			},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Labels: map[string]string{
+						label.IoIstioUseWaypoint.Name: "missing-waypoint",
+					},
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: {
+					Status:  false,
+					Reason:  "WaypointIsNotReady",
+					Message: `waypoint "ns/missing-waypoint" is not ready`,
+				},
+			},
+		},
+		{
+			name:   "workload entry without waypoint",
+			inputs: []any{},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: nil,
+			},
+		},
+		{
+			name: "workload entry with namespace-inherited service-only waypoint produces no condition",
+			inputs: []any{
+				Waypoint{
+					Named: krt.Named{
+						Name:      "service-waypoint",
+						Namespace: "ns",
+					},
+					TrafficType: constants.ServiceTraffic,
+					Address:     waypointAddr,
+					AllowedRoutes: WaypointSelector{
+						FromNamespaces: gatewayv1.NamespacesFromSame,
+					},
+				},
+				&v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns",
+						Labels: map[string]string{
+							v1.LabelMetadataName:          "ns",
+							label.IoIstioUseWaypoint.Name: "service-waypoint",
+						},
+					},
+				},
+			},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: nil,
+			},
+		},
+		{
+			name: "workload entry with direct service-only waypoint label produces error",
+			inputs: []any{
+				Waypoint{
+					Named: krt.Named{
+						Name:      "service-waypoint",
+						Namespace: "ns",
+					},
+					TrafficType: constants.ServiceTraffic,
+					Address:     waypointAddr,
+					AllowedRoutes: WaypointSelector{
+						FromNamespaces: gatewayv1.NamespacesFromSame,
+					},
+				},
+				ns,
+			},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Labels: map[string]string{
+						label.IoIstioUseWaypoint.Name: "service-waypoint",
+					},
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: {
+					Status:  false,
+					Reason:  "UnsupportedTrafficType",
+					Message: `attempting to bind to traffic type "workload" which the waypoint "ns/service-waypoint" does not support`,
+				},
+			},
+		},
+		{
+			name: "workload entry with namespace-inherited all-traffic waypoint binds successfully",
+			inputs: []any{
+				Waypoint{
+					Named: krt.Named{
+						Name:      "all-waypoint",
+						Namespace: "ns",
+					},
+					TrafficType: constants.AllTraffic,
+					Address:     waypointAddr,
+					AllowedRoutes: WaypointSelector{
+						FromNamespaces: gatewayv1.NamespacesFromSame,
+					},
+				},
+				&v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns",
+						Labels: map[string]string{
+							v1.LabelMetadataName:          "ns",
+							label.IoIstioUseWaypoint.Name: "all-waypoint",
+						},
+					},
+				},
+			},
+			we: &networkingclient.WorkloadEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: networking.WorkloadEntry{
+					Address: "1.2.3.4",
+				},
+			},
+			conditions: model.ConditionSet{
+				model.WaypointBound: {
+					Status:  true,
+					Reason:  string(model.WaypointAccepted),
+					Message: "Successfully attached to waypoint ns/all-waypoint",
+				},
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := krttest.NewMock(t, tt.inputs)
+			a := newAmbientUnitTest(t)
+			WorkloadServices := krttest.GetMockPointers[model.ServiceInfo](mock)
+			WorkloadServicesNamespaceIndex := krt.NewNamespaceIndex(WorkloadServices)
+			builder := a.workloadEntryWorkloadBuilder(
+				GetMeshConfig(mock),
+				selectingWorkloadAuthzByNs(krttest.GetMockCollection[model.WorkloadAuthorization](mock)),
+				krt.NewNamespaceIndex(krttest.GetMockCollection[*securityclient.PeerAuthentication](mock)),
+				krttest.GetMockCollection[Waypoint](mock),
+				WorkloadServices,
+				WorkloadServicesNamespaceIndex,
+				krttest.GetMockCollection[*v1.Namespace](mock),
+			)
+			wrapper := builder(krt.TestingDummyContext{}, tt.we)
+			assert.Equal(t, wrapper.GetConditions(nil), tt.conditions)
 		})
 	}
 }
@@ -1639,14 +1982,14 @@ func TestServiceEntryWorkloads(t *testing.T) {
 			a := newAmbientUnitTest(t)
 			builder := a.serviceEntryWorkloadBuilder(
 				GetMeshConfig(mock),
-				krttest.GetMockCollection[model.WorkloadAuthorization](mock),
-				krttest.GetMockCollection[*securityclient.PeerAuthentication](mock),
+				selectingWorkloadAuthzByNs(krttest.GetMockCollection[model.WorkloadAuthorization](mock)),
+				krt.NewNamespaceIndex(krttest.GetMockCollection[*securityclient.PeerAuthentication](mock)),
 				krttest.GetMockCollection[Waypoint](mock),
 				krttest.GetMockCollection[*v1.Namespace](mock),
-				krttest.GetMockCollection[model.ServiceInfo](mock),
+				krttest.GetMockPointers[model.ServiceInfo](mock),
 			)
 			res := builder(krt.TestingDummyContext{}, tt.se)
-			wl := slices.Map(res, func(e model.WorkloadInfo) *workloadapi.Workload {
+			wl := slices.Map(res, func(e *model.WorkloadInfo) *workloadapi.Workload {
 				return e.Workload
 			})
 			slices.SortFunc(wl, func(a, b *workloadapi.Workload) int {
@@ -1762,13 +2105,13 @@ func TestEndpointSliceWorkloads(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := krttest.NewMock(t, tt.inputs)
 			a := newAmbientUnitTest(t)
-			WorkloadServices := krttest.GetMockCollection[model.ServiceInfo](mock)
+			WorkloadServices := krttest.GetMockPointers[model.ServiceInfo](mock)
 			builder := a.endpointSlicesBuilder(
 				GetMeshConfig(mock),
 				WorkloadServices,
 			)
 			res := builder(krt.TestingDummyContext{}, tt.slice)
-			wl := slices.Map(res, func(e model.WorkloadInfo) *workloadapi.Workload {
+			wl := slices.Map(res, func(e *model.WorkloadInfo) *workloadapi.Workload {
 				return e.Workload
 			})
 			assert.Equal(t, wl, tt.result)
